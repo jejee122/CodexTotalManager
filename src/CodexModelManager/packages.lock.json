@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0-windows7.0": {
+      "Tomlyn": {
+        "type": "Direct",
+        "requested": "[0.20.0, )",
+        "resolved": "0.20.0",
+        "contentHash": "Z8TmFcz6oeULVSVGDvbF1h+gnCoy/6NbWrlsQg9f2i+lzqXtUoU4+2RJIm8/s/14uSu0OqTv6JcSngTw3tlkTQ=="
+      },
+      "ZstdSharp.Port": {
+        "type": "Transitive",
+        "resolved": "0.8.8",
+        "contentHash": "UIDFkA5DC3en3tOJ3Mof11yBx9kUQLsaeo/oFdvN6Bbkr9E9+VCqfIadHci8cu+I51K2Sl7XYWVl2R/mA75NBQ=="
+      },
+      "codexopencodexnative": {
+        "type": "Project",
+        "dependencies": {
+          "ZstdSharp.Port": "[0.8.8, )"
+        }
+      }
+    },
+    "net10.0-windows7.0/win-x64": {}
+  }
+}

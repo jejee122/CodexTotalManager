@@ -1,0 +1,36 @@
+<Application x:Class="CodexModelManager.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnLastWindowClose">
+    <Application.Resources>
+        <FontFamily x:Key="AppFont">Microsoft YaHei UI, Noto Sans CJK SC, Segoe UI</FontFamily>
+        <FontFamily x:Key="DisplayFont">华文行楷, STXingkai, KaiTi, 华文宋体</FontFamily>
+        <FontFamily x:Key="CodeFont">Cascadia Mono, Consolas</FontFamily>
+
+        <Style x:Key="CloudTitleText" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{StaticResource DisplayFont}"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="Foreground" Value="#FFF8F0DF"/>
+            <Setter Property="TextOptions.TextFormattingMode" Value="Display"/>
+            <Setter Property="Effect">
+                <Setter.Value>
+                    <DropShadowEffect Color="#FFF2D69A" BlurRadius="12" ShadowDepth="0" Opacity="0.58"/>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <EventTrigger RoutedEvent="FrameworkElement.Loaded">
+                    <BeginStoryboard>
+                        <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                            <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                             From="0.92" To="1" Duration="0:0:18"/>
+                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.Effect).(DropShadowEffect.BlurRadius)"
+                                             From="9" To="15" Duration="0:0:22"/>
+                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.Effect).(DropShadowEffect.Opacity)"
+                                             From="0.34" To="0.58" Duration="0:0:22"/>
+                        </Storyboard>
+                    </BeginStoryboard>
+                </EventTrigger>
+            </Style.Triggers>
+        </Style>
+    </Application.Resources>
+</Application>

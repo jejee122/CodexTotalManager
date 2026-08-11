@@ -1,0 +1,12 @@
+Project: OpenCodex
+Repository: https://github.com/lidge-jun/opencodex
+Migration baseline: v2.7.41
+Baseline commit: ac73f189cf7e3f4ee55690ed8dc7e354b7e6ed10
+Integration form: selected behavior rewritten in C# under CodexOpenCodexNative
+Runtime dependency: none; the TypeScript package is not executed or downloaded
+License: MIT; see LICENSE in this directory
+
+Compatibility note:
+CodexOpenCodexNative is a maintained local rewrite, not a byte-for-byte vendored
+copy. Later OpenCodex releases are reviewed and ported deliberately; installing a
+new npm version does not update or alter the Total Manager engine.

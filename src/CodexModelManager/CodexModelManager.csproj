@@ -1,0 +1,92 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CodexModelManager</AssemblyName>
+    <RootNamespace>CodexModelManager</RootNamespace>
+    <ApplicationIcon>Resources\Brand\CodexTotalManager-v4.ico</ApplicationIcon>
+    <!-- Keep the desktop payload, assembly metadata and deployment evidence on one version. -->
+    <Version>3.0.0-rc.25</Version>
+    <AssemblyVersion>3.0.0.0</AssemblyVersion>
+    <FileVersion>3.0.0.25</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <AssemblyTitle>Codex 总管家</AssemblyTitle>
+    <Product>Codex 总管家</Product>
+    <Description>统一管理 Codex 号池、模型、皮肤、本机服务与服务器状态。</Description>
+    <CliProxyApiExpectedSha256>BD3456675B98CFF406B600D1361F1441879220CAD2DD4083B63409A09210629B</CliProxyApiExpectedSha256>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(DetachedOnly)' == 'true'">
+    <DefineConstants>$(DefineConstants);CMM_DETACHED_ONLY</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Tomlyn" Version="0.20.0" />
+    <ProjectReference Include="..\CodexOpenCodexNative\CodexOpenCodexNative.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Resources\Brand\CodexTotalManager-v4.ico" />
+    <Content Include="Resources\Themes\CelestialTech\celestial-palace-night-v2.png"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\Themes\codex-bridge.ps1"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\Themes\dream-skin-manager.ps1"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\CodexDreamSkin\**\*"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\OpenCodex\**\*"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\Server\health-check.ps1"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\CLIProxyAPI\LICENSE"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\CLIProxyAPI\VERSION.txt"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="Resources\CLIProxyAPI\ARTIFACT.lock.json"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(CliProxyApiArtifactPath)' != ''">
+    <Content Include="$(CliProxyApiArtifactPath)"
+             Link="Resources\CLIProxyAPI\cli-proxy-api.exe"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+  </ItemGroup>
+  <Target Name="VerifyCliProxyApiArtifact"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(CliProxyApiArtifactPath)' != ''">
+    <Error Condition="!Exists('$(CliProxyApiArtifactPath)')"
+           Text="CLIProxyAPI artifact does not exist: $(CliProxyApiArtifactPath)" />
+    <GetFileHash Files="$(CliProxyApiArtifactPath)" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="_CliProxyApiArtifactWithHash" />
+    </GetFileHash>
+    <Error Condition="'%(_CliProxyApiArtifactWithHash.FileHash)' != '$(CliProxyApiExpectedSha256)'"
+           Text="CLIProxyAPI artifact SHA-256 does not match the source-controlled trust anchor." />
+  </Target>
+</Project>

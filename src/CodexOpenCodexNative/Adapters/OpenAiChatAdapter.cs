@@ -1,0 +1,245 @@
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using CodexOpenCodexNative.Models;
+
+namespace CodexOpenCodexNative.Adapters;
+
+public sealed class OpenAiChatAdapter : IProviderAdapter
+{
+    private readonly HttpClient _http;
+
+    public OpenAiChatAdapter(HttpClient? http = null)
+    {
+        _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
+    }
+
+    public string AdapterId => "openai-chat";
+
+    public async Task<AdapterResponse> FetchAsync(
+        ProviderDefinition provider,
+        OcxParsedRequest request,
+        string modelId,
+        CancellationToken cancellationToken)
+    {
+        var url = provider.BaseUrl.TrimEnd('/') + "/chat/completions";
+        var body = BuildRequestJson(provider, request, modelId);
+        var content = new StringContent(body, Encoding.UTF8, "application/json");
+        var httpRequest = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+        if (!string.IsNullOrWhiteSpace(provider.ApiKey))
+            httpRequest.Headers.Authorization = new("Bearer", provider.ApiKey);
+
+        var response = await _http.SendAsync(
+            httpRequest,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+            return new AdapterResponse
+            {
+                Streaming = false,
+                ContentType = "application/json",
+                JsonBody = BuildErrorBody((int)response.StatusCode, errorBody),
+                StatusCode = (int)response.StatusCode
+            };
+        }
+
+        if (request.Stream)
+        {
+            var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            return new AdapterResponse
+            {
+                Streaming = true,
+                ContentType = "text/event-stream",
+                Events = ParseSseStream(stream, modelId, cancellationToken)
+            };
+        }
+
+        var jsonBody = await response.Content.ReadAsStringAsync(cancellationToken);
+        return new AdapterResponse
+        {
+            Streaming = false,
+            ContentType = "application/json",
+            JsonBody = jsonBody
+        };
+    }
+
+    public static string BuildRequestJson(ProviderDefinition provider, OcxParsedRequest request, string modelId)
+    {
+        var root = new JsonObject
+        {
+            ["model"] = modelId,
+            ["messages"] = SerializeMessages(request.Messages),
+            ["stream"] = request.Stream
+        };
+        if (request.Tools is { Count: > 0 })
+            root["tools"] = JsonSerializer.SerializeToNode(request.Tools);
+        if (request.ToolChoice is { ValueKind: not JsonValueKind.Undefined })
+            root["tool_choice"] = JsonSerializer.SerializeToNode(request.ToolChoice);
+        if (request.Temperature is not null)
+            root["temperature"] = request.Temperature;
+        if (request.MaxTokens is not null)
+            root["max_tokens"] = request.MaxTokens;
+        if (request.ExtraBody is { Count: > 0 })
+        {
+            foreach (var (key, value) in request.ExtraBody)
+            {
+                if (!root.ContainsKey(key))
+                    root[key] = JsonSerializer.SerializeToNode(value);
+            }
+        }
+        return root.ToJsonString();
+    }
+
+    private static JsonArray SerializeMessages(List<OcxMessage> messages)
+    {
+        var array = new JsonArray();
+        foreach (var message in messages)
+        {
+            var node = new JsonObject { ["role"] = message.Role };
+            if (message.Content is JsonElement element && element.ValueKind is JsonValueKind.Array)
+            {
+                node["content"] = JsonSerializer.SerializeToNode(element);
+            }
+            else if (message.Content is not null)
+            {
+                node["content"] = JsonSerializer.SerializeToNode(message.Content);
+            }
+            else
+            {
+                node["content"] = string.Empty;
+            }
+            if (message.ToolCalls is { Count: > 0 })
+                node["tool_calls"] = JsonSerializer.SerializeToNode(message.ToolCalls);
+            if (message.ToolCallId is not null)
+                node["tool_call_id"] = message.ToolCallId;
+            if (message.Name is not null)
+                node["name"] = message.Name;
+            array.Add(node);
+        }
+        return array;
+    }
+
+    private static async IAsyncEnumerable<AdapterEvent> ParseSseStream(
+        Stream raw,
+        string modelId,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        using var reader = new StreamReader(raw, Encoding.UTF8);
+        var pendingToolCall = new Dictionary<string, (string Name, StringBuilder Arguments)>();
+        var pendingReasoning = new StringBuilder();
+        var hasReasoning = false;
+        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        {
+            if (cancellationToken.IsCancellationRequested) yield break;
+            if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+            var payload = line["data:".Length..].Trim();
+            if (payload == "[DONE]")
+            {
+                yield return new AdapterEvent { Type = "done" };
+                yield break;
+            }
+            ChatCompletionChunk? chunk;
+            try
+            {
+                chunk = JsonSerializer.Deserialize<ChatCompletionChunk>(payload);
+            }
+            catch
+            {
+                continue;
+            }
+            if (chunk is null) continue;
+            if (chunk.Usage is not null)
+                yield return new AdapterEvent { Type = "usage", Usage = chunk.Usage };
+            if (chunk.Choices is { Count: 0 }) continue;
+
+            var delta = chunk.Choices[0].Delta;
+            if (delta.Content is not null)
+                yield return new AdapterEvent { Type = "text", Text = delta.Content, Role = delta.Role };
+            if (delta.ToolCalls is { Count: > 0 })
+            {
+                foreach (var toolCall in delta.ToolCalls)
+                {
+                    var index = 0;
+                    string? id = null;
+                    string? name = null;
+                    string? arguments = null;
+                    if (toolCall.ValueKind == JsonValueKind.Object)
+                    {
+                        if (toolCall.TryGetProperty("index", out var indexValue))
+                            index = indexValue.GetInt32();
+                        if (toolCall.TryGetProperty("id", out var idValue))
+                            id = idValue.GetString();
+                        if (toolCall.TryGetProperty("function", out var function))
+                        {
+                            if (function.TryGetProperty("name", out var nameValue))
+                                name = nameValue.GetString();
+                            if (function.TryGetProperty("arguments", out var argsValue))
+                                arguments = argsValue.GetString();
+                        }
+                    }
+                    if (!pendingToolCall.TryGetValue(index.ToString(), out var pending))
+                    {
+                        pending = (name ?? string.Empty, new StringBuilder());
+                        pendingToolCall[index.ToString()] = pending;
+                    }
+                    if (!string.IsNullOrEmpty(name))
+                        pending.Name = name;
+                    if (!string.IsNullOrEmpty(arguments))
+                        pending.Arguments.Append(arguments);
+                    yield return new AdapterEvent
+                    {
+                        Type = "function_call",
+                        CallId = id,
+                        FunctionName = name,
+                        Arguments = arguments
+                    };
+                }
+            }
+            if (chunk.Choices[0].FinishReason is not null)
+            {
+                if (pendingToolCall.Count > 0)
+                {
+                    foreach (var (_, call) in pendingToolCall)
+                    {
+                        yield return new AdapterEvent
+                        {
+                            Type = "function_call_done",
+                            FunctionName = call.Name,
+                            Arguments = call.Arguments.ToString()
+                        };
+                    }
+                    pendingToolCall.Clear();
+                }
+                if (hasReasoning)
+                {
+                    yield return new AdapterEvent { Type = "reasoning_done", Reasoning = pendingReasoning.ToString() };
+                    pendingReasoning.Clear();
+                    hasReasoning = false;
+                }
+                yield return new AdapterEvent
+                {
+                    Type = "finish",
+                    FinishReason = chunk.Choices[0].FinishReason
+                };
+            }
+        }
+    }
+
+    private static string BuildErrorBody(int status, string upstreamBody) =>
+        JsonSerializer.Serialize(new
+        {
+            error = new
+            {
+                message = $"上游返回 {(int)status}：{Truncate(upstreamBody, 500)}",
+                type = "upstream_error",
+                code = (int)status
+            }
+        });
+
+    private static string Truncate(string value, int max) =>
+        value.Length <= max ? value : value[..max];
+}

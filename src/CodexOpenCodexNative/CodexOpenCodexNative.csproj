@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- This assembly uses CurrentUser DPAPI and is intentionally Windows-only. -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CodexOpenCodexNative</RootNamespace>
+    <AssemblyName>CodexOpenCodexNative</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>OpenCodex 2.7.41 全 C# 重写（原生代理内核），由总管家托管。</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
+  </ItemGroup>
+</Project>
