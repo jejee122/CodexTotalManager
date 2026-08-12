@@ -47,6 +47,7 @@ public partial class MainWindow : Window
         BackupList.ItemsSource = _backupItems;
         ServerEventStreamList.ItemsSource = _serverFeed;
         ServerCardsList.ItemsSource = _serverCards;
+        ExtensionsPage.Initialize(_services.Extensions);
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -964,6 +965,8 @@ public partial class MainWindow : Window
 
     private void ServersNavButton_Click(object sender, RoutedEventArgs e) => ShowServersPage();
 
+    private void ExtensionsNavButton_Click(object sender, RoutedEventArgs e) => ShowExtensionsPage();
+
     private async void StudyNavButton_Click(object sender, RoutedEventArgs e)
     {
         if (_busy || !StudyNavButton.IsEnabled) return;
@@ -1191,13 +1194,19 @@ public partial class MainWindow : Window
         StartServerMonitoring();
     }
 
+    private void ShowExtensionsPage()
+    {
+        ShowPage(ExtensionsPage, ExtensionsNavButton, "自定义插件", "把天气工具等独立小程序接进总管家；默认关闭，手动启用。 ");
+        ExtensionsPage.Refresh();
+    }
+
     private void ShowPage(FrameworkElement page, Button navButton, string title, string subtitle)
     {
         foreach (var candidate in new FrameworkElement[]
-                 { HomePage, TokenPage, ModelsPage, SourcesPage, AccountsPage, SubagentsPage, ThemesPage, ServicesPage, ServersPage })
+                 { HomePage, TokenPage, ModelsPage, SourcesPage, AccountsPage, SubagentsPage, ThemesPage, ServicesPage, ServersPage, ExtensionsPage })
             candidate.Visibility = candidate == page ? Visibility.Visible : Visibility.Collapsed;
         foreach (var button in new[]
-                 { HomeNavButton, AccountsNavButton, SubagentsNavButton, TokenNavButton, ThemesNavButton, ServicesNavButton, ServersNavButton })
+                 { HomeNavButton, AccountsNavButton, SubagentsNavButton, TokenNavButton, ThemesNavButton, ServicesNavButton, ServersNavButton, ExtensionsNavButton })
             button.Tag = button == navButton ? "active" : null;
         PageTitle.Text = title;
         PageSubtitle.Text = RuntimeMode.IsDetachedUi
@@ -1387,9 +1396,17 @@ public partial class MainWindow : Window
         foreach (var button in VisualDescendants<Button>(this))
         {
             if (allowed.Contains(button)) continue;
+            if (RuntimeMode.AllowsCustomExtensions && IsInside(button, ExtensionsPage)) continue;
             button.IsEnabled = false;
             button.ToolTip = "独立开发模式：实际操作已锁定";
         }
+    }
+
+    private static bool IsInside(DependencyObject candidate, DependencyObject ancestor)
+    {
+        for (DependencyObject? current = candidate; current is not null; current = VisualTreeHelper.GetParent(current))
+            if (ReferenceEquals(current, ancestor)) return true;
+        return false;
     }
 
     private async Task RefreshDetachedLocalStatusAsync()

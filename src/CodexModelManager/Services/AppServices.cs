@@ -29,6 +29,7 @@ public sealed class AppServices
     public WorkerBroker WorkerBroker { get; init; } = null!;
     public WorkerBudgetLedger WorkerBudget { get; init; } = null!;
     public NativeEngineService NativeEngine { get; init; } = null!;
+    public ExtensionService Extensions { get; init; } = null!;
 
     public static AppServices Create(string? dataDirectory = null)
     {
@@ -154,7 +155,8 @@ public sealed class AppServices
             ExternalWorker = externalWorker,
             WorkerBroker = workerBroker,
             WorkerBudget = workerBudget,
-            NativeEngine = CreateNativeEngineService(settings.DataDirectory)
+            NativeEngine = CreateNativeEngineService(settings.DataDirectory),
+            Extensions = new ExtensionService(settings.DataDirectory)
         };
     }
 

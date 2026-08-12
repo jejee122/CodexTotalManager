@@ -45,6 +45,7 @@ public partial class MainWindow
             ShowThemesPage();
             ShowServicesPage();
             ShowServersPage();
+            ShowExtensionsPage();
             await Dispatcher.Yield(DispatcherPriority.Background);
             cycleTimer.Stop();
             maxCycleLatencyMs = Math.Max(maxCycleLatencyMs, cycleTimer.ElapsedMilliseconds);
@@ -76,7 +77,7 @@ public partial class MainWindow
         return new DetachedUiStressReport(
             Marker: "DETACHED_UI_STRESS_OK",
             Cycles: cycles,
-            PageTransitions: checked(cycles * 7),
+            PageTransitions: checked(cycles * 8),
             ElapsedMs: timer.ElapsedMilliseconds,
             MaxCycleLatencyMs: maxCycleLatencyMs,
             ManagedBefore: managedBefore,
@@ -108,6 +109,7 @@ public partial class MainWindow
         ThemesNavButton,
         ServicesNavButton,
         ServersNavButton,
+        ExtensionsNavButton,
         MinimizeWindowButton,
         MaximizeWindowButton,
         CloseWindowButton,

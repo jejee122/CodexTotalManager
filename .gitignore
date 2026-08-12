@@ -13,6 +13,7 @@ evidence/
 # Runtime data is never source
 runtime-data/
 test-runtime/
+extensions/
 *.db
 *.db-journal
 *.db-shm

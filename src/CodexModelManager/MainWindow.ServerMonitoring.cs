@@ -277,5 +277,10 @@ public partial class MainWindow
         return value.TotalDays >= 1 ? $"{(int)value.TotalDays}天 {value.Hours}小时" : $"{(int)value.TotalHours}小时 {value.Minutes}分";
     }
 
-    private void Window_Closed(object? sender, EventArgs e) => StopServerMonitoring();
+    private void Window_Closed(object? sender, EventArgs e)
+    {
+        StopServerMonitoring();
+        try { _services.Extensions.StopAllAsync(TimeSpan.FromSeconds(3)).GetAwaiter().GetResult(); }
+        catch { }
+    }
 }

@@ -15,6 +15,7 @@ public static class RuntimeMode
     public static bool IsCodexTestDouble { get; private set; }
     public static bool AllowsRealCodexConnectionToggle { get; private set; }
     public static bool AllowsExternalStatusConnections { get; private set; } = true;
+    public static bool AllowsCustomExtensions { get; private set; }
     public static Uri? CodexTestDoubleEngineUri { get; private set; }
     public static Uri? CodexTestDoubleGatewayUri { get; private set; }
     public static string? CodexTestDoubleToken { get; private set; }
@@ -39,10 +40,16 @@ public static class RuntimeMode
 #if CMM_DETACHED_ONLY
         IsDetachedUi = true;
         AllowsRealCodexConnectionToggle = false;
+        AllowsCustomExtensions = false;
 #else
         AllowsRealCodexConnectionToggle = !testDoubleRequested
                                           && !completeSandbox
                                           && !explicitIsolationEnvironment;
+        AllowsCustomExtensions = !requested
+                                 && !environmentRequested
+                                 && !testDoubleRequested
+                                 && !completeSandbox
+                                 && !explicitIsolationEnvironment;
         var managedConnectionIsValid = AllowsRealCodexConnectionToggle
                                        && HasValidManagedCodexConnection();
         // An ordinary launch is intentionally detached unless the user previously

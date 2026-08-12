@@ -3,8 +3,8 @@
 
   常用命令：
     .\build.ps1 -Release
-    .\build.ps1 -Publish -Version 3.0.0-rc.25
-    .\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.25
+    .\build.ps1 -Publish -Version 3.0.0-rc.26
+    .\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.26
 
   -Publish 生成 win-x64 自包含候选包，不安装、不启动总管家，也不会启动 Codex。
   发布包必须同时带入经过锁定的 CLIProxyAPI、签名有效的 Node.js 22+，以及

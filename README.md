@@ -4,14 +4,14 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows)
 ![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet)
-![Release](https://img.shields.io/badge/release-3.0.0--rc.25-orange)
+![Release](https://img.shields.io/badge/release-3.0.0--rc.26-orange)
 ![Status](https://img.shields.io/badge/status-external_validation_pending-yellow)
 
 Codex 总管家不是另一个聊天客户端，也不会替换 Codex。它是一个运行在本机的控制面：
 默认与 Codex 断开；只有用户点击“一键连接 Codex”并确认后，才把本机网关和模型目录写入 Codex 配置。
 断开时只删除总管家自己拥有的内容。
 
-当前版本为 **3.0.0-rc.25 候选版**。隔离构建、安全测试、假上游端到端请求和
+当前版本为 **3.0.0-rc.26 候选版**。隔离构建、安全测试、假上游端到端请求和
 10 万条账本压力矩阵已经通过；真实 Codex、真实 OAuth 账号池和皮肤仍需在专用测试电脑完成最终验收，
 因此现在不能称为生产稳定版。
 
@@ -63,6 +63,18 @@ Codex 总管家不是另一个聊天客户端，也不会替换 Codex。它是�
 - `delegate_to_worker` 统一管理外部 Worker 的角色、模型、来源、单价、预算、超时和审计；
 - 展示本机 Native Engine、Unified Gateway、皮肤通道、v2rayN 和服务器健康状态；
 - 服务器监控需要用户明确配置，仓库不包含服务器地址、SSH 密钥或代理链接。
+
+### 自定义插件
+
+- 支持把天气查看等独立 Windows 小程序作为插件文件夹放入运行数据目录；
+- 插件通过 `plugin.json` 声明名称、版本、入口、参数和网络/文件等能力；
+- 初次发现默认关闭，用户检查发布者、能力与文件指纹后才能启用；
+- 插件包内任意文件变化会自动撤销旧授权，路径逃逸、符号链接、未知清单字段和重复 ID 均被拒绝；
+- 插件作为独立进程运行，崩溃不会直接拖垮总管家，输出和退出码会显示在插件页；
+- 总管家不会主动把 Codex、账号池、OAuth、API Key 或服务器配置传给插件。
+
+进程隔离不等于 Windows 安全沙盒：恶意插件仍可能主动访问当前用户可访问的文件或网络。
+只启用可信插件；完整格式与开发说明见 [docs/EXTENSIONS.md](docs/EXTENSIONS.md)。
 
 ## 工作流程
 
@@ -142,21 +154,21 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-local-release.
 ```powershell
 dotnet build CodexTotalManager.sln --no-restore -c Debug
 dotnet test tests\CodexModelManager.SecurityTests\CodexModelManager.SecurityTests.csproj --no-build -c Debug
-.\build.ps1 -Publish -Version 3.0.0-rc.25
+.\build.ps1 -Publish -Version 3.0.0-rc.26
 ```
 
 生成永久隔离、不能连接真实 Codex 的测试包：
 
 ```powershell
-.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.25
+.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.26
 ```
 
 ## 测试边界
 
-当前 rc.25 已验证：
+当前 rc.26 已验证：
 
 - Debug 全解决方案编译：0 错误、0 警告；
-- 30 项安全测试；
+- 36 项安全测试，其中包含通用插件的禁用默认值、路径边界、整包指纹、确认期间换包拦截、参数传递、环境变量隔离和崩溃隔离；
 - 隔离单元/集成矩阵；
 - 10 万条账本冷启动和追加压力测试；
 - 589 文件候选包清单校验，以及安装回路“只验包、不安装”测试；

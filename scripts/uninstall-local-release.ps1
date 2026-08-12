@@ -71,6 +71,32 @@ foreach ($target in $programTargets) {
     if (Test-Path -LiteralPath $targetFull) { Remove-Item -LiteralPath $targetFull -Recurse -Force }
 }
 
+# Remove only shortcuts that both use the Total Manager name and resolve back to this
+# exact installation root. A similarly named user shortcut to another program is kept.
+$shortcutShell = New-Object -ComObject WScript.Shell
+foreach ($desktopFolder in @(
+    [Environment]::GetFolderPath('DesktopDirectory'),
+    [Environment]::GetFolderPath('CommonDesktopDirectory')
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) {
+    $desktopFull = [IO.Path]::GetFullPath($desktopFolder).TrimEnd('\')
+    foreach ($shortcut in @(Get-ChildItem -LiteralPath $desktopFull -Filter 'Codex 总管家*.lnk' -File -ErrorAction SilentlyContinue)) {
+        $shortcutFull = [IO.Path]::GetFullPath($shortcut.FullName)
+        if (-not $shortcutFull.StartsWith($desktopFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "快捷方式越过桌面目录：$shortcutFull"
+        }
+        try {
+            $resolvedShortcut = $shortcutShell.CreateShortcut($shortcutFull)
+            $targetPath = [string]$resolvedShortcut.TargetPath
+            $arguments = [string]$resolvedShortcut.Arguments
+            $owned = ($targetPath -and $targetPath.StartsWith($installFull + '\', [StringComparison]::OrdinalIgnoreCase)) -or
+                     ($arguments -and $arguments.IndexOf($installFull + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0)
+            if ($owned) { Remove-Item -LiteralPath $shortcutFull -Force }
+        } catch {
+            Write-Warning "无法核对快捷方式，已保留：$shortcutFull"
+        }
+    }
+}
+
 if ($PurgeRuntimeData) {
     if (Test-Path -LiteralPath $runtimeRoot) { Remove-Item -LiteralPath $runtimeRoot -Recurse -Force }
     if ((Get-ChildItem -LiteralPath $installFull -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {

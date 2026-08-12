@@ -10,14 +10,14 @@
     <RootNamespace>CodexModelManager</RootNamespace>
     <ApplicationIcon>Resources\Brand\CodexTotalManager-v4.ico</ApplicationIcon>
     <!-- Keep the desktop payload, assembly metadata and deployment evidence on one version. -->
-    <Version>3.0.0-rc.25</Version>
+    <Version>3.0.0-rc.26</Version>
     <AssemblyVersion>3.0.0.0</AssemblyVersion>
-    <FileVersion>3.0.0.25</FileVersion>
+    <FileVersion>3.0.0.26</FileVersion>
     <InformationalVersion>$(Version)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AssemblyTitle>Codex 总管家</AssemblyTitle>
     <Product>Codex 总管家</Product>
-    <Description>统一管理 Codex 号池、模型、皮肤、本机服务与服务器状态。</Description>
+    <Description>统一管理 Codex 号池、模型、皮肤、本机服务、服务器状态与自定义插件。</Description>
     <CliProxyApiExpectedSha256>BD3456675B98CFF406B600D1361F1441879220CAD2DD4083B63409A09210629B</CliProxyApiExpectedSha256>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">

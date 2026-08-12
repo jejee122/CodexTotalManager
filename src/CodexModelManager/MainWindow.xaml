@@ -685,6 +685,8 @@
                             Click="ServicesNavButton_Click" Content="◎  本机服务"/>
                     <Button x:Name="ServersNavButton" Style="{StaticResource NavButton}"
                             Click="ServersNavButton_Click" Content="⌁  服务器"/>
+                    <Button x:Name="ExtensionsNavButton" Style="{StaticResource NavButton}"
+                            Click="ExtensionsNavButton_Click" Content="▧  自定义插件"/>
                     <Button x:Name="StudyNavButton" Style="{StaticResource NavButton}"
                             Click="StudyNavButton_Click" Content="↗  考研学习"
                             ToolTip="启动并打开知耕考研学习系统"/>
@@ -1726,6 +1728,8 @@
                         </Expander>
                     </StackPanel>
                 </ScrollViewer>
+
+                <views:ExtensionManagementView x:Name="ExtensionsPage" Visibility="Collapsed"/>
 
                 <ScrollViewer x:Name="ServersPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="30,26,24,38">

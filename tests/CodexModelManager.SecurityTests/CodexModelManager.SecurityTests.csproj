@@ -12,5 +12,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\CodexModelManager\CodexModelManager.csproj" />
+    <ProjectReference Include="..\ExtensionTestPlugin\ExtensionTestPlugin.csproj" />
   </ItemGroup>
 </Project>

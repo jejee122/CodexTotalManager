@@ -121,6 +121,9 @@
           "System.Security.Cryptography.ProtectedData": "[10.0.0, )",
           "ZstdSharp.Port": "[0.8.8, )"
         }
+      },
+      "extensiontestplugin": {
+        "type": "Project"
       }
     }
   }

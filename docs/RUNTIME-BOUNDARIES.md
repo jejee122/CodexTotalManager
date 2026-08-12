@@ -29,6 +29,16 @@ and run identifier match the active test run. At teardown it verifies that the
 directory no longer exists. Existing Codex, Manager, Moyuan, game, study-system,
 and server databases are outside the test boundary.
 
+## Custom extensions
+
+Extensions are untrusted, out-of-process Windows executables discovered only from the
+runtime `extensions/packages` directory. They are disabled until the user trusts the
+current whole-package fingerprint. They do not receive Codex, account-pool, OAuth,
+API-key, server or proxy configuration from the Manager. This process boundary protects
+Manager stability but is not an OS sandbox: an extension still has the permissions of
+the current Windows user. Reparse points, directory escape, shell command concatenation,
+automatic startup and in-process DLL loading are rejected.
+
 ## Codex connection switch
 
 The ordinary desktop UI starts detached unless `~/.codex/config.toml` contains
