@@ -242,10 +242,27 @@ public sealed class CodexConnectionSwitchTests
             Directory.Delete(root, recursive: true);
         }
     }
+
 }
 
 public sealed class RuntimeModeIsolationTests
 {
+    [Fact]
+    public void OrdinaryDisconnectedLaunch_DoesNotBecomeIsolationMode()
+    {
+        var emptyEnvironment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+        Assert.False(RuntimeMode.RequiresExplicitIsolation(
+            Array.Empty<string>(),
+            name => emptyEnvironment.GetValueOrDefault(name)));
+        Assert.True(RuntimeMode.RequiresExplicitIsolation(
+            new[] { "--detached-ui" },
+            name => emptyEnvironment.GetValueOrDefault(name)));
+        Assert.True(RuntimeMode.RequiresExplicitIsolation(
+            Array.Empty<string>(),
+            name => name == "CMM_DETACHED_DATA_ROOT" ? @"C:\fake-cmm" : null));
+    }
+
     [Fact]
     public async Task Initialize_ExplicitDetachedRoot_BindsEveryFakeStoreBelowIt()
     {
@@ -296,6 +313,192 @@ public sealed class RuntimeModeIsolationTests
     }
 }
 
+public sealed class DisconnectedViewIsolationTests
+{
+    [Fact]
+    public async Task AccountPools_DisconnectedView_DoesNotCallNativeCodexAccountApi()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cmm-disconnected-pools-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var requests = 0;
+        var http = new HttpClient(new CountingHandler(() => Interlocked.Increment(ref requests)))
+        {
+            BaseAddress = new Uri("http://127.0.0.1:1")
+        };
+
+        try
+        {
+            var settings = new AppSettingsService(root);
+            var secrets = new SecretStore(root);
+            var catalog = new PoolCatalogService(root, settings.ReservedLocalPorts);
+            var client = new OpenCodexClient(http);
+            var codexPath = Path.Combine(root, "codex-home", "config.toml");
+            var codex = new CodexConfigService(codexPath, Path.Combine(root, "codex-backups"));
+            var process = new OpenCodexProcessService(
+                settings,
+                secrets,
+                client,
+                codex,
+                new CodexModelCatalogService(codex),
+                catalog,
+                Path.Combine(root, "native-proxy"));
+            var service = new AccountPoolService(
+                catalog,
+                new CliProxyPoolService(settings, secrets, poolCatalog: catalog),
+                client,
+                process,
+                codex,
+                new CodexDesktopBridgeService(),
+                new ConfigBackupService(Path.Combine(root, "native-proxy", "config.json"), Path.Combine(root, "backups")),
+                settings,
+                secrets);
+
+            var views = await service.ReadDisconnectedViewsAsync();
+
+            Assert.Equal(0, requests);
+            Assert.All(
+                views.Where(view => view.SectionOrder == 0),
+                view => Assert.Contains("æ²¡æœ‰è¯»å– Codex è´¦å·", view.StatusDetail, StringComparison.Ordinal));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Subagents_DraftOnly_DoesNotReadCodexConfigOrAgentDirectory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cmm-draft-only-" + Guid.NewGuid().ToString("N"));
+        var codexPath = Path.Combine(root, "codex-home", "config.toml");
+        var agentsPath = Path.Combine(root, "codex-home", "agents");
+        var draftPath = Path.Combine(root, "manager", "subagents.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(codexPath)!);
+        Directory.CreateDirectory(agentsPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(draftPath)!);
+        File.WriteAllText(codexPath, "invalid = [", new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(agentsPath, "private.toml"), "secret", new UTF8Encoding(false));
+
+        try
+        {
+            var service = new SubagentConfigurationService(
+                configPath: codexPath,
+                agentsDirectory: agentsPath,
+                dataPath: draftPath,
+                backupRoot: Path.Combine(root, "backups"),
+                bridgeExecutablePath: Environment.ProcessPath);
+
+            var snapshot = service.InspectDraftOnly();
+
+            Assert.False(snapshot.ConfigReadable);
+            Assert.Equal("Codex æœªè¿æ¥ï¼ˆè·¯å¾„æœªè¯»å–ï¼‰", snapshot.ConfigPath);
+            Assert.Contains("æ²¡æœ‰è¯»å– MCP åŒºå—", snapshot.Bridge.StatusText, StringComparison.Ordinal);
+            Assert.All(snapshot.AppliedRoles.Values, state => Assert.False(state.ExactMatch));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private sealed class CountingHandler(Action count) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            count();
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable));
+        }
+    }
+}
+
+public sealed class ServerAllowlistTests
+{
+    [Fact]
+    public void ExactlyFiveConfiguredAliases_AreAccepted_AndExtraSshHostsAreIgnored()
+    {
+        using var fixture = new ServerAllowlistFixture();
+        var selected = fixture.Aliases.Take(5).ToArray();
+
+        var validated = AppSettingsService.ValidateServerAliases(fixture.ConfigPath, selected);
+        var dashboard = new DashboardStatusService(
+            fixture.ResourceRoot,
+            fixture.ConfigPath,
+            fixture.ConfigHash,
+            selected);
+
+        Assert.Equal(selected, validated);
+        Assert.Equal(5, dashboard.ExpectedServerCount);
+        Assert.Equal(selected, dashboard.DiscoveredServerAliases);
+        Assert.DoesNotContain(fixture.Aliases[5], dashboard.DiscoveredServerAliases);
+    }
+
+    [Fact]
+    public void MissingDuplicateOrUnknownAliases_AreRejectedBeforeAnyServerCheck()
+    {
+        using var fixture = new ServerAllowlistFixture();
+
+        Assert.Throws<ArgumentException>(() => AppSettingsService.ValidateServerAliases(
+            fixture.ConfigPath,
+            fixture.Aliases.Take(4).ToArray()));
+        Assert.Throws<ArgumentException>(() => AppSettingsService.ValidateServerAliases(
+            fixture.ConfigPath,
+            new[] { fixture.Aliases[0], fixture.Aliases[0], fixture.Aliases[1], fixture.Aliases[2], fixture.Aliases[3] }));
+        Assert.Throws<ArgumentException>(() => AppSettingsService.ValidateServerAliases(
+            fixture.ConfigPath,
+            new[] { fixture.Aliases[0], fixture.Aliases[1], fixture.Aliases[2], fixture.Aliases[3], "not-configured" }));
+    }
+
+    [Fact]
+    public void SettingsRemainDisabledUntilPathHashAndFiveAliasesAllMatch()
+    {
+        using var fixture = new ServerAllowlistFixture();
+        var data = Path.Combine(fixture.Root, "settings");
+        var settings = new AppSettingsService(data);
+
+        Assert.False(settings.ServerMonitoringEnabled);
+        settings.SetServerMonitoringConfiguration(
+            fixture.ConfigPath,
+            fixture.ConfigHash,
+            fixture.Aliases.Take(5).ToArray());
+        Assert.True(settings.ServerMonitoringEnabled);
+        Assert.Equal(5, settings.ServerAliases.Count);
+
+        settings.SetServerMonitoringConfiguration(null, null, Array.Empty<string>());
+        Assert.False(settings.ServerMonitoringEnabled);
+        Assert.Empty(settings.ServerAliases);
+    }
+
+    private sealed class ServerAllowlistFixture : IDisposable
+    {
+        public string Root { get; } = Path.Combine(Path.GetTempPath(), "cmm-server-allowlist-" + Guid.NewGuid().ToString("N"));
+        public string ConfigPath => Path.Combine(Root, "ssh-config");
+        public string ResourceRoot => Path.Combine(Root, "resources");
+        public string[] Aliases { get; } = ["srv-one", "srv-two", "srv-three", "srv-four", "srv-five", "srv-extra"];
+        public string ConfigHash { get; }
+
+        public ServerAllowlistFixture()
+        {
+            Directory.CreateDirectory(Root);
+            File.WriteAllText(
+                ConfigPath,
+                string.Join(Environment.NewLine, Aliases.Select(alias => $"Host {alias}{Environment.NewLine}  HostName 127.0.0.1")),
+                new UTF8Encoding(false));
+            ConfigHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(ConfigPath)));
+            Directory.CreateDirectory(Path.Combine(ResourceRoot, "Server"));
+            File.Copy(
+                Path.Combine(AppContext.BaseDirectory, "Resources", "Server", "health-check.ps1"),
+                Path.Combine(ResourceRoot, "Server", "health-check.ps1"));
+        }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
+        }
+    }
+}
+
 public sealed class CodexConversationContinuityTests
 {
     private const string TargetModel = "cmm/main";
@@ -329,4 +532,572 @@ public sealed class CodexConversationContinuityTests
 
     [Fact]
     public void VerifySameTask_MessageCountChanged_Fails()
-    ×Îv¶‰ËkºwµçpÑÉÕ”¤ì(€€€€€€€ô(€€€ô)ô()ÁÕ‰±¥ŒÍ•…±•±…ÍÌXÉÉ…åAÉ½•ÍÍM½Á•Q•ÍÑÌ)ì(€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥5…¹…•‘AÉ½•ÍÍM½Á•}I•©•ÑÍU¹É•±…Ñ•‘á•ÕÑ…‰±•Í%¹Q¡•%¹ÍÑ…±±¥É•Ñ½Éä ¤(€€€ì(€€€€€€€Ù…ÈÉ½½Ğ€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰ØÉÉ…å8µÑ•ÍĞµÉ½½Ğˆ¤ì(€€€€€€€Ù…È½¹™¥ÕÉ•€ôA…Ñ ¹½µ‰¥¹”¡É½½Ğ°€‰ØÉÉ…å8¹•á”ˆ¤ì(€€€€€€€ÍÍ•ÉĞ¹QÉÕ”¡1½…±M•ÉÙ¥•½¹ÑÉ½±M•ÉÙ¥”¹%Í5…¹…•‘XÉÉ…åAÉ½•ÍÍA…Ñ ¡½¹™¥ÕÉ•°½¹™¥ÕÉ•°É½½Ğ¤¤ì(€€€€€€€ÍÍ•ÉĞ¹QÉÕ”¡1½…±M•ÉÙ¥•½¹ÑÉ½±M•ÉÙ¥”¹%Í5…¹…•‘XÉÉ…åAÉ½•ÍÍA…Ñ  (€€€€€€€€€€€A…Ñ ¹½µ‰¥¹”¡É½½Ğ°€‰‰¥¸ˆ°€‰áÉ…ä¹•á”ˆ¤°½¹™¥ÕÉ•°É½½Ğ¤¤ì(€€€€€€€ÍÍ•ÉĞ¹…±Í”¡1½…±M•ÉÙ¥•½¹ÑÉ½±M•ÉÙ¥”¹%Í5…¹…•‘XÉÉ…åAÉ½•ÍÍA…Ñ  (€€€€€€€€€€€A…Ñ ¹½µ‰¥¹”¡É½½Ğ°€‰ÕÁ‘…Ñ•È¹•á”ˆ¤°½¹™¥ÕÉ•°É½½Ğ¤¤ì(€€€€€€€ÍÍ•ÉĞ¹…±Í”¡1½…±M•ÉÙ¥•½¹ÑÉ½±M•ÉÙ¥”¹%Í5…¹…•‘XÉÉ…åAÉ½•ÍÍA…Ñ  (€€€€€€€€€€€A…Ñ ¹½µ‰¥¹”¡É½½Ğ°€‰Ñ½½±Ìˆ°€‰¡•±Á•È¹•á”ˆ¤°½¹™¥ÕÉ•°É½½Ğ¤¤ì(€€€€€€€ÍÍ•ÉĞ¹…±Í”¡1½…±M•ÉÙ¥•½¹ÑÉ½±M•ÉÙ¥”¹%Í5…¹…•‘XÉÉ…åAÉ½•ÍÍA…Ñ  (€€€€€€€€€€€A…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰½ÕÑÍ¥‘”ˆ°€‰áÉ…ä¹•á”ˆ¤°½¹™¥ÕÉ•°É½½Ğ¤¤ì(€€€ô)ô()ÁÕ‰±¥Œ±…ÍÌ=ÕÑ¡Q½­•¹MÑ½É•Q•ÍÑÌ)ì(€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥M…Ù•}AÉ½‘Õ•Í¹ÉåÁÑ•‘¥±•}9½A±…¥¹Ñ•áÑQ½­•¹Ì ¤(€€€ì(€€€€€€€Ù…È‘¥È€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ½…ÕÑ ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤¤ì(€€€€€€€¥É•Ñ½Éä¹É•…Ñ•¥É•Ñ½Éä¡‘¥È¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…ÈÍÑ½É”€ô¹•Ü=ÕÑ¡Q½­•¹MÑ½É”¡‘¥È¤ì(€€€€€€€€€€€ÍÑ½É”¹M…Ù” ‰¡…ÑÁĞˆ°¹•Ü=ÕÑ¡É•‘•¹Ñ¥…±Ì(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€•ÍÌ€ô€‰Ñ•ÍĞµ…•ÍÌµÑ½­•¸µÍ•É•Ğ´ÄÈÌˆ°(€€€€€€€€€€€€€€€I•™É•Í €ô€‰ÉĞµÉ•™É•Í µÑ½­•¸µÍ•É•Ğ´ĞÔØˆ°(€€€€€€€€€€€€€€€½Õ¹Ñ%€ô€‰…Ğ´Äˆ(€€€€€€€€€€€ô¤ì((€€€€€€€€€€€Ù…ÈÉ…Ü€ô¥±”¹I•…‘±±Q•áĞ¡A…Ñ ¹½µ‰¥¹”¡‘¥È°€‰½…ÕÑ µÑ½­•¹Ì¹©Í½¸ˆ¤¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½•Í9½Ñ½¹Ñ…¥¸ ‰Ñ•ÍĞµ…•ÍÌµÑ½­•¸µÍ•É•Ğ´ÄÈÌˆ°É…Ü¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½•Í9½Ñ½¹Ñ…¥¸ ‰ÉĞµÉ•™É•Í µÑ½­•¸µÍ•É•Ğ´ĞÔØˆ°É…Ü¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥É•Ñ½Éä¹•±•Ñ”¡‘¥È°ÑÉÕ”¤ì(€€€€€€€ô(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥M…Ù•}Q¡•¹1½…‘}I½Õ¹‘QÉ¥ÁÍQ½­•¸ ¤(€€€ì(€€€€€€€Ù…È‘¥È€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ½…ÕÑ ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤¤ì(€€€€€€€¥É•Ñ½Éä¹É•…Ñ•¥É•Ñ½Éä¡‘¥È¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…ÈÍÑ½É”€ô¹•Ü=ÕÑ¡Q½­•¹MÑ½É”¡‘¥È¤ì(€€€€€€€€€€€ÍÑ½É”¹M…Ù” ‰¡…ÑÁĞˆ°¹•Ü=ÕÑ¡É•‘•¹Ñ¥…±Ìì•ÍÌ€ô€‰Ñ½¬µ„ˆ°I•™É•Í €ô€‰Ñ½¬µÈˆô¤ì(€€€€€€€€€€€Ù…È±½…‘•€ôÍÑ½É”¹1½… ‰¡…ÑÁĞˆ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹9½Ñ9Õ±°¡±½…‘•¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰Ñ½¬µ„ˆ°±½…‘•¹•ÍÌ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰Ñ½¬µÈˆ°±½…‘•¹I•™É•Í ¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥É•Ñ½Éä¹•±•Ñ”¡‘¥È°ÑÉÕ”¤ì(€€€€€€€ô(€€€ô)ô()ÁÕ‰±¥Œ±…ÍÌ9…Ñ¥Ù•AÉ½áå½¹™¥MÑ½É•Q•ÍÑÌ)ì(€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥M…Ù•}¹ÉåÁÑÍÁ¥-•å¹‘‘µ¥ÍÍ¥½¹Q½­•¸ ¤(€€€ì(€€€€€€€Ù…È‘¥È€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ™œ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤¤ì(€€€€€€€¥É•Ñ½Éä¹É•…Ñ•¥É•Ñ½Éä¡‘¥È¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…ÈÍÑ½É”€ô¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥MÑ½É”¡‘¥È¤ì(€€€€€€€€€€€ÍÑ½É”¹M…Ù”¡¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥œ(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€1¥ÍÑ•¹A½ÉĞ€ô€ÄÀÄÀÀ°(€€€€€€€€€€€€€€€‘µ¥ÍÍ¥½¹Q½­•¸€ô€‰…‘µ¥ÍÍ¥½¸µÍ•É•Ğµáåèˆ°(€€€€€€€€€€€€€€€AÉ½Ù¥‘•ÉÌ€ô(€€€€€€€€€€€€€€€l(€€€€€€€€€€€€€€€€€€€¹•ÜAÉ½Ù¥‘•É•™¥¹¥Ñ¥½¸ì%€ô€‰‘••ÁÍ••¬ˆ°	…Í•UÉ°€ô€‰¡ÑÑÀè¼½à½ØÄˆ°Á¥-•ä€ô€‰Í¬µÁ±…¥¸´ÄÈÌˆô(€€€€€€€€€€€€€€€t(€€€€€€€€€€€ô¤ì((€€€€€€€€€€€Ù…ÈÉ…Ü€ô¥±”¹I•…‘±±Q•áĞ¡A…Ñ ¹½µ‰¥¹”¡‘¥È°€‰½¹™¥œ¹©Í½¸ˆ¤¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½•Í9½Ñ½¹Ñ…¥¸ ‰…‘µ¥ÍÍ¥½¸µÍ•É•Ğµáåèˆ°É…Ü¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½•Í9½Ñ½¹Ñ…¥¸ ‰Í¬µÁ±…¥¸´ÄÈÌˆ°É…Ü¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½¹Ñ…¥¹Ì ‰‘Á…Á¤èˆ°É…Ü¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥É•Ñ½Éä¹•±•Ñ”¡‘¥È°ÑÉÕ”¤ì(€€€€€€€ô(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥1½…‘}I½Õ¹‘QÉ¥ÁÍ•ÉåÁÑ•‘M•É•ÑÌ ¤(€€€ì(€€€€€€€Ù…È‘¥È€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ™œ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤¤ì(€€€€€€€¥É•Ñ½Éä¹É•…Ñ•¥É•Ñ½Éä¡‘¥È¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…ÈÍÑ½É”€ô¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥MÑ½É”¡‘¥È¤ì(€€€€€€€€€€€ÍÑ½É”¹M…Ù”¡¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥œ(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€1¥ÍÑ•¹A½ÉĞ€ô€ÄÀÄÀÀ°(€€€€€€€€€€€€€€€‘µ¥ÍÍ¥½¹Q½­•¸€ô€‰…‘´´Äˆ°(€€€€€€€€€€€€€€€AÉ½Ù¥‘•ÉÌ€ôm¹•ÜAÉ½Ù¥‘•É•™¥¹¥Ñ¥½¸ì%€ô€‰Àˆ°Á¥-•ä€ô€‰­•ä´Äˆõt(€€€€€€€€€€€ô¤ì(€€€€€€€€€€€Ù…È±½…‘•€ôÍÑ½É”¹1½… ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰…‘´´Äˆ°±½…‘•¹‘µ¥ÍÍ¥½¹Q½­•¸¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰­•ä´Äˆ°±½…‘•¹AÉ½Ù¥‘•ÉÍlÁt¹Á¥-•ä¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥É•Ñ½Éä¹•±•Ñ”¡‘¥È°ÑÉÕ”¤ì(€€€€€€€ô(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥1½…‘}½ÉÉÕÁÑ½¹™¥}Q¡É½İÍ%¹ÍÑ•…‘=™•™…Õ±Ğ ¤(€€€ì(€€€€€€€Ù…È‘¥È€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ™œ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤¤ì(€€€€€€€¥É•Ñ½Éä¹É•…Ñ•¥É•Ñ½Éä¡‘¥È¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€¥±”¹]É¥Ñ•±±Q•áĞ¡A…Ñ ¹½µ‰¥¹”¡‘¥È°€‰½¹™¥œ¹©Í½¸ˆ¤°€‰í½ÉÉÕÁĞµ©Í½¸„„„ˆ¤ì(€€€€€€€€€€€Ù…ÈÍÑ½É”€ô¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥MÑ½É”¡‘¥È¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹Q¡É½İÌñ%¹Ù…±¥‘=Á•É…Ñ¥½¹á•ÁÑ¥½¸ø  ¤€ôøÍÑ½É”¹1½… ¤¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥É•Ñ½Éä¹•±•Ñ”¡‘¥È°ÑÉÕ”¤ì(€€€€€€€ô(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥UÁÉ…‘•A±…¥¹Ñ•áÑM•É•ÑÍ}½¹Ù•ÉÑÍ1•…åA±…¥¹Ñ•áĞ ¤(€€€ì(€€€€€€€Ù…È‘¥È€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ™œ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤¤ì(€€€€€€€¥É•Ñ½Éä¹É•…Ñ•¥É•Ñ½Éä¡‘¥È¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…ÈÁ…Ñ €ôA…Ñ ¹½µ‰¥¹”¡‘¥È°€‰½¹™¥œ¹©Í½¸ˆ¤ì(€€€€€€€€€€€¥±”¹]É¥Ñ•±±Q•áĞ¡Á…Ñ °€ˆˆˆ(€€€€€€€€€€€€€€€ì(€€€€€€€€€€€€€€€€€€‰1¥ÍÑ•¹A½ÉĞˆè€ÄÀÄÀÀ°(€€€€€€€€€€€€€€€€€€‰‘µ¥ÍÍ¥½¹Q½­•¸ˆè€‰±•…äµÁ±…¥¸µÑ½­•¸ˆ°(€€€€€€€€€€€€€€€€€€‰AÉ½Ù¥‘•ÉÌˆèl(€€€€€€€€€€€€€€€€€€€ì€‰%ˆè€‰Àˆ°€‰	…Í•UÉ°ˆè€‰¡ÑÑÀè¼½à½ØÄˆ°€‰Á¥-•äˆè€‰±•…äµÁ±…¥¸µ­•äˆô(€€€€€€€€€€€€€€€€€t(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€ˆˆˆ¤ì(€€€€€€€€€€€Ù…ÈÍÑ½É”€ô¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥MÑ½É”¡‘¥È¤ì(€€€€€€€€€€€Ù…È½¹™¥œ€ôÍÑ½É”¹1½… ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰±•…äµÁ±…¥¸µÑ½­•¸ˆ°½¹™¥œ¹‘µ¥ÍÍ¥½¹Q½­•¸¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰±•…äµÁ±…¥¸µ­•äˆ°½¹™¥œ¹AÉ½Ù¥‘•ÉÍlÁt¹Á¥-•ä¤ì((€€€€€€€€€€€Ù…ÈÕÁÉ…‘•€ôÍÑ½É”¹UÁÉ…‘•A±…¥¹Ñ•áÑM•É•ÑÌ¡½¹™¥œ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹QÉÕ”¡ÕÁÉ…‘•¤ì((€€€€€€€€€€€Ù…ÈÉ…Ü€ô¥±”¹I•…‘±±Q•áĞ¡Á…Ñ ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½•Í9½Ñ½¹Ñ…¥¸ ‰±•…äµÁ±…¥¸µÑ½­•¸ˆ°É…Ü¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½•Í9½Ñ½¹Ñ…¥¸ ‰±•…äµÁ±…¥¸µ­•äˆ°É…Ü¤ì((€€€€€€€€€€€Ù…ÈÉ•±½…‘•€ôÍÑ½É”¹1½… ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰±•…äµÁ±…¥¸µÑ½­•¸ˆ°É•±½…‘•¹‘µ¥ÍÍ¥½¹Q½­•¸¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰±•…äµÁ±…¥¸µ­•äˆ°É•±½…‘•¹AÉ½Ù¥‘•ÉÍlÁt¹Á¥-•ä¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥É•Ñ½Éä¹•±•Ñ”¡‘¥È°ÑÉÕ”¤ì(€€€€€€€ô(€€€ô)ô()ÁÕ‰±¥Œ±…ÍÌ9…Ñ¥Ù•AÉ½áå‘µ¥ÍÍ¥½¹Q•ÍÑÌ)ì(€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥!½ÍÑ}5¥ÍÍ¥¹‘µ¥ÍÍ¥½¹Q½­•¹}…¥±Í±½Í•‘	•™½É•1¥ÍÑ•¹¥¹œ ¤(€€€ì(€€€€€€€Ù…È‘¥È€ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ…‘µ¥ÍÍ¥½¸´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤¤ì(€€€€€€€¥É•Ñ½Éä¹É•…Ñ•¥É•Ñ½Éä¡‘¥È¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…ÈÍÑ½É”€ô¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥MÑ½É”¡‘¥È¤ì(€€€€€€€€€€€ÍÑ½É”¹M…Ù”¡¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥œì1¥ÍÑ•¹A½ÉĞ€ô€ÄÀÄÀÀ°‘µ¥ÍÍ¥½¹Q½­•¸€ô¹Õ±°ô¤ì(€€€€€€€€€€€Ù…È•ÉÉ½È€ôÍÍ•ÉĞ¹Q¡É½İÌñ%¹Ù…±¥‘=Á•É…Ñ¥½¹á•ÁÑ¥½¸ø  ¤€ôø(€€€€€€€€€€€€€€€¹•Ü9…Ñ¥Ù•AÉ½áå!½ÍĞ¡ÍÑ½É”°‘…Ñ…I½½Ñ=Ù•ÉÉ¥‘”è‘¥È¤¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½¹Ñ…¥¹Ì ‰‘µ¥ÍÍ¥½¸Q½­•¸ˆ°•ÉÉ½È¹5•ÍÍ…”°MÑÉ¥¹½µÁ…É¥Í½¸¹=É‘¥¹…°¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥É•Ñ½Éä¹•±•Ñ”¡‘¥È°ÑÉÕ”¤ì(€€€€€€€ô(€€€ô)ô()ÁÕ‰±¥Œ±…ÍÌI½ÕÑ•I•Í½±Ù•ÉQ•ÍÑÌ)ì(€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥I•Í½±Ù•}U¹­¹½İ¹5½‘•±}Q¡É½İÍ5½‘•±9½Ñ½Õ¹ ¤(€€€ì(€€€€€€€Ù…ÈÉ•¥ÍÑÉä€ô¹•ÜAÉ½Ù¥‘•ÉI•¥ÍÑÉä¡¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥œ(€€€€€€€ì(€€€€€€€€€€€AÉ½Ù¥‘•ÉÌ€ô(€€€€€€€€€€€l(€€€€€€€€€€€€€€€¹•ÜAÉ½Ù¥‘•É•™¥¹¥Ñ¥½¸ì%€ô€‰½Á•¹…¤ˆ°9…µ”€ô€‰=Á•¹$ˆ°5½‘•±Ì€ôl‰ÁĞ´Ô¸ØµÍ½°‰t°•™…Õ±Ñ5½‘•°€ô€‰ÁĞ´Ô¸ØµÍ½°ˆô(€€€€€€€€€€€t(€€€€€€€ô¤ì(€€€€€€€ÍÍ•ÉĞ¹Q¡É½İÌñ½‘•á=Á•¹½‘•á9…Ñ¥Ù”¹AÉ½Ù¥‘•ÉÌ¹5½‘•±9½Ñ½Õ¹‘á•ÁÑ¥½¸ø (€€€€€€€€€€€€ ¤€ôø½‘•á=Á•¹½‘•á9…Ñ¥Ù”¹AÉ½Ù¥‘•ÉÌ¹I½ÕÑ•I•Í½±Ù•È¹I•Í½±Ù”¡É•¥ÍÑÉä°€‰¹¼µÍÕ µµ½‘•°ˆ¤¤ì(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥I•Í½±Ù•}	…É•5½‘•±9…µ•}¥¹‘ÍAÉ½Ù¥‘•È ¤(€€€ì(€€€€€€€Ù…ÈÉ•¥ÍÑÉä€ô¹•ÜAÉ½Ù¥‘•ÉI•¥ÍÑÉä¡¹•Ü9…Ñ¥Ù•AÉ½áå½¹™¥œ(€€€€€€€ì(€€€€€€€€€€€AÉ½Ù¥‘•ÉÌ€ô(€€€€€€€€€€€l(€€€€€€€€€€€€€€€¹•ÜAÉ½Ù¥‘•É•™¥¹¥Ñ¥½¸ì%€ô€‰‘••ÁÍ••¬ˆ°9…µ”€ô€‰••ÁM••¬ˆ°5½‘•±Ì€ôl‰‘••ÁÍ••¬µØĞµ™±…Í ‰t°•™…Õ±Ñ5½‘•°€ô€‰‘••ÁÍ••¬µØĞµ™±…Í ˆô(€€€€€€€€€€€t(€€€€€€€ô¤ì(€€€€€€€Ù…ÈÉ•ÍÕ±Ğ€ô½‘•á=Á•¹½‘•á9…Ñ¥Ù”¹AÉ½Ù¥‘•ÉÌ¹I½ÕÑ•I•Í½±Ù•È¹I•Í½±Ù”¡É•¥ÍÑÉä°€‰‘••ÁÍ••¬µØĞµ™±…Í ˆ¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰‘••ÁÍ••¬ˆ°É•ÍÕ±Ğ¹AÉ½Ù¥‘•É%¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰‘••ÁÍ••¬µØĞµ™±…Í ˆ°É•ÍÕ±Ğ¹5½‘•±%¤ì(€€€ô)ô()ÁÕ‰±¥Œ±…ÍÌ]½É­•É	É½­•ÉAÉ¥¥¹Q•ÍÑÌ)ì(€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥•ÑI½±•AÉ¥¥¹}I•ÑÕÉ¹Í½¹™¥ÕÉ•‘Y…±Õ•Ì ¤(€€€ì(€€€€€€€€¼¼ƒ¦k¢şMÕ‰…•¹Ñ½¹™¥ÕÉ…Ñ¥½¹M•ÉÙ¥”ƒj¦îc¢º“¢K¢&Ë¦ª3¢¾(€€€€€€€Ù…ÈÍ•ÉÙ¥”€ô¹•ÜMÕ‰…•¹Ñ½¹™¥ÕÉ…Ñ¥½¹M•ÉÙ¥” ¤ì(€€€€€€€Ù…È‰É½­•È€ô¹•Ü]½É­•É	É½­•È (€€€€€€€€€€€¹•ÜáÑ•É¹…±]½É­•ÉM•ÉÙ¥” (€€€€€€€€€€€€€€€¹•Ü…­•½¹™¥M½ÕÉ” ¤°(€€€€€€€€€€€€€€€¹•Ü…­•	…­•¹ ¤°(€€€€€€€€€€€€€€€¹•Ü…­•Õ‘¥Ğ ¤¤°(€€€€€€€€€€€Í•ÉÙ¥”¤ì((€€€€€€€Ù…ÈÁÉ¥¥¹œ€ô‰É½­•È¹•ÑI½±•AÉ¥¥¹œ ‰µµ}•áÁ±½É•Èˆ¤ì(€€€€€€€ÍÍ•ÉĞ¹9½Ñ9Õ±°¡ÁÉ¥¥¹œ¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° É´°ÁÉ¥¥¹œ¹AÉ¥•A•É5¥±±¥½¹Q½­•¹Ì¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰UMˆ°ÁÉ¥¥¹œ¹ÕÉÉ•¹ä¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ÔÁ´°ÁÉ¥¥¹œ¹	Õ‘•Ñ1¥µ¥Ğ¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ÌÀÀ°ÁÉ¥¥¹œ¹5…áQ¥µ•½ÕÑM•½¹‘Ì¤ì(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥•±•…Ñ•Íå¹}U¹­¹½İ¹I½±•}…¥±Í±½Í• ¤(€€€ì(€€€€€€€Ù…ÈÍ•ÉÙ¥”€ô¹•ÜMÕ‰…•¹Ñ½¹™¥ÕÉ…Ñ¥½¹M•ÉÙ¥” ¤ì(€€€€€€€Ù…È‰É½­•È€ô¹•Ü]½É­•É	É½­•È (€€€€€€€€€€€¹•ÜáÑ•É¹…±]½É­•ÉM•ÉÙ¥”¡¹•Ü…­•½¹™¥M½ÕÉ” ¤°¹•Ü…­•	…­•¹ ¤°¹•Ü…­•Õ‘¥Ğ ¤¤°(€€€€€€€€€€€Í•ÉÙ¥”¤ì((€€€€€€€Ù…È•à€ôÍÍ•ÉĞ¹Q¡É½İÌñ]½É­•É	É½­•Éá•ÁÑ¥½¸ø  ¤€ôø(€€€€€€€€€€€‰É½­•È¹•±•…Ñ•Íå¹Œ ‰¹½}ÍÕ¡}É½±”ˆ°€‰Ñ…Í¬ˆ¤¹•Ñİ…¥Ñ•È ¤¹•ÑI•ÍÕ±Ğ ¤¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰É½±•}¹½Ñ}™½Õ¹ˆ°•à¹½‘”¤ì(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥•±•…Ñ•Íå¹}I½±•]¥Ñ¡½ÕÑAÉ¥¥¹}…¥±Í±½Í• ¤(€€€ì(€€€€€€€Ù…ÈÍ•ÉÙ¥”€ô¹•ÜMÕ‰…•¹Ñ½¹™¥ÕÉ…Ñ¥½¹M•ÉÙ¥” ¤ì(€€€€€€€Ù…È‰É½­•È€ô¹•Ü]½É­•É	É½­•È (€€€€€€€€€€€¹•ÜáÑ•É¹…±]½É­•ÉM•ÉÙ¥”¡¹•Ü…­•½¹™¥M½ÕÉ” ¤°¹•Ü…­•	…­•¹ ¤°¹•Ü…­•Õ‘¥Ğ ¤¤°(€€€€€€€€€€€Í•ÉÙ¥”¤ì((€€€€€€€€¼¼µµ}ÍÕÁ•ÉÙ¥Í½Èƒ’â7–¢ºã–’[¦£–Ş—’êë¾ò!±±½İÍáÑ•É¹…±]½É­•Èõ™…±Í—¾ò'ŠHƒ–’Ç¢Ò—–Ï¦^´(€€€€€€€Ù…È•à€ôÍÍ•ÉĞ¹Q¡É½İÌñ]½É­•É	É½­•Éá•ÁÑ¥½¸ø  ¤€ôø(€€€€€€€€€€€‰É½­•È¹•±•…Ñ•Íå¹Œ ‰µµ}ÍÕÁ•ÉÙ¥Í½Èˆ°€‰Ñ…Í¬ˆ¤¹•Ñİ…¥Ñ•È ¤¹•ÑI•ÍÕ±Ğ ¤¤ì(€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ‰É½±•}•áÑ•É¹…±}™½É‰¥‘‘•¸ˆ°•à¹½‘”¤ì(€€€ô((€€€ÁÉ¥Ù…Ñ”Í•…±•±…ÍÌ…­•½¹™¥M½ÕÉ”€è%áÑ•É¹…±]½É­•É½¹™¥ÕÉ…Ñ¥½¹M½ÕÉ”(€€€ì(€€€€€€€ÁÕ‰±¥ŒÍÑÉ¥¹œü1½…‘]…É¹¥¹œ€ôø¹Õ±°ì(€€€€€€€ÁÕ‰±¥Œ%I•…‘=¹±å1¥ÍĞñMÕ‰…•¹ÑI½±••™¥¹¥Ñ¥½¸øI½±•Ìì•Ğìô€ôÉÉ…ä¹µÁÑäñMÕ‰…•¹ÑI½±••™¥¹¥Ñ¥½¸ø ¤ì(€€€€€€€ÁÕ‰±¥ŒMÕ‰…•¹Ñ½¹™¥ÕÉ…Ñ¥½¹½Õµ•¹Ğ1½…‘É…™Ğ ¤€ôø¹•Ü ¤ì(€€€ô((€€€ÁÉ¥Ù…Ñ”Í•…±•±…ÍÌ…­•	…­•¹€è%áÑ•É¹…±]½É­•É	…­•¹(€€€ì(€€€€€€€ÁÕ‰±¥Œ%I•…‘=¹±å1¥ÍĞñÍÑÉ¥¹œøI•…‘½¹™¥ÕÉ•‘5½‘•±Ì ¤€ôøÉÉ…ä¹µÁÑäñÍÑÉ¥¹œø ¤ì(€€€€€€€ÁÕ‰±¥ŒQ…Í¬ñáÑ•É¹…±]½É­•É	…­•¹‘I•ÍÁ½¹Í”ø½µÁ±•Ñ•Íå¹Œ¡áÑ•É¹…±]½É­•É	…­•¹‘I•ÅÕ•ÍĞÉ•ÅÕ•ÍĞ°…¹•±±…Ñ¥½¹Q½­•¸…¹•±±…Ñ¥½¹Q½­•¸€ô‘•™…Õ±Ğ¤€ôø(€€€€€€€€€€€Q…Í¬¹É½µI•ÍÕ±Ğ¡¹•ÜáÑ•É¹…±]½É­•É	…­•¹‘I•ÍÁ½¹Í” ‰½¬ˆ°€‰ÍÑ½Àˆ°¹•ÜáÑ•É¹…±]½É­•ÉQ½­•¹UÍ…” Ä°€Ä°€È¤°€ÈÀÀ°É•ÅÕ•ÍĞ¹5½‘•°¤¤ì(€€€ô((€€€ÁÉ¥Ù…Ñ”Í•…±•±…ÍÌ…­•Õ‘¥Ğ€è%áÑ•É¹…±]½É­•ÉÕ‘¥ÑM¥¹¬(€€€ì(€€€€€€€ÁÕ‰±¥ŒY…±Õ•Q…Í¬ÁÁ•¹‘Íå¹Œ¡áÑ•É¹…±]½É­•ÉÕ‘¥Ñ¹ÑÉä•¹ÑÉä°…¹•±±…Ñ¥½¹Q½­•¸…¹•±±…Ñ¥½¹Q½­•¸€ô‘•™…Õ±Ğ¤€ôø(€€€€€€€€€€€Y…±Õ•Q…Í¬¹½µÁ±•Ñ•‘Q…Í¬ì(€€€ô)ô()ÁÕ‰±¥Œ±…ÍÌ]½É­•É	Õ‘•Ñ1•‘•ÉQ•ÍÑÌ)ì(€€€m…Ñt(€€€ÁÕ‰±¥Œ…Íå¹ŒQ…Í¬•‘ÕÑ}Q¡•¹}¡•­	•™½É•…±±}I•©•ÑÍ]¡•¹	Õ‘•Ñá¡…ÕÍÑ• ¤(€€€ì(€€€€€€€Ù…ÈÁ…Ñ €ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ‰Õ‘•Ğ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤€¬€ˆ¹©Í½¸ˆ¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…È±•‘•È€ô¹•Ü]½É­•É	Õ‘•Ñ1•‘•È¡Á…Ñ ¤ì(€€€€€€€€€€€Ù…ÈÉ½±”€ô¹•ÜMÕ‰…•¹ÑI½±••™¥¹¥Ñ¥½¸ (€€€€€€€€€€€€€€€€‰µµ}Ñ•ÍĞˆ°€‹šÖ/¢¾Tˆ°€‰Ğˆ°€‰ÁĞ´Ô¸ØµÍ½°ˆ°€‰±½Üˆ°€‰É•…µ½¹±äˆ°ÑÉÕ”°(€€€€€€€€€€€€€€€€‰‘•Øˆ°(€€€€€€€€€€€€€€€AÉ¥•A•É5¥±±¥½¹Q½­•¹Ìè€ÄÀÀÁ´°€¼¼ƒš¾?fû’âÑ½­•¸€ÄÀÀÀƒú;–(€€€€€€€€€€€€€€€ÕÉÉ•¹äè€‰UMˆ°(€€€€€€€€€€€€€€€	Õ‘•Ñ1¥µ¥Ğè€À¸ÀÀÅ´°€€€€€€€€€€¼¼ƒ¦Šº\€À¸ÀÀÄƒú;–(€€€€€€€€€€€€€€€5…áQ¥µ•½ÕÑM•½¹‘Ìè€ØÀ¤ì((€€€€€€€€€€€€¼¼ƒR €ÄÀÀÀÑ½­•¸ƒŠHƒš"Cšr°€À¸ÀÀÄƒú;–ƒŠHƒš¶––÷š&Ošî‡¦Šº\(€€€€€€€€€€€Ù…È½ÍĞ€ô…İ…¥Ğ±•‘•È¹•‘ÕÑÍå¹Œ¡É½±”°€ÄÀÀÀ°€À¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° Ä¸Á´°½ÍĞ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° Ä¸Á´°±•‘•È¹•ÑMÁ•¹Ğ ‰µµ}Ñ•ÍĞˆ¤¤ì((€€€€€€€€€€€€¼¼ƒ¦Šº_¢_–ÂôƒŠHƒš.Kît(€€€€€€€€€€€Ù…È‰±½¬€ô±•‘•È¹¡•­	•™½É•…±°¡É½±”¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹9½Ñ9Õ±°¡‰±½¬¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½¹Ñ…¥¹Ì ‹–ŞË¢_–Âôˆ°‰±½¬¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥±”¹•±•Ñ”¡Á…Ñ ¤ì(€€€€€€€ô(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥Œ…Íå¹ŒQ…Í¬•‘ÕÑ}ÕµÕ±…Ñ•ÍÉ½ÍÍ…±±Ì ¤(€€€ì(€€€€€€€Ù…ÈÁ…Ñ €ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ‰Õ‘•Ğ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤€¬€ˆ¹©Í½¸ˆ¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…È±•‘•È€ô¹•Ü]½É­•É	Õ‘•Ñ1•‘•È¡Á…Ñ ¤ì(€€€€€€€€€€€Ù…ÈÉ½±”€ô¹•ÜMÕ‰…•¹ÑI½±••™¥¹¥Ñ¥½¸ (€€€€€€€€€€€€€€€€‰µµ}Ñ•ÍĞÈˆ°€‹šÖ/¢¾TÈˆ°€‰Ğˆ°€‰ÁĞ´Ô¸ØµÍ½°ˆ°€‰±½Üˆ°€‰É•…µ½¹±äˆ°ÑÉÕ”°(€€€€€€€€€€€€€€€€‰‘•Øˆ°(€€€€€€€€€€€€€€€AÉ¥•A•É5¥±±¥½¹Q½­•¹Ìè€É´°(€€€€€€€€€€€€€€€ÕÉÉ•¹äè€‰UMˆ°(€€€€€€€€€€€€€€€	Õ‘•Ñ1¥µ¥Ğè€ÄÁ´°(€€€€€€€€€€€€€€€5…áQ¥µ•½ÕÑM•½¹‘Ìè€ØÀ¤ì((€€€€€€€€€€€Ù…ÈŒÄ€ô…İ…¥Ğ±•‘•È¹•‘ÕÑÍå¹Œ¡É½±”°€ÄÀÀÀÀÀ°€À¤ì€€¼¼€À¸Èƒú;–(€€€€€€€€€€€Ù…ÈŒÈ€ô…İ…¥Ğ±•‘•È¹•‘ÕÑÍå¹Œ¡É½±”°€ÄÀÀÀÀÀ°€À¤ì€€¼¼€À¸Èƒú;–(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° À¸É´°ŒÄ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° À¸É´°ŒÈ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° À¸Ñ´°±•‘•È¹•ÑMÁ•¹Ğ ‰µµ}Ñ•ÍĞÈˆ¤¤ì((€€€€€€€€€€€Ù…ÈÉ•µ…¥¹¥¹œ€ô±•‘•È¹•ÑI•µ…¥¹¥¹œ¡É½±”¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹9½Ñ9Õ±°¡É•µ…¥¹¥¹œ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹ÅÕ…° ä¸Ù´°É•µ…¥¹¥¹œ¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹9Õ±°¡±•‘•È¹¡•­	•™½É•…±°¡É½±”¤¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥±”¹•±•Ñ”¡Á…Ñ ¤ì(€€€€€€€ô(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥ŒÙ½¥¡•­	•™½É•…±±}I½±•]¥Ñ¡½ÕÑAÉ¥¥¹}I•©•ÑÌ ¤(€€€ì(€€€€€€€Ù…ÈÁ…Ñ €ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ‰Õ‘•Ğ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤€¬€ˆ¹©Í½¸ˆ¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…È±•‘•È€ô¹•Ü]½É­•É	Õ‘•Ñ1•‘•È¡Á…Ñ ¤ì(€€€€€€€€€€€Ù…ÈÉ½±”€ô¹•ÜMÕ‰…•¹ÑI½±••™¥¹¥Ñ¥½¸ (€€€€€€€€€€€€€€€€‰µµ}¹½ÁÉ¥”ˆ°€‹š^ƒ’îÜˆ°€‰Ğˆ°€‰ÁĞ´Ô¸ØµÍ½°ˆ°€‰±½Üˆ°€‰É•…µ½¹±äˆ°ÑÉÕ”°€‰‘•Øˆ¤ì(€€€€€€€€€€€Ù…È‰±½¬€ô±•‘•È¹¡•­	•™½É•…±°¡É½±”¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹9½Ñ9Õ±°¡‰±½¬¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½¹Ñ…¥¹Ì ‹šr«¦7ö»’îßš‚ğˆ°‰±½¬¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥±”¹•±•Ñ”¡Á…Ñ ¤ì(€€€€€€€ô(€€€ô((€€€m…Ñt(€€€ÁÕ‰±¥Œ…Íå¹ŒQ…Í¬•‘ÕÑ}5¥ÍÍ¥¹UÍ…•}Q¡É½İÍ…¥±±½Í• ¤(€€€ì(€€€€€€€Ù…ÈÁ…Ñ €ôA…Ñ ¹½µ‰¥¹”¡A…Ñ ¹•ÑQ•µÁA…Ñ  ¤°€‰µ´µ‰Õ‘•Ğ´ˆ€¬Õ¥¹9•İÕ¥ ¤¹Q½MÑÉ¥¹œ ‰8ˆ¤€¬€ˆ¹©Í½¸ˆ¤ì(€€€€€€€ÑÉä(€€€€€€€ì(€€€€€€€€€€€Ù…È±•‘•È€ô¹•Ü]½É­•É	Õ‘•Ñ1•‘•È¡Á…Ñ ¤ì(€€€€€€€€€€€Ù…ÈÉ½±”€ô¹•ÜMÕ‰…•¹ÑI½±••™¥¹¥Ñ¥½¸ (€€€€€€€€€€€€€€€€‰µµ}¹½ÕÍ…”ˆ°€‹š^ƒR£¦<ˆ°€‰Ğˆ°€‰ÁĞ´Ô¸ØµÍ½°ˆ°€‰±½Üˆ°€‰É•…µ½¹±äˆ°ÑÉÕ”°(€€€€€€€€€€€€€€€€‰‘•Øˆ°(€€€€€€€€€€€€€€€AÉ¥•A•É5¥±±¥½¹Q½­•¹Ìè€É´°(€€€€€€€€€€€€€€€ÕÉÉ•¹äè€‰UMˆ°(€€€€€€€€€€€€€€€	Õ‘•Ñ1¥µ¥Ğè€ÄÁ´°(€€€€€€€€€€€€€€€5…áQ¥µ•½ÕÑM•½¹‘Ìè€ØÀ¤ì((€€€€€€€€€€€€¼¼ÕÍ…”ƒ–º3–£òë–’Çš^Û’â7–ú_š2$€Àƒ¢º‡¢Òç¾ò3–ş¦†ï–’Ç¢Ò—–Ï¦^´(€€€€€€€€€€€Ù…È•à€ô…İ…¥ĞÍÍ•ÉĞ¹Q¡É½İÍÍå¹Œñ%¹Ù…±¥‘=Á•É…Ñ¥½¹á•ÁÑ¥½¸ø  ¤€ôø(€€€€€€€€€€€€€€€±•‘•È¹•‘ÕÑÍå¹Œ¡É½±”°¹Õ±°°¹Õ±°¤¤ì(€€€€€€€€€€€ÍÍ•ÉĞ¹½¹Ñ…¥¹Ì ‹šr«¢şS–nxÑ½­•¸ƒR£¦<ˆ°•à¹5•ÍÍ…”¤ì(€€€€€€€ô(€€€€€€€™¥¹…±±ä(€€€€€€€ì(€€€€€€€€€€€¥±”¹•±•Ñ”¡Á…Ñ ¤ì(€€€€€€€ô(€€€ô)ô(
+    {
+        var result = CodexConversationContinuity.VerifySameTask(
+            Before(),
+            After() with { VisibleMessageCount = 5 },
+            TargetModel);
+        Assert.False(result.Success);
+    }
+
+    [Fact]
+    public void VerifySameTask_ConversationFingerprintChanged_Fails()
+    {
+        var result = CodexConversationContinuity.VerifySameTask(
+            Before(),
+            After() with { ConversationFingerprint = "fingerprint-b" },
+            TargetModel);
+        Assert.False(result.Success);
+    }
+
+    [Fact]
+    public void VerifySameTask_NoContinuityEvidence_FailsClosed()
+    {
+        var before = new CodexDesktopState(true, false, "gpt-old", "before");
+        var after = new CodexDesktopState(true, false, TargetModel, "after");
+        var result = CodexConversationContinuity.VerifySameTask(before, after, TargetModel);
+        Assert.False(result.Success);
+    }
+
+    [Fact]
+    public void VerifySameTask_EvidenceMissingAfterSwitch_FailsClosed()
+    {
+        var after = new CodexDesktopState(true, false, TargetModel, "after");
+        var result = CodexConversationContinuity.VerifySameTask(Before(), after, TargetModel);
+        Assert.False(result.Success);
+    }
+
+    [Fact]
+    public void AccountPoolPolicy_UsesStableDesktopAlias_AndNeverRestartsCodexAutomatically()
+    {
+        Assert.Equal(OpenCodexClient.SwitchAlias, AccountPoolService.StableDesktopAlias);
+        Assert.Equal("cmm/main", AccountPoolService.StableDesktopAlias);
+        Assert.False(AccountPoolService.AllowsAutomaticCodexRestart);
+    }
+
+    private static CodexDesktopState Before() => new(
+        true,
+        false,
+        "gpt-old",
+        "before",
+        HostProcessId: 101,
+        TaskIdentity: "task-1",
+        VisibleMessageCount: 4,
+        ConversationFingerprint: "fingerprint-a");
+
+    private static CodexDesktopState After() => new(
+        true,
+        false,
+        TargetModel,
+        "after",
+        HostProcessId: 101,
+        TaskIdentity: "task-1",
+        VisibleMessageCount: 4,
+        ConversationFingerprint: "fingerprint-a");
+}
+
+public sealed class InternalRouteNamingTests
+{
+    [Fact]
+    public void ActiveRouter_AcceptsOnlyCurrentCmmNamespace()
+    {
+        Assert.True(InternalRouteNames.IsAlias("cmm/main"));
+        Assert.True(InternalRouteNames.IsAlias("CMM/pool-1"));
+        Assert.False(InternalRouteNames.IsAlias("zcode/main"));
+        Assert.False(InternalRouteNames.IsAlias("gpt-5.6-sol"));
+    }
+
+    [Fact]
+    public void NativeConfig_Load_RewritesLegacyRouteNamesAndRemovesThemFromDisk()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-route-migration-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = new NativeProxyConfigStore(dir);
+            store.Save(new NativeProxyConfig
+            {
+                Combos =
+                [
+                    new ComboDefinition
+                    {
+                        Id = "zcode-switch",
+                        Alias = "zcode/main",
+                        Targets = [new ComboTargetDefinition { Provider = "test", Model = "model" }]
+                    }
+                ]
+            });
+
+            var loaded = store.Load();
+            var combo = Assert.Single(loaded.Combos);
+            Assert.Equal(InternalRouteNames.SwitchComboId, combo.Id);
+            Assert.Equal(InternalRouteNames.MainAlias, combo.Alias);
+            var raw = File.ReadAllText(store.ConfigPath);
+            Assert.DoesNotContain("zcode", raw, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void PoolCatalog_Load_RewritesLegacyAliasesAndAdvancesSchema()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-pool-route-migration-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "pools.json"), """
+                {
+                  "SchemaVersion": 3,
+                  "Pools": [
+                    {
+                      "Id": "legacy-pool",
+                      "DisplayName": "Legacy Pool",
+                      "Transport": "CliProxyApi",
+                      "Product": "CodexPlus",
+                      "Enabled": true,
+                      "RouteAlias": "zcode/custom",
+                      "ProviderId": "cmm-legacy-pool",
+                      "DefaultModel": "gpt-5.6-sol",
+                      "BaseUrl": "http://127.0.0.1:18455/v1",
+                      "LocalPort": 18455
+                    }
+                  ],
+                  "Active": {
+                    "PoolId": "legacy-pool",
+                    "Model": "zcode/main",
+                    "Verification": "legacy-route-test"
+                  }
+                }
+                """);
+
+            var catalog = new PoolCatalogService(dir);
+            Assert.Null(catalog.LoadWarning);
+            Assert.Equal("cmm/custom", catalog.Find("legacy-pool")?.RouteAlias);
+            Assert.Equal(InternalRouteNames.MainAlias, catalog.GetActive().Model);
+            using var json = JsonDocument.Parse(File.ReadAllText(catalog.FilePath));
+            Assert.Equal(PoolCatalogService.CurrentSchemaVersion, json.RootElement.GetProperty("SchemaVersion").GetInt32());
+            Assert.DoesNotContain("zcode", json.RootElement.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+}
+
+public sealed class V2rayProcessScopeTests
+{
+    [Fact]
+    public void ManagedProcessScope_RejectsUnrelatedExecutablesInTheInstallDirectory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "v2rayN-test-root");
+        var configured = Path.Combine(root, "v2rayN.exe");
+        Assert.True(LocalServiceControlService.IsManagedV2rayProcessPath(configured, configured, root));
+        Assert.True(LocalServiceControlService.IsManagedV2rayProcessPath(
+            Path.Combine(root, "bin", "xray.exe"), configured, root));
+        Assert.False(LocalServiceControlService.IsManagedV2rayProcessPath(
+            Path.Combine(root, "updater.exe"), configured, root));
+        Assert.False(LocalServiceControlService.IsManagedV2rayProcessPath(
+            Path.Combine(root, "tools", "helper.exe"), configured, root));
+        Assert.False(LocalServiceControlService.IsManagedV2rayProcessPath(
+            Path.Combine(Path.GetTempPath(), "outside", "xray.exe"), configured, root));
+    }
+}
+
+public class OAuthTokenStoreTests
+{
+    [Fact]
+    public void Save_ProducesEncryptedFile_NoPlaintextTokens()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-oauth-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = new OAuthTokenStore(dir);
+            store.Save("chatgpt", new OAuthCredentials
+            {
+                Access = "test-access-token-secret-123",
+                Refresh = "rt-refresh-token-secret-456",
+                AccountId = "acct-1"
+            });
+
+            var raw = File.ReadAllText(Path.Combine(dir, "oauth-tokens.json"));
+            Assert.DoesNotContain("test-access-token-secret-123", raw);
+            Assert.DoesNotContain("rt-refresh-token-secret-456", raw);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Save_ThenLoad_RoundTripsToken()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-oauth-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = new OAuthTokenStore(dir);
+            store.Save("chatgpt", new OAuthCredentials { Access = "tok-a", Refresh = "tok-r" });
+            var loaded = store.Load("chatgpt");
+            Assert.NotNull(loaded);
+            Assert.Equal("tok-a", loaded.Access);
+            Assert.Equal("tok-r", loaded.Refresh);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+}
+
+public class NativeProxyConfigStoreTests
+{
+    [Fact]
+    public void Save_EncryptsApiKeyAndAdmissionToken()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-cfg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = new NativeProxyConfigStore(dir);
+            store.Save(new NativeProxyConfig
+            {
+                ListenPort = 10100,
+                AdmissionToken = "admission-secret-xyz",
+                Providers =
+                [
+                    new ProviderDefinition { Id = "deepseek", BaseUrl = "http://x/v1", ApiKey = "sk-plain-123" }
+                ]
+            });
+
+            var raw = File.ReadAllText(Path.Combine(dir, "config.json"));
+            Assert.DoesNotContain("admission-secret-xyz", raw);
+            Assert.DoesNotContain("sk-plain-123", raw);
+            Assert.Contains("dpapi:", raw);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Load_RoundTripsDecryptedSecrets()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-cfg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = new NativeProxyConfigStore(dir);
+            store.Save(new NativeProxyConfig
+            {
+                ListenPort = 10100,
+                AdmissionToken = "adm-1",
+                Providers = [new ProviderDefinition { Id = "p", ApiKey = "key-1" }]
+            });
+            var loaded = store.Load();
+            Assert.Equal("adm-1", loaded.AdmissionToken);
+            Assert.Equal("key-1", loaded.Providers[0].ApiKey);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Load_CorruptConfig_ThrowsInsteadOfDefault()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-cfg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "config.json"), "{corrupt-json!!!");
+            var store = new NativeProxyConfigStore(dir);
+            Assert.Throws<InvalidOperationException>(() => store.Load());
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void UpgradePlaintextSecrets_ConvertsLegacyPlaintext()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-cfg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var path = Path.Combine(dir, "config.json");
+            File.WriteAllText(path, """
+                {
+                  "ListenPort": 10100,
+                  "AdmissionToken": "legacy-plain-token",
+                  "Providers": [
+                    { "Id": "p", "BaseUrl": "http://x/v1", "ApiKey": "legacy-plain-key" }
+                  ]
+                }
+                """);
+            var store = new NativeProxyConfigStore(dir);
+            var config = store.Load();
+            Assert.Equal("legacy-plain-token", config.AdmissionToken);
+            Assert.Equal("legacy-plain-key", config.Providers[0].ApiKey);
+
+            var upgraded = store.UpgradePlaintextSecrets(config);
+            Assert.True(upgraded);
+
+            var raw = File.ReadAllText(path);
+            Assert.DoesNotContain("legacy-plain-token", raw);
+            Assert.DoesNotContain("legacy-plain-key", raw);
+
+            var reloaded = store.Load();
+            Assert.Equal("legacy-plain-token", reloaded.AdmissionToken);
+            Assert.Equal("legacy-plain-key", reloaded.Providers[0].ApiKey);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+}
+
+public class NativeProxyAdmissionTests
+{
+    [Fact]
+    public void Host_MissingAdmissionToken_FailsClosedBeforeListening()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-admission-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = new NativeProxyConfigStore(dir);
+            store.Save(new NativeProxyConfig { ListenPort = 10100, AdmissionToken = null });
+            var error = Assert.Throws<InvalidOperationException>(() =>
+                new NativeProxyHost(store, dataRootOverride: dir));
+            Assert.Contains("Admission Token", error.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+}
+
+public class RouteResolverTests
+{
+    [Fact]
+    public void Resolve_UnknownModel_ThrowsModelNotFound()
+    {
+        var registry = new ProviderRegistry(new NativeProxyConfig
+        {
+            Providers =
+            [
+                new ProviderDefinition { Id = "openai", Name = "OpenAI", Models = ["gpt-5.6-sol"], DefaultModel = "gpt-5.6-sol" }
+            ]
+        });
+        Assert.Throws<CodexOpenCodexNative.Providers.ModelNotFoundException>(
+            () => CodexOpenCodexNative.Providers.RouteResolver.Resolve(registry, "no-such-model"));
+    }
+
+    [Fact]
+    public void Resolve_BareModelName_FindsProvider()
+    {
+        var registry = new ProviderRegistry(new NativeProxyConfig
+        {
+            Providers =
+            [
+                new ProviderDefinition { Id = "deepseek", Name = "DeepSeek", Models = ["deepseek-v4-flash"], DefaultModel = "deepseek-v4-flash" }
+            ]
+        });
+        var result = CodexOpenCodexNative.Providers.RouteResolver.Resolve(registry, "deepseek-v4-flash");
+        Assert.Equal("deepseek", result.ProviderId);
+        Assert.Equal("deepseek-v4-flash", result.ModelId);
+    }
+}
+
+public class WorkerBrokerPricingTests
+{
+    [Fact]
+    public void GetRolePricing_ReturnsConfiguredValues()
+    {
+        // é€šè¿‡ SubagentConfigurationService çš„é»˜è®¤è§’è‰²éªŒè¯
+        var service = new SubagentConfigurationService();
+        var broker = new WorkerBroker(
+            new ExternalWorkerService(
+                new FakeConfigSource(),
+                new FakeBackend(),
+                new FakeAudit()),
+            service);
+
+        var pricing = broker.GetRolePricing("cmm_explorer");
+        Assert.NotNull(pricing);
+        Assert.Equal(2m, pricing.PricePerMillionTokens);
+        Assert.Equal("USD", pricing.Currency);
+        Assert.Equal(50m, pricing.BudgetLimit);
+        Assert.Equal(300, pricing.MaxTimeoutSeconds);
+    }
+
+    [Fact]
+    public void DelegateAsync_UnknownRole_FailsClosed()
+    {
+        var service = new SubagentConfigurationService();
+        var broker = new WorkerBroker(
+            new ExternalWorkerService(new FakeConfigSource(), new FakeBackend(), new FakeAudit()),
+            service);
+
+        var ex = Assert.Throws<WorkerBrokerException>(() =>
+            broker.DelegateAsync("no_such_role", "task").GetAwaiter().GetResult());
+        Assert.Equal("role_not_found", ex.Code);
+    }
+
+    [Fact]
+    public void DelegateAsync_RoleWithoutPricing_FailsClosed()
+    {
+        var service = new SubagentConfigurationService();
+        var broker = new WorkerBroker(
+            new ExternalWorkerService(new FakeConfigSource(), new FakeBackend(), new FakeAudit()),
+            service);
+
+        // cmm_supervisor ä¸å…è®¸å¤–éƒ¨å·¥äººï¼ˆAllowsExternalWorker=falseï¼‰â†’ å¤±è´¥å…³é—­
+        var ex = Assert.Throws<WorkerBrokerException>(() =>
+            broker.DelegateAsync("cmm_supervisor", "task").GetAwaiter().GetResult());
+        Assert.Equal("role_external_forbidden", ex.Code);
+    }
+
+    private sealed class FakeConfigSource : IExternalWorkerConfigurationSource
+    {
+        public string? LoadWarning => null;
+        public IReadOnlyList<SubagentRoleDefinition> Roles { get; } = Array.Empty<SubagentRoleDefinition>();
+        public SubagentConfigurationDocument LoadDraft() => new();
+    }
+
+    private sealed class FakeBackend : IExternalWorkerBackend
+    {
+        public IReadOnlyList<string> ReadConfiguredModels() => Array.Empty<string>();
+        public Task<ExternalWorkerBackendResponse> CompleteAsync(ExternalWorkerBackendRequest request, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ExternalWorkerBackendResponse("ok", "stop", new ExternalWorkerTokenUsage(1, 1, 2), 200, request.Model));
+    }
+
+    private sealed class FakeAudit : IExternalWorkerAuditSink
+    {
+        public ValueTask AppendAsync(ExternalWorkerAuditEntry entry, CancellationToken cancellationToken = default) =>
+            ValueTask.CompletedTask;
+    }
+}
+
+public class WorkerBudgetLedgerTests
+{
+    [Fact]
+    public async Task Deduct_Then_CheckBeforeCall_RejectsWhenBudgetExhausted()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var ledger = new WorkerBudgetLedger(path);
+            var role = new SubagentRoleDefinition(
+                "cmm_test", "æµ‹è¯•", "t", "gpt-5.6-sol", "low", "read-only", true,
+                "dev",
+                PricePerMillionTokens: 1000m, // æ¯ç™¾ä¸‡ token 1000 ç¾å…ƒ
+                Currency: "USD",
+                BudgetLimit: 0.001m,          // é¢„ç®— 0.001 ç¾å…ƒ
+                MaxTimeoutSeconds: 60);
+
+            // ç”¨ 1000 token â†’ æˆæœ¬ 0.001 ç¾å…ƒ â†’ æ­£å¥½æ‰“æ»¡é¢„ç®—
+            var cost = await ledger.DeductAsync(role, 1000, 0);
+            Assert.Equal(1.0m, cost);
+            Assert.Equal(1.0m, ledger.GetSpent("cmm_test"));
+
+            // é¢„ç®—è€—å°½ â†’ æ‹’ç»
+            var block = ledger.CheckBeforeCall(role);
+            Assert.NotNull(block);
+            Assert.Contains("å·²è€—å°½", block);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Deduct_AccumulatesAcrossCalls()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var ledger = new WorkerBudgetLedger(path);
+            var role = new SubagentRoleDefinition(
+                "cmm_test2", "æµ‹è¯•2", "t", "gpt-5.6-sol", "low", "read-only", true,
+                "dev",
+                PricePerMillionTokens: 2m,
+                Currency: "USD",
+                BudgetLimit: 10m,
+                MaxTimeoutSeconds: 60);
+
+            var c1 = await ledger.DeductAsync(role, 100000, 0);  // 0.2 ç¾å…ƒ
+            var c2 = await ledger.DeductAsync(role, 100000, 0);  // 0.2 ç¾å…ƒ
+            Assert.Equal(0.2m, c1);
+            Assert.Equal(0.2m, c2);
+            Assert.Equal(0.4m, ledger.GetSpent("cmm_test2"));
+
+            var remaining = ledger.GetRemaining(role);
+            Assert.NotNull(remaining);
+            Assert.Equal(9.6m, remaining);
+            Assert.Null(ledger.CheckBeforeCall(role));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void CheckBeforeCall_RoleWithoutPricing_Rejects()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var ledger = new WorkerBudgetLedger(path);
+            var role = new SubagentRoleDefinition(
+                "cmm_noprice", "æ— ä»·", "t", "gpt-5.6-sol", "low", "read-only", true, "dev");
+            var block = ledger.CheckBeforeCall(role);
+            Assert.NotNull(block);
+            Assert.Contains("æœªé…ç½®ä»·æ ¼", block);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Deduct_MissingUsage_ThrowsFailClosed()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var ledger = new WorkerBudgetLedger(path);
+            var role = new SubagentRoleDefinition(
+                "cmm_nousage", "æ— ç”¨é‡", "t", "gpt-5.6-sol", "low", "read-only", true,
+                "dev",
+                PricePerMillionTokens: 2m,
+                Currency: "USD",
+                BudgetLimit: 10m,
+                MaxTimeoutSeconds: 60);
+
+            // usage å®Œå…¨ç¼ºå¤±æ—¶ä¸å¾—æŒ‰ 0 è®¡è´¹ï¼Œå¿…é¡»å¤±è´¥å…³é—­
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                ledger.DeductAsync(role, null, null));
+            Assert.Contains("æœªè¿”å› token ç”¨é‡", ex.Message);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+}

@@ -37,7 +37,9 @@ public partial class PoolManagementView : UserControl
         _liveUsageTimer.Tick += LiveUsageTimer_Tick;
         Loaded += (_, _) =>
         {
-            if (!RuntimeMode.IsDetachedUi) _liveUsageTimer.Start();
+            if (!RuntimeMode.IsDetachedUi
+                && _services?.CodexConfig.IsManagedNativeProviderSelected() == true)
+                _liveUsageTimer.Start();
         };
         Unloaded += (_, _) => _liveUsageTimer.Stop();
         PoolsList.ItemsSource = _pools;
@@ -51,7 +53,46 @@ public partial class PoolManagementView : UserControl
     {
         if (RuntimeMode.IsDetachedUi) return;
         if (_services is null) return;
+        if (!_services.CodexConfig.IsManagedNativeProviderSelected())
+        {
+            await ReloadDisconnectedAsync(cancellationToken);
+            return;
+        }
         await ReloadAsync(await _services.RuntimeTruth.ReadAsync(cancellationToken), cancellationToken);
+    }
+
+    private async Task ReloadDisconnectedAsync(CancellationToken cancellationToken)
+    {
+        var viewsTask = _services!.AccountPools.ReadDisconnectedViewsAsync(cancellationToken);
+        var gatewayTask = ReadGatewaySafelyAsync(cancellationToken);
+        await Task.WhenAll(viewsTask, gatewayTask);
+        var views = viewsTask.Result;
+        ApplyGatewayStatus(gatewayTask.Result);
+        _pools.Clear();
+        foreach (var view in views) _pools.Add(view);
+        var active = views.FirstOrDefault(view => view.IsActive);
+        ActiveTitle = active?.DisplayName ?? "号池尚未选择";
+        ActiveDetail = "Codex 保持断开；这里仍可管理独立 API 号池";
+        OfficialHealthy = false;
+        CurrentPoolText.Text = ActiveTitle;
+        CurrentPoolDetailText.Text = "本地号池配置；未读取 Codex 任务";
+        CurrentPoolModelText.Text = active?.SelectedModel ?? "未选择";
+        CurrentPoolModelDetailText.Text = "连接 Codex 前不会把该模型写入 Codex";
+        CurrentTaskModelText.Text = "Codex 未连接（默认）";
+        CurrentTaskModelDetailText.Text = "没有读取聊天、模型、账号或扣费信息";
+        HeroCurrentAccountText.Text = ActiveTitle;
+        HeroCurrentModelText.Text = active?.SelectedModel ?? "未选择";
+        HeroTaskStateText.Text = "Codex 隔离中";
+        RecentActualText.Text = "未读取 Codex 请求";
+        RecentActualDetailText.Text = "独立号池可以管理；切换给 Codex 前必须先点一键连接";
+        RoutingActualAccountText.Text = "未读取";
+        RoutingProLastText.Text = "未读取";
+        RoutingSinceSwitchLabelText.Text = "Codex 请求";
+        RoutingProSinceSwitchText.Text = "未读取";
+        RoutingAuditSourceText.Text = "Codex 未连接，未读取路由日志。";
+        UpdateLiveUsage(LiveTokenUsageSnapshot.Empty);
+        ApplyAccountLedger(_services.AccountUsageLedger.LastSnapshot);
+        StatusMessage.Text = "Codex 未连接；独立 API 号池仍可添加、授权、启停和查看。";
     }
 
     public async Task ReloadAsync(RuntimeTruthSnapshot runtimeTruth, CancellationToken cancellationToken = default)

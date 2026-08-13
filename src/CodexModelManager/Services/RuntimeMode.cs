@@ -20,45 +20,47 @@ public static class RuntimeMode
     public static Uri? CodexTestDoubleGatewayUri { get; private set; }
     public static string? CodexTestDoubleToken { get; private set; }
 
+    public static bool RequiresExplicitIsolation(
+        IReadOnlyList<string> arguments,
+        Func<string, string?>? readEnvironment = null)
+    {
+        readEnvironment ??= Environment.GetEnvironmentVariable;
+        var requested = arguments.Any(argument =>
+            argument.Equals("--detached-ui", StringComparison.OrdinalIgnoreCase));
+        var environmentRequested = IsEnabled(readEnvironment(DetachedEnvironmentVariable));
+        var testDoubleRequested = arguments.Any(argument =>
+            argument.Equals(TestDoubleCommand, StringComparison.OrdinalIgnoreCase));
+        var completeSandbox = !string.IsNullOrWhiteSpace(readEnvironment("CMM_SANDBOX_CODEX_HOME"))
+                              && !string.IsNullOrWhiteSpace(readEnvironment("CMM_SANDBOX_APPDATA"));
+        var explicitIsolationEnvironment = IsEnabled(readEnvironment(DetachedNoExternalNetworkEnvironmentVariable))
+                                           || !string.IsNullOrWhiteSpace(readEnvironment(DetachedDataRootEnvironmentVariable));
+        return requested
+               || environmentRequested
+               || testDoubleRequested
+               || completeSandbox
+               || explicitIsolationEnvironment;
+    }
+
     public static void Initialize(IReadOnlyList<string> arguments)
     {
         if (_initialized) return;
         _initialized = true;
 
-        var requested = arguments.Any(argument =>
-            argument.Equals("--detached-ui", StringComparison.OrdinalIgnoreCase));
-        var environmentRequested = IsEnabled(
-            Environment.GetEnvironmentVariable(DetachedEnvironmentVariable));
         var testDoubleRequested = arguments.Any(argument =>
             argument.Equals(TestDoubleCommand, StringComparison.OrdinalIgnoreCase));
-        var completeSandbox = HasCompleteSandboxEnvironment();
-        var explicitIsolationEnvironment = IsEnabled(Environment.GetEnvironmentVariable(
-                                               DetachedNoExternalNetworkEnvironmentVariable))
-                                           || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(
-                                               DetachedDataRootEnvironmentVariable));
+        var isolationRequested = RequiresExplicitIsolation(arguments);
 
 #if CMM_DETACHED_ONLY
         IsDetachedUi = true;
         AllowsRealCodexConnectionToggle = false;
         AllowsCustomExtensions = false;
 #else
-        AllowsRealCodexConnectionToggle = !testDoubleRequested
-                                          && !completeSandbox
-                                          && !explicitIsolationEnvironment;
-        AllowsCustomExtensions = !requested
-                                 && !environmentRequested
-                                 && !testDoubleRequested
-                                 && !completeSandbox
-                                 && !explicitIsolationEnvironment;
-        var managedConnectionIsValid = AllowsRealCodexConnectionToggle
-                                       && HasValidManagedCodexConnection();
-        // An ordinary launch is intentionally detached unless the user previously
-        // used the in-app switch to install a complete, unmodified managed block.
-        IsDetachedUi = requested
-                       || environmentRequested
-                       || completeSandbox
-                       || explicitIsolationEnvironment
-                       || !managedConnectionIsValid;
+        // "Codex is not connected" is an ordinary application state, not a test
+        // sandbox.  Only an explicit isolation request may redirect the Manager to
+        // fake stores and lock real-machine actions.
+        IsDetachedUi = isolationRequested;
+        AllowsRealCodexConnectionToggle = !IsDetachedUi;
+        AllowsCustomExtensions = !IsDetachedUi;
 #endif
 
         if (!IsDetachedUi) return;
@@ -106,22 +108,6 @@ public static class RuntimeMode
             : AllowsExternalStatusConnections
             ? "Codex 连接默认关闭：真实 Codex、模型和账号保持隔离；只有你点击连接按钮才会切换网关。"
             : "隔离压力测试模式：真实 Codex、服务器和 v2rayN 网络全部断开；只使用本机假数据与回环测试。";
-
-    private static bool HasCompleteSandboxEnvironment() =>
-        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CMM_SANDBOX_CODEX_HOME"))
-        && !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CMM_SANDBOX_APPDATA"));
-
-    private static bool HasValidManagedCodexConnection()
-    {
-        try
-        {
-            return new CodexConfigService().IsManagedNativeProviderSelected();
-        }
-        catch
-        {
-            return false;
-        }
-    }
 
     private static void ConfigureCodexTestDouble()
     {

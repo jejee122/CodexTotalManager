@@ -6,7 +6,11 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9A-Fa-f]{64}$')]
-    [string]$SshConfigSha256
+    [string]$SshConfigSha256,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$ServerAliasesJson
 )
 
 Set-StrictMode -Version Latest
@@ -27,7 +31,7 @@ if ($actualConfigHash -ne $expectedConfigHash) {
     throw 'SSH config SHA-256 mismatch; health check was not started.'
 }
 
-function Get-MainServerAliases {
+function Get-ConfiguredHostAliases {
     param([Parameter(Mandatory)][string]$Path)
 
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -37,8 +41,6 @@ function Get-MainServerAliases {
         foreach ($alias in ($match.Groups[1].Value -split '\s+')) {
             if ([string]::IsNullOrWhiteSpace($alias)) { continue }
             if ($alias -notmatch '^[A-Za-z0-9._-]+$') { continue }
-            if ($alias.EndsWith('-Public', [StringComparison]::OrdinalIgnoreCase)) { continue }
-            if ($alias.EndsWith('-WG', [StringComparison]::OrdinalIgnoreCase)) { continue }
             if ($seen.Add($alias)) { $aliases.Add($alias) }
         }
     }
@@ -152,11 +154,26 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 '@
 
-$serverAliases = @(Get-MainServerAliases -Path $configPath)
-Write-Output "discovery:count=$($serverAliases.Count)"
-if ($serverAliases.Count -eq 0) {
-    throw 'No main server aliases were discovered in the SSH config.'
+$configuredAliases = @(Get-ConfiguredHostAliases -Path $configPath)
+$configuredSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($configuredAlias in $configuredAliases) { [void]$configuredSet.Add($configuredAlias) }
+$serverAliases = @($ServerAliasesJson | ConvertFrom-Json)
+if ($serverAliases.Count -ne 5) {
+    throw 'Exactly five explicit server aliases are required.'
 }
+$selectedSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($serverAlias in $serverAliases) {
+    if ($serverAlias -isnot [string] -or $serverAlias -notmatch '^[A-Za-z0-9._-]+$') {
+        throw 'Every server alias must be a safe SSH Host name.'
+    }
+    if (-not $selectedSet.Add($serverAlias)) {
+        throw 'The five explicit server aliases must be unique.'
+    }
+    if (-not $configuredSet.Contains($serverAlias)) {
+        throw "Explicit server alias is missing from SSH config: $serverAlias"
+    }
+}
+Write-Output "discovery:count=$($serverAliases.Count)"
 
 foreach ($serverAlias in $serverAliases) {
     Write-Output "discovery:alias=$serverAlias"

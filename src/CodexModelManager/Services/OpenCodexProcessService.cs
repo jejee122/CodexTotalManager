@@ -4,6 +4,11 @@ using CodexOpenCodexNative.Config;
 
 namespace CodexModelManager.Services;
 
+public readonly record struct ManagedCodexConnectionState(bool WasConnected)
+{
+    public bool MayReadOrWriteCodexConfiguration => WasConnected;
+}
+
 public sealed class OpenCodexProcessService
 {
     private readonly AppSettingsService _settings;
@@ -35,19 +40,34 @@ public sealed class OpenCodexProcessService
 
     public async Task<bool> EnsureOpenCodexAsync(CancellationToken cancellationToken = default)
     {
-        if (await IsRecordedNativeEngineHealthyAsync(cancellationToken))
-            return await RestoreFixedEntryAsync(cancellationToken);
-
-        var result = await RunOcxAsync("ensure", cancellationToken);
-        if (!result) return false;
-        if (!await WaitForHealthAsync(TimeSpan.FromSeconds(20), cancellationToken))
-        {
-            await StopOwnedNativeEngineAsync(cancellationToken);
-            return false;
-        }
+        if (!await EnsureNativeEngineOnlyAsync(cancellationToken)) return false;
         var restored = await RestoreFixedEntryAsync(cancellationToken);
         if (!restored) await StopOwnedNativeEngineAsync(cancellationToken);
         return restored;
+    }
+
+    public async Task<bool> EnsureNativeEngineOnlyAsync(CancellationToken cancellationToken = default)
+    {
+        if (await IsRecordedNativeEngineHealthyAsync(cancellationToken)) return true;
+
+        var result = await RunOcxAsync("ensure", cancellationToken);
+        if (!result) return false;
+        if (await WaitForHealthAsync(TimeSpan.FromSeconds(20), cancellationToken)) return true;
+        await StopOwnedNativeEngineAsync(cancellationToken);
+        return false;
+    }
+
+    public ManagedCodexConnectionState CaptureManagedCodexConnectionState()
+        => new(_codexConfig.IsManagedNativeProviderSelected());
+
+    public async Task<bool> EnsurePreservingConnectionStateAsync(
+        ManagedCodexConnectionState originalState,
+        CancellationToken cancellationToken = default)
+    {
+        var healthy = originalState.WasConnected
+            ? await EnsureOpenCodexAsync(cancellationToken)
+            : await EnsureNativeEngineOnlyAsync(cancellationToken);
+        return healthy && ConnectionStateMatches(originalState);
     }
 
     public async Task<bool> RestartOpenCodexAsync(CancellationToken cancellationToken = default)
@@ -63,6 +83,22 @@ public sealed class OpenCodexProcessService
         var restored = await RestoreFixedEntryAsync(cancellationToken);
         if (!restored) await StopOwnedNativeEngineAsync(cancellationToken);
         return restored;
+    }
+
+    public async Task<bool> RestartNativeEngineOnlyAsync(CancellationToken cancellationToken = default)
+    {
+        await RunOcxAsync("stop", cancellationToken);
+        return await EnsureNativeEngineOnlyAsync(cancellationToken);
+    }
+
+    public async Task<bool> RestartPreservingConnectionStateAsync(
+        ManagedCodexConnectionState originalState,
+        CancellationToken cancellationToken = default)
+    {
+        var healthy = originalState.WasConnected
+            ? await RestartOpenCodexAsync(cancellationToken)
+            : await RestartNativeEngineOnlyAsync(cancellationToken);
+        return healthy && ConnectionStateMatches(originalState);
     }
 
     public Task<bool> StopOpenCodexAsync(CancellationToken cancellationToken = default) =>
@@ -104,6 +140,22 @@ public sealed class OpenCodexProcessService
         if (!restored) await StopOwnedNativeEngineAsync(cancellationToken);
         return restored;
     }
+
+    public Task<bool> StartNativeEngineOnlyAsync(CancellationToken cancellationToken = default) =>
+        EnsureNativeEngineOnlyAsync(cancellationToken);
+
+    public async Task<bool> StartPreservingConnectionStateAsync(
+        ManagedCodexConnectionState originalState,
+        CancellationToken cancellationToken = default)
+    {
+        var healthy = originalState.WasConnected
+            ? await StartOpenCodexAsync(cancellationToken)
+            : await StartNativeEngineOnlyAsync(cancellationToken);
+        return healthy && ConnectionStateMatches(originalState);
+    }
+
+    private bool ConnectionStateMatches(ManagedCodexConnectionState originalState) =>
+        _codexConfig.IsManagedNativeProviderSelected() == originalState.WasConnected;
 
     private async Task<bool> RestoreFixedEntryAsync(CancellationToken cancellationToken)
     {

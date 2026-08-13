@@ -1,5 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 
 namespace CodexModelManager.Services;
 
@@ -138,10 +140,14 @@ public sealed class AppSettingsService
     public int BackupRetentionDays => Math.Clamp(_settings.BackupRetentionDays, 1, 3650);
     public bool BackupAutoCleanup => _settings.BackupAutoCleanup;
     public bool ServerMonitoringEnabled => _settings.ServerMonitoringEnabled
-                                           && !string.IsNullOrWhiteSpace(_settings.ServerSshConfigPath)
-                                           && !string.IsNullOrWhiteSpace(_settings.ServerSshConfigSha256);
+                                            && !string.IsNullOrWhiteSpace(_settings.ServerSshConfigPath)
+                                            && !string.IsNullOrWhiteSpace(_settings.ServerSshConfigSha256)
+                                            && NormalizeServerAliases(_settings.ServerAliases).Count == 5;
     public string? ServerSshConfigPath => ServerMonitoringEnabled ? _settings.ServerSshConfigPath : null;
     public string? ServerSshConfigSha256 => ServerMonitoringEnabled ? _settings.ServerSshConfigSha256 : null;
+    public IReadOnlyList<string> ServerAliases => ServerMonitoringEnabled
+        ? NormalizeServerAliases(_settings.ServerAliases)
+        : Array.Empty<string>();
 
     public void SetBackupRetention(int count, int days, bool autoCleanup)
     {
@@ -154,27 +160,66 @@ public sealed class AppSettingsService
         Save();
     }
 
-    public void SetServerMonitoringConfiguration(string? sshConfigPath, string? sha256)
+    public void SetServerMonitoringConfiguration(
+        string? sshConfigPath,
+        string? sha256,
+        IReadOnlyList<string>? serverAliases)
     {
         EnsureWritable();
-        if (string.IsNullOrWhiteSpace(sshConfigPath) && string.IsNullOrWhiteSpace(sha256))
+        if (string.IsNullOrWhiteSpace(sshConfigPath)
+            && string.IsNullOrWhiteSpace(sha256)
+            && (serverAliases is null || serverAliases.Count == 0))
         {
             _settings.ServerMonitoringEnabled = false;
             _settings.ServerSshConfigPath = null;
             _settings.ServerSshConfigSha256 = null;
+            _settings.ServerAliases.Clear();
             Save();
             return;
         }
-        if (string.IsNullOrWhiteSpace(sshConfigPath) || string.IsNullOrWhiteSpace(sha256))
-            throw new ArgumentException("服务器监控的 SSH 配置路径与 SHA-256 必须同时提供。");
+        if (string.IsNullOrWhiteSpace(sshConfigPath)
+            || string.IsNullOrWhiteSpace(sha256)
+            || serverAliases is null)
+            throw new ArgumentException("服务器监控必须同时提供 SSH 配置、SHA-256 和五台服务器名称。");
         var normalizedHash = sha256.Trim().ToUpperInvariant();
         if (normalizedHash.Length != 64 || normalizedHash.Any(character => !Uri.IsHexDigit(character)))
             throw new ArgumentException("服务器监控的 SHA-256 必须是 64 位十六进制字符。", nameof(sha256));
+        var fullPath = Path.GetFullPath(sshConfigPath);
+        if (!File.Exists(fullPath)) throw new FileNotFoundException("SSH 配置文件不存在。", fullPath);
+        var actualHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(fullPath)));
+        if (!actualHash.Equals(normalizedHash, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("SSH 配置文件已经变化，指纹不一致；没有启用服务器监控。");
+        var aliases = ValidateServerAliases(fullPath, serverAliases);
         _settings.ServerMonitoringEnabled = true;
-        _settings.ServerSshConfigPath = Path.GetFullPath(sshConfigPath);
+        _settings.ServerSshConfigPath = fullPath;
         _settings.ServerSshConfigSha256 = normalizedHash;
+        _settings.ServerAliases = aliases.ToList();
         Save();
     }
+
+    public static IReadOnlyList<string> ValidateServerAliases(
+        string sshConfigPath,
+        IReadOnlyList<string> serverAliases)
+    {
+        var aliases = NormalizeServerAliases(serverAliases);
+        if (aliases.Count != 5)
+            throw new ArgumentException("必须正好填写五个不重复的服务器名称，一行一个。", nameof(serverAliases));
+        if (aliases.Any(alias => !Regex.IsMatch(alias, "^[A-Za-z0-9._-]+$", RegexOptions.CultureInvariant)))
+            throw new ArgumentException("服务器名称只能包含英文字母、数字、点、下划线和短横线。", nameof(serverAliases));
+        var configured = DashboardStatusService.DiscoverSshHostAliases(sshConfigPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var missing = aliases.Where(alias => !configured.Contains(alias)).ToArray();
+        if (missing.Length > 0)
+            throw new ArgumentException($"SSH 配置里找不到这些服务器名称：{string.Join("、", missing)}", nameof(serverAliases));
+        return aliases;
+    }
+
+    private static IReadOnlyList<string> NormalizeServerAliases(IEnumerable<string>? aliases) =>
+        (aliases ?? Array.Empty<string>())
+        .Select(alias => alias?.Trim() ?? string.Empty)
+        .Where(alias => alias.Length > 0)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
 
     public string GetProviderName(string provider)
     {
@@ -288,6 +333,7 @@ public sealed class AppSettingsService
         public bool ServerMonitoringEnabled { get; set; }
         public string? ServerSshConfigPath { get; set; }
         public string? ServerSshConfigSha256 { get; set; }
+        public List<string> ServerAliases { get; set; } = new();
 
         public static AppSettings Default() => new()
         {

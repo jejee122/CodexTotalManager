@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using CodexModelManager.Models;
+using CodexModelManager.Services;
 
 namespace CodexModelManager;
 
@@ -12,11 +13,14 @@ public partial class MainWindow
         if (_busy || sender is not Button { Tag: string providerId }) return;
         var provider = _providers.FirstOrDefault(item => item.Id.Equals(providerId, StringComparison.OrdinalIgnoreCase));
         if (provider is null) return;
+        var connectionState = _services.Process.CaptureManagedCodexConnectionState();
         SetBusy(true, $"正在测试 {provider.DisplayName}…");
         try
         {
+            if (!await _services.Process.EnsurePreservingConnectionStateAsync(connectionState))
+                throw new InvalidOperationException("总管家本机模型引擎没有准备好，或 Codex 连接状态发生了变化。");
             var result = await _services.OpenCodex.TestProviderAsync(providerId);
-            await ReloadAsync();
+            await ReloadModelManagementAsync(connectionState);
             FooterMessage.Text = result.Success
                 ? $"{provider.DisplayName} 连接测试通过，状态和延迟已更新。"
                 : $"{provider.DisplayName} 测试失败：{FriendlyError(new InvalidOperationException(result.Message))}";
@@ -64,7 +68,9 @@ public partial class MainWindow
         ProviderKeyBox.Clear();
         ProviderContextBox.Text = "128000";
         ProviderAdapterBox.SelectedIndex = 0;
-        AddProviderButton.Content = "测试并添加到 Codex";
+        AddProviderButton.Content = _services.Process.CaptureManagedCodexConnectionState().WasConnected
+            ? "测试并添加到总管家和 Codex"
+            : "测试并添加到总管家";
         CancelProviderEditButton.Visibility = Visibility.Collapsed;
         AddProviderResult.Text = string.Empty;
     }
@@ -96,20 +102,24 @@ public partial class MainWindow
             $"接口类型：{adapter}\n" +
             $"上下文：{contextWindow}\n" +
             $"密钥：{(string.IsNullOrWhiteSpace(newApiKey) ? "保持原密钥" : "替换为新密钥")}\n\n" +
-            "会先备份，再测试、保存、重启 OpenCodex 并复查；失败会自动恢复。继续吗？";
+            "会先备份，再测试、保存、重启总管家本机模型引擎并复查；失败会自动恢复。Codex 原来连着就保持连接，原来断开就保持断开。继续吗？";
         if (MessageBox.Show(summary, "确认修改模型来源", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No)
             != MessageBoxResult.Yes) return;
 
         SetBusy(true, $"正在检查并更新 {provider.DisplayName}…");
+        var connectionState = _services.Process.CaptureManagedCodexConnectionState();
         string? backup = null;
         string? codexSnapshot = null;
         var oldSecret = _services.Secrets.Read(providerId);
         _services.Settings.TryGetProviderName(providerId, out var oldName);
         try
         {
+            if (!await _services.Process.EnsurePreservingConnectionStateAsync(connectionState))
+                throw new InvalidOperationException("总管家本机模型引擎没有准备好，或 Codex 连接状态发生了变化。");
             var probe = await _services.Probe.ProbeAsync(url, apiKey);
             backup = _services.Backups.Create();
-            codexSnapshot = _services.CodexConfig.CreateSnapshot();
+            if (connectionState.MayReadOrWriteCodexConfiguration)
+                codexSnapshot = _services.CodexConfig.CreateSnapshot();
             _services.Secrets.Save(providerId, apiKey);
             var envName = _services.Secrets.GetEnvironmentName(providerId);
             var allowPrivate = Uri.TryCreate(probe.BaseUrl, UriKind.Absolute, out var baseUri)
@@ -123,17 +133,17 @@ public partial class MainWindow
                 contextWindow,
                 allowPrivate);
             _services.Settings.SetProviderName(providerId, displayName);
-            if (!await _services.Process.RestartOpenCodexAsync())
-                throw new InvalidOperationException("OpenCodex 重启后没有通过健康检查。");
+            if (!await _services.Process.RestartPreservingConnectionStateAsync(connectionState))
+                throw new InvalidOperationException("本机模型引擎重启失败，或 Codex 连接状态发生了变化。");
             var test = await _services.OpenCodex.TestProviderAsync(providerId);
             if (!test.Success) throw new InvalidOperationException($"保存后的连接复查失败：{test.Message}");
             ResetProviderForm();
-            await ReloadAsync();
+            await ReloadModelManagementAsync(connectionState);
             FooterMessage.Text = $"{displayName} 已修改并复查通过，共读取到 {probe.Models.Count} 个模型。";
         }
         catch (Exception ex)
         {
-            var errors = await RestoreProviderBackupAsync(backup, codexSnapshot, providerId, oldSecret, oldName);
+            var errors = await RestoreProviderBackupAsync(backup, codexSnapshot, providerId, oldSecret, oldName, connectionState);
             var recovery = errors.Count == 0 ? "原来源已经恢复。" : $"自动恢复不完整：{string.Join("；", errors)}";
             ShowAddError($"没有保存：{FriendlyError(ex)} {recovery}");
             FooterMessage.Text = $"来源修改失败。{recovery}";
@@ -152,14 +162,10 @@ public partial class MainWindow
         var provider = _providers.FirstOrDefault(item => item.Id.Equals(providerId, StringComparison.OrdinalIgnoreCase));
         if (provider is null) return;
         var enabling = provider.Disabled;
+        var connectionState = _services.Process.CaptureManagedCodexConnectionState();
         var verb = enabling ? "启用" : "停用";
-        var active = await _services.OpenCodex.GetActiveTargetAsync();
-        var activeNotice = !enabling && active is not null
-                           && active.Value.Provider.Equals(providerId, StringComparison.OrdinalIgnoreCase)
-            ? "\n\n它正是当前主模型来源，会先切到官方 Sol。"
-            : string.Empty;
         if (MessageBox.Show(
-                $"确定{verb}“{provider.DisplayName}”吗？{activeNotice}\n\n会先备份并在操作后验证，聊天记录和密钥不会删除。",
+                $"确定{verb}“{provider.DisplayName}”吗？\n\n如果它正被使用，总管家会先切回官方 Sol。会先备份并在操作后验证，聊天记录和密钥不会删除。Codex 连接状态不会改变。",
                 $"{verb}模型来源",
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Warning,
@@ -170,13 +176,18 @@ public partial class MainWindow
         string? codexSnapshot = null;
         try
         {
+            if (!await _services.Process.EnsurePreservingConnectionStateAsync(connectionState))
+                throw new InvalidOperationException("总管家本机模型引擎没有准备好，或 Codex 连接状态发生了变化。");
+            var active = await _services.OpenCodex.GetActiveTargetAsync();
             backup = _services.Backups.Create();
-            codexSnapshot = _services.CodexConfig.CreateSnapshot();
+            if (connectionState.MayReadOrWriteCodexConfiguration)
+                codexSnapshot = _services.CodexConfig.CreateSnapshot();
             if (!enabling && active is not null
                 && active.Value.Provider.Equals(providerId, StringComparison.OrdinalIgnoreCase))
             {
                 await _services.OpenCodex.SetActiveTargetAsync("openai", "gpt-5.6-sol");
-                _services.CodexConfig.SetDefaultModel(Services.OpenCodexClient.SwitchAlias);
+                if (connectionState.MayReadOrWriteCodexConfiguration)
+                    _services.CodexConfig.SetDefaultModel(Services.OpenCodexClient.SwitchAlias);
             }
             await _services.OpenCodex.SetProviderEnabledAsync(providerId, enabling);
             var refreshed = await _services.OpenCodex.GetProvidersAsync(_services.Settings);
@@ -188,12 +199,18 @@ public partial class MainWindow
                 var test = await _services.OpenCodex.TestProviderAsync(providerId);
                 if (!test.Success) throw new InvalidOperationException($"来源已启用，但连接测试失败：{test.Message}");
             }
-            await ReloadAsync();
+            await ReloadModelManagementAsync(connectionState);
             FooterMessage.Text = $"已{verb} {provider.DisplayName}。聊天记录、密钥和其他来源没有改动。";
         }
         catch (Exception ex)
         {
-            var errors = await RestoreProviderBackupAsync(backup, codexSnapshot, providerId, _services.Secrets.Read(providerId), provider.DisplayName);
+            var errors = await RestoreProviderBackupAsync(
+                backup,
+                codexSnapshot,
+                providerId,
+                _services.Secrets.Read(providerId),
+                provider.DisplayName,
+                connectionState);
             FooterMessage.Text = errors.Count == 0
                 ? $"没有{verb}：{FriendlyError(ex)} 原配置已恢复。"
                 : $"没有{verb}：{FriendlyError(ex)} 自动恢复不完整：{string.Join("；", errors)}";
@@ -209,7 +226,8 @@ public partial class MainWindow
         string? codexSnapshot,
         string providerId,
         string? oldSecret,
-        string? oldName)
+        string? oldName,
+        ManagedCodexConnectionState connectionState)
     {
         var errors = new List<string>();
         if (backup is not null)
@@ -249,14 +267,57 @@ public partial class MainWindow
         }
         try
         {
-            if (!await _services.Process.StartOpenCodexAsync())
-                errors.Add("OpenCodex 恢复后没有重新启动");
+            if (!await _services.Process.StartPreservingConnectionStateAsync(connectionState))
+                errors.Add("本机模型引擎恢复后没有重新启动，或 Codex 连接状态发生了变化");
         }
         catch (Exception rollbackException)
         {
-            errors.Add($"OpenCodex 重启失败：{FriendlyError(rollbackException)}");
+            errors.Add($"本机模型引擎重启失败：{FriendlyError(rollbackException)}");
         }
         return errors;
+    }
+
+    private async Task ReloadModelManagementAsync(ManagedCodexConnectionState connectionState)
+    {
+        if (connectionState.WasConnected)
+        {
+            await ReloadAsync();
+            return;
+        }
+
+        if (_services.CodexConfig.IsManagedNativeProviderSelected())
+            throw new InvalidOperationException("Codex 原本处于断开状态，但操作后变成了连接状态；已停止刷新。");
+
+        var modelsTask = _services.OpenCodex.GetModelsAsync(_services.Settings);
+        var providersTask = _services.OpenCodex.GetProvidersAsync(_services.Settings);
+        await Task.WhenAll(modelsTask, providersTask);
+        var models = modelsTask.Result;
+        var modelCounts = models
+            .GroupBy(model => model.Provider, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+
+        _allOfficialModels.Clear();
+        _allCustomModels.Clear();
+        _allCustomModels.AddRange(models
+            .Where(model => !model.IsOfficial && model.Provider is not "openai" and not "combo")
+            .OrderBy(model => model.ProviderLabel, StringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(model => model.Title, StringComparer.CurrentCultureIgnoreCase));
+        ApplyModelFilter();
+
+        var providers = providersTask.Result
+            .Where(provider => provider.Id != "openai")
+            .OrderBy(provider => provider.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToArray();
+        foreach (var provider in providers)
+        {
+            provider.ModelCount = modelCounts.TryGetValue(provider.Id, out var count) ? count : 0;
+            provider.UsageText = "Codex 未连接；这里只管理总管家自己的模型来源";
+            provider.QuotaText = "需要时可单独测试这个 API；不会把它自动切给 Codex";
+        }
+        Replace(_providers, providers);
+        CurrentModelText.Text = "Codex 未连接（只管理模型来源）";
+        CurrentModelDetail.Text = "添加、编辑、启停和测试不会改变 Codex 网关";
+        RefreshCodexConnectionUi();
     }
 
     private void UseOfficialDirectButton_Click(object sender, RoutedEventArgs e)

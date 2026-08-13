@@ -29,6 +29,11 @@ public sealed class SubagentSourceRegistryService
     /// an upstream, creates a secret, writes gateway/Codex configuration, or invokes a model.
     /// </summary>
     public async Task<IReadOnlyList<SubagentSourceDescriptor>> DiscoverAsync(
+        CancellationToken cancellationToken = default) =>
+        await DiscoverAsync(includeCodexSources: true, cancellationToken);
+
+    public async Task<IReadOnlyList<SubagentSourceDescriptor>> DiscoverAsync(
+        bool includeCodexSources,
         CancellationToken cancellationToken = default)
     {
         var discoveredAt = DateTimeOffset.Now;
@@ -76,7 +81,8 @@ public sealed class SubagentSourceRegistryService
         }
 
         foreach (var pool in catalogPools.Where(pool =>
-                     pool.Transport is PoolTransport.OfficialCodex or PoolTransport.NativeCodexAccount))
+                     includeCodexSources
+                     && pool.Transport is PoolTransport.OfficialCodex or PoolTransport.NativeCodexAccount))
         {
             var accountIdentity = pool.NativeAccountId ?? pool.Id;
             var fingerprint = ComputeNonRoutableFingerprint(
@@ -102,7 +108,7 @@ public sealed class SubagentSourceRegistryService
                 discoveredAt));
         }
 
-        if (!catalogInvalid)
+        if (includeCodexSources && !catalogInvalid)
             await AddCustomProvidersAsync(result, discoveredAt, cancellationToken);
         return result
             .GroupBy(item => item.SourceId, StringComparer.OrdinalIgnoreCase)

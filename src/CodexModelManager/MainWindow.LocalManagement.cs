@@ -67,7 +67,7 @@ public partial class MainWindow
             switch (serviceId)
             {
                 case "opencodex":
-                    if (!await _services.Process.EnsureOpenCodexAsync())
+                    if (!await _services.Process.EnsureNativeEngineOnlyAsync())
                         throw new InvalidOperationException("OpenCodex 启动后没有通过健康检查。");
                     break;
                 case "v2rayn":
@@ -80,7 +80,7 @@ public partial class MainWindow
                 default:
                     throw new InvalidOperationException("未知的本机服务。");
             }
-            await ReloadAsync();
+            if (_services.CodexConfig.IsManagedNativeProviderSelected()) await ReloadAsync();
             await RefreshLocalManagementAsync();
             FooterMessage.Text = $"{ServiceName(serviceId)} 已启动并完成复查。";
         }
@@ -194,7 +194,7 @@ public partial class MainWindow
             {
                 case "opencodex":
                     _services.Backups.Create();
-                    if (!await _services.Process.RestartOpenCodexAsync())
+                    if (!await _services.Process.RestartNativeEngineOnlyAsync())
                         throw new InvalidOperationException("OpenCodex 重启后没有通过健康检查。");
                     break;
                 case "v2rayn":
@@ -207,7 +207,7 @@ public partial class MainWindow
                 default:
                     throw new InvalidOperationException("未知的本机服务。");
             }
-            await ReloadAsync();
+            if (_services.CodexConfig.IsManagedNativeProviderSelected()) await ReloadAsync();
             await RefreshLocalManagementAsync();
             FooterMessage.Text = $"{ServiceName(serviceId)} 已重启并完成复查。";
         }
@@ -303,7 +303,10 @@ public partial class MainWindow
                 default:
                     throw new InvalidOperationException("这种归档目前只允许查看，不能在总管家内恢复。");
             }
-            await ReloadAsync();
+            if (_services.CodexConfig.IsManagedNativeProviderSelected())
+                await ReloadAsync();
+            else
+                await InitializeManagerOnlyAsync();
             await RefreshLocalManagementAsync();
             BackupActionResult.Text = $"恢复并验证完成：{item.Name}";
         }
@@ -313,13 +316,14 @@ public partial class MainWindow
 
     private async Task RestoreOpenCodexBackupAsync(string path)
     {
+        var connectionState = _services.Process.CaptureManagedCodexConnectionState();
         var current = _services.Backups.Create();
         try
         {
             await _services.Process.StopOpenCodexAsync();
             _services.Backups.Restore(path);
-            if (!await _services.Process.StartOpenCodexAsync())
-                throw new InvalidOperationException("恢复后的 OpenCodex 没有通过健康检查。");
+            if (!await _services.Process.StartPreservingConnectionStateAsync(connectionState))
+                throw new InvalidOperationException("恢复后的本机模型引擎没有通过健康检查，或 Codex 连接状态发生了变化。");
         }
         catch
         {
@@ -327,7 +331,7 @@ public partial class MainWindow
             {
                 await _services.Process.StopOpenCodexAsync();
                 _services.Backups.Restore(current);
-                await _services.Process.StartOpenCodexAsync();
+                await _services.Process.StartPreservingConnectionStateAsync(connectionState);
             }
             catch { }
             throw;
@@ -336,10 +340,15 @@ public partial class MainWindow
 
     private void RestoreCodexBackup(string path)
     {
+        var connectionState = _services.Process.CaptureManagedCodexConnectionState();
+        if (!connectionState.WasConnected)
+            throw new InvalidOperationException("Codex 当前没有连接总管家，因此禁止恢复 Codex 配置备份。请先通过“一键连接 Codex”明确授权。 ");
         var current = _services.CodexConfig.CreateSnapshot();
         try
         {
             _services.CodexConfig.RestoreSnapshot(path);
+            if (_services.CodexConfig.IsManagedNativeProviderSelected() != connectionState.WasConnected)
+                throw new InvalidOperationException("这份备份会改变 Codex 与总管家的连接状态。请先用“一键连接 Codex”开关切到对应状态，再恢复备份。");
             if (!_services.CodexConfig.MemoryProtectionLooksSafe())
                 throw new InvalidOperationException("恢复结果触发了记忆保护锁。");
         }

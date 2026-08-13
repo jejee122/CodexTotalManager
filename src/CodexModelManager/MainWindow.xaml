@@ -1733,6 +1733,29 @@
 
                 <ScrollViewer x:Name="ServersPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="30,26,24,38">
+                        <Border Background="#7410262E" BorderBrush="#6979DDBA" BorderThickness="1" CornerRadius="12" Padding="20" Margin="0,0,6,18">
+                            <StackPanel>
+                                <TextBlock Text="先明确指定五台服务器" FontSize="18" FontWeight="Bold" Foreground="White"/>
+                                <TextBlock Text="总管家不会扫描你的全部 SSH Host。只有这里保存成功的五个名称会被只读监控；少一个、多一个、重复或名称不存在都会拒绝启用。"
+                                           Foreground="#BBD1D6" FontSize="12" Margin="0,7,0,14" TextWrapping="Wrap"/>
+                                <TextBlock Text="SSH 配置文件" Style="{StaticResource LabelText}"/>
+                                <Grid Margin="0,5,0,12">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                    <TextBox x:Name="ServerSshConfigPathBox" Style="{StaticResource InputBox}" Margin="0,0,10,0"/>
+                                    <Button Grid.Column="1" Style="{StaticResource SecondaryButton}" Content="选择文件" Click="BrowseServerSshConfigButton_Click"/>
+                                </Grid>
+                                <TextBlock Text="五台服务器名称（一行一个，必须与 SSH 配置里的 Host 名称完全一致）" Style="{StaticResource LabelText}"/>
+                                <TextBox x:Name="ServerAliasesBox" Style="{StaticResource InputBox}" MinHeight="105" AcceptsReturn="True"
+                                         VerticalContentAlignment="Top" Margin="0,5,0,12"/>
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Style="{StaticResource PrimaryButton}" Content="启用并保存五台白名单" Click="SaveServerMonitoringButton_Click"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="停用服务器监控" Margin="10,0,0,0" Click="DisableServerMonitoringButton_Click"/>
+                                </StackPanel>
+                                <TextBlock x:Name="ServerConfigurationStatusText" Text="尚未配置；不会连接任何服务器。"
+                                           Foreground="#91B8BE" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </Border>
+
                         <Border Background="#7410262E" BorderBrush="#69C99747" BorderThickness="1" CornerRadius="12" Padding="20" Margin="0,0,6,18">
                             <Grid>
                                 <Grid.ColumnDefinitions>
@@ -1755,7 +1778,7 @@
                                         <TextBlock Text="五台服务器动态状态中心" FontSize="20" FontWeight="Bold" Foreground="White"/>
                                         <TextBlock Text="前台每 20 秒、后台每 60 秒只读采样；不会重启、删除、升级、改配置或改防火墙。"
                                                    Foreground="#BBD1D6" FontSize="13" Margin="0,7,0,0" TextWrapping="Wrap"/>
-                                        <TextBlock Text="服务器从本机 SSH 配置自动发现；排除 -Public 和 -WG，不在程序里写死国家或地址。"
+                                        <TextBlock Text="只读取你在上方明确保存的五台白名单；不会扫描或连接 SSH 配置中的其他 Host。"
                                                    Foreground="#91B8BE" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
                                         <TextBlock x:Name="ServerFreshnessBadge" Text="状态：尚未采样"
                                                    Foreground="#79DDBA" FontSize="12" FontWeight="SemiBold" Margin="0,7,0,0"/>
@@ -1855,7 +1878,7 @@
                         </Border>
 
                         <Border x:Name="ServerResultBanner" Background="{StaticResource InfoSurface}" BorderBrush="#5279B6A8" BorderThickness="1" CornerRadius="9" Padding="15" Margin="0,0,6,0">
-                            <TextBlock x:Name="ServerResultText" Text="进入本页后会自动开始只读采样。" Foreground="{StaticResource Muted}" FontSize="13" TextWrapping="Wrap"/>
+                            <TextBlock x:Name="ServerResultText" Text="保存五台白名单后才会开始只读采样。" Foreground="{StaticResource Muted}" FontSize="13" TextWrapping="Wrap"/>
                         </Border>
                     </StackPanel>
                 </ScrollViewer>

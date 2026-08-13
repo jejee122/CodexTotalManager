@@ -154,6 +154,82 @@ public sealed class AccountPoolService
             .ToArray();
     }
 
+    public async Task<IReadOnlyList<AccountPoolView>> ReadDisconnectedViewsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (_catalog.LoadWarning is not null)
+        {
+            var active = _catalog.GetActive();
+            return _catalog.GetPools()
+                .Select(pool => CreateCatalogRecoveryView(pool, active, _catalog.LoadWarning))
+                .OrderBy(view => view.SectionOrder)
+                .ThenBy(view => view.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+                .ToArray();
+        }
+
+        var storedActive = _catalog.GetActive();
+        var views = new List<AccountPoolView>();
+        foreach (var pool in _catalog.GetPools())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (pool.Transport is PoolTransport.OfficialCodex or PoolTransport.NativeCodexAccount)
+            {
+                views.Add(CreateDisconnectedNativeView(pool, storedActive));
+                continue;
+            }
+
+            views.Add(await ReadViewAsync(
+                pool,
+                storedActive,
+                new NativeCodexSnapshot(
+                    Array.Empty<CodexAccountView>(),
+                    new CodexPoolSettings(null, 80, 3, "disconnected"),
+                    Array.Empty<string>(),
+                    "Codex 未连接；未读取原生账号。",
+                    AccountRosterCompleteness.Unknown),
+                cancellationToken));
+        }
+
+        return views.OrderBy(view => view.SectionOrder)
+            .ThenBy(view => view.IsProtected ? 0 : 1)
+            .ThenBy(view => view.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToArray();
+    }
+
+    private static AccountPoolView CreateDisconnectedNativeView(
+        PoolDefinition pool,
+        ActivePoolState active) => new()
+    {
+        Id = pool.Id,
+        RuntimeProviderId = ResolveRuntimeProviderId(pool),
+        RuntimeProviderIdentitySource = ResolveRuntimeProviderIdentitySource(pool),
+        QuotaRosterCompleteness = AccountRosterCompleteness.Unknown,
+        DisplayName = pool.DisplayName,
+        Description = pool.Description,
+        TypeText = TypeText(pool),
+        SectionTitle = "Codex 原生账号 · 连接后读取",
+        SectionOrder = 0,
+        StatusTitle = "Codex 未连接",
+        StatusDetail = "没有读取 Codex 账号、套餐、额度或聊天状态。",
+        EndpointText = "OpenAI 原生账号",
+        AccountCountText = "未读取账号",
+        ModelCountText = "连接后读取模型",
+        LastCheckedText = "Codex 隔离中",
+        IsActive = active.PoolId.Equals(pool.Id, StringComparison.OrdinalIgnoreCase),
+        IsProtected = pool.IsProtected,
+        Enabled = pool.Enabled,
+        CanSwitch = false,
+        CanAddAccount = false,
+        CanConfigure = false,
+        CanTogglePool = false,
+        CanSelectModel = false,
+        NewTasksOnly = false,
+        ModelSelectionHint = "先点总管家的一键连接 Codex，再读取或切换原生账号。",
+        SelectedModel = pool.DefaultModel,
+        AddAccountText = "连接后管理",
+        ConfigureText = "连接后管理"
+    };
+
     private static AccountPoolView CreateCatalogRecoveryView(
         PoolDefinition pool,
         ActivePoolState active,
@@ -227,7 +303,7 @@ public sealed class AccountPoolService
     public async Task<CodexAccountLoginStartResult> StartNativeCodexLoginAsync(
         CancellationToken cancellationToken = default)
     {
-        if (!await _process.EnsureOpenCodexAsync(cancellationToken))
+        if (!await _process.EnsureNativeEngineOnlyAsync(cancellationToken))
             throw new OpenCodexAccountApiUnavailableException("OpenCodex 没有启动成功，无法调用账号登录接口。");
         return await _openCodex.StartCodexAccountLoginAsync(cancellationToken);
     }
@@ -266,7 +342,8 @@ public sealed class AccountPoolService
 
     public async Task OpenOpenCodexManagementAsync(CancellationToken cancellationToken = default)
     {
-        await _process.EnsureOpenCodexAsync(cancellationToken);
+        if (!await _process.EnsureNativeEngineOnlyAsync(cancellationToken))
+            throw new InvalidOperationException("本机号池引擎没有启动成功。");
         System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
             FileName = _openCodex.ManagementUrl,
@@ -337,6 +414,8 @@ public sealed class AccountPoolService
     {
         var target = _catalog.Find(poolId) ?? throw new InvalidOperationException("号池不存在。");
         if (!target.Enabled) return OperationResult.Fail("这个号池已停用。");
+        if (!_codexConfig.IsManagedNativeProviderSelected())
+            return OperationResult.Fail("Codex 目前没有连接总管家。你仍可添加、登录和管理号池；要把某个号池切给 Codex 使用，请先点“一键连接 Codex”。");
 
         var desktopBefore = await _desktop.ReadStateAsync(cancellationToken);
         if (!desktopBefore.Connected && IsCodexProcessRunning())

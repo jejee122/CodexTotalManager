@@ -2,6 +2,8 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
 using CodexModelManager.Models;
+using Microsoft.Win32;
+using System.Security.Cryptography;
 
 namespace CodexModelManager;
 
@@ -17,13 +19,16 @@ public partial class MainWindow
 
     private void StartServerMonitoring()
     {
+        RefreshServerConfigurationUi();
         if (!_services.Dashboard.ServerCheckExists)
         {
             StopServerMonitoring();
             _nextServerSample = null;
-            ServerResultText.Text = "没有在 SSH 配置中发现可监控的主服务器。";
+            ServerCheckButton.IsEnabled = false;
+            ServerResultText.Text = "服务器监控未启用；不会扫描 SSH 配置，也不会连接任何服务器。";
             return;
         }
+        ServerCheckButton.IsEnabled = true;
         _serverTimer ??= new DispatcherTimer(DispatcherPriority.Background)
         {
             Interval = TimeSpan.FromSeconds(60)
@@ -69,7 +74,7 @@ public partial class MainWindow
         if (_serverRefreshRunning) return;
         _serverRefreshRunning = true;
         var expected = _services.Dashboard.ExpectedServerCount;
-        if (showBusy) SetBusy(true, $"正在只读采样动态发现的 {expected} 台服务器…");
+        if (showBusy) SetBusy(true, $"正在只读采样白名单中的 {expected} 台服务器…");
         ServerCheckButton.IsEnabled = false;
         ServerCheckButton.Content = "采样中…";
         ServerResultText.Text = "正在读取 CPU、内存、磁盘、网络、负载和通用服务；不会修改服务器。";
@@ -117,7 +122,7 @@ public partial class MainWindow
             : "没有配置公开入口网址；这不会影响五台服务器的 SSH 只读检测";
         var cadence = ServersPage.Visibility == Visibility.Visible ? 20 : 60;
         ServerCheckedAt.Text = $"最近一次真实采样：{result.CheckedAt} · 当前自动刷新间隔 {cadence} 秒";
-        ServerStreamMeta.Text = $"本轮完成 {DateTime.Now:HH:mm:ss} · 动态发现 {result.Servers.Count} 台";
+        ServerStreamMeta.Text = $"本轮完成 {DateTime.Now:HH:mm:ss} · 白名单 {result.Servers.Count} 台";
         ServerResultText.Text = result.Message;
         ServerResultText.Foreground = new SolidColorBrush(result.Success
             ? Color.FromRgb(121, 221, 186)
@@ -139,7 +144,7 @@ public partial class MainWindow
             ? "没有发现服务器"
             : string.Join(" · ", result.Servers.Select(server => $"{server.Role} {(server.Online ? "在线" : "离线")}"));
         HomeServerCapability.Text = online == result.Servers.Count && online > 0 ? "已经可用" : "部分可用";
-        HomeServerCapabilityDetail.Text = $"动态只读采样 · {result.CheckedAt}";
+        HomeServerCapabilityDetail.Text = $"五台白名单只读采样 · {result.CheckedAt}";
 
         foreach (var server in result.Servers)
             AppendServerFeed(server);
@@ -223,6 +228,77 @@ public partial class MainWindow
             ? 0
             : Math.Max(0, (int)(_nextServerSample.Value - DateTimeOffset.Now).TotalSeconds);
         ServerFreshnessBadge.Text = $"LIVE · {age} 秒前更新 · 约 {until} 秒后刷新";
+    }
+
+    private void RefreshServerConfigurationUi()
+    {
+        if (ServerSshConfigPathBox is null) return;
+        ServerSshConfigPathBox.Text = _services.Settings.ServerSshConfigPath ?? ServerSshConfigPathBox.Text;
+        if (_services.Settings.ServerAliases.Count > 0)
+            ServerAliasesBox.Text = string.Join(Environment.NewLine, _services.Settings.ServerAliases);
+        ServerConfigurationStatusText.Text = _services.Settings.ServerMonitoringEnabled
+            ? $"已启用：只监控 {_services.Settings.ServerAliases.Count} 台；SSH 配置指纹 {_services.Settings.ServerSshConfigSha256?[..12]}…"
+            : "尚未配置；不会扫描或连接任何服务器。";
+    }
+
+    private void BrowseServerSshConfigButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "选择包含五台服务器的 SSH 配置文件",
+            Filter = "SSH 配置 (config;*.conf)|config;*.conf|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+        if (dialog.ShowDialog(this) == true) ServerSshConfigPathBox.Text = dialog.FileName;
+    }
+
+    private void SaveServerMonitoringButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+        try
+        {
+            var path = Path.GetFullPath(ServerSshConfigPathBox.Text.Trim());
+            if (!File.Exists(path)) throw new FileNotFoundException("选择的 SSH 配置文件不存在。", path);
+            var aliases = ServerAliasesBox.Text
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+            _services.Settings.SetServerMonitoringConfiguration(path, hash, aliases);
+            _services.Dashboard.ConfigureServerMonitoring(path, hash, aliases);
+            ServerConfigurationStatusText.Text = $"保存成功：只监控这五台——{string.Join("、", aliases)}。";
+            _lastServerSample = null;
+            StartServerMonitoring();
+        }
+        catch (Exception ex)
+        {
+            StopServerMonitoring();
+            ServerConfigurationStatusText.Text = "没有启用：" + FriendlyError(ex);
+            ServerResultText.Text = "配置没有通过检查；不会连接任何服务器。";
+        }
+    }
+
+    private void DisableServerMonitoringButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+        try
+        {
+            StopServerMonitoring();
+            _services.Settings.SetServerMonitoringConfiguration(null, null, Array.Empty<string>());
+            _services.Dashboard.DisableServerMonitoring();
+            _serverCards.Clear();
+            _serverFeed.Clear();
+            _lastServerSample = null;
+            _nextServerSample = null;
+            ServerCheckButton.IsEnabled = false;
+            ServerConfigurationStatusText.Text = "服务器监控已停用；不会连接任何服务器。";
+            ServerResultText.Text = "已停用。";
+            HomeServersSummaryText.Text = "服务器监控已停用";
+            HomeServersDetailText.Text = "没有连接服务器";
+        }
+        catch (Exception ex)
+        {
+            ServerConfigurationStatusText.Text = "停用没有完成：" + FriendlyError(ex);
+        }
     }
 
     private static string FriendlyServiceName(string name) => name switch

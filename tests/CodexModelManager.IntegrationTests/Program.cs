@@ -2284,7 +2284,18 @@ static async Task RunUnitTestsAsync()
                                                   User synthetic-test
                                                   IdentityFile C:/nonexistent/cmm-synthetic-test-key
                                                   BatchMode yes
+                                                Host synthetic-us
+                                                  HostName 127.0.0.1
+                                                Host synthetic-jp
+                                                  HostName 127.0.0.1
+                                                Host synthetic-de
+                                                  HostName 127.0.0.1
+                                                Host synthetic-sg
+                                                  HostName 127.0.0.1
+                                                Host synthetic-extra
+                                                  HostName 127.0.0.1
                                                 """;
+        string[] syntheticServerAliases = ["synthetic-cn", "synthetic-us", "synthetic-jp", "synthetic-de", "synthetic-sg"];
         await File.WriteAllTextAsync(
             syntheticSshConfigPath,
             syntheticSshConfig,
@@ -2319,13 +2330,13 @@ static async Task RunUnitTestsAsync()
                && timedCallIndex < metricIndex
                && metricIndex < resultIndex,
             "Each host health sample must use exactly one timed SSH command and report its result afterward.");
-        Ensure(serverHealthScriptText.Contains("function Get-MainServerAliases", StringComparison.Ordinal)
-               && serverHealthScriptText.Contains("EndsWith('-Public'", StringComparison.Ordinal)
-               && serverHealthScriptText.Contains("EndsWith('-WG'", StringComparison.Ordinal)
+        Ensure(serverHealthScriptText.Contains("function Get-ConfiguredHostAliases", StringComparison.Ordinal)
+               && serverHealthScriptText.Contains("[string]$ServerAliasesJson", StringComparison.Ordinal)
+               && serverHealthScriptText.Contains("$serverAliases.Count -ne 5", StringComparison.Ordinal)
+               && serverHealthScriptText.Contains("$configuredSet.Contains($serverAlias)", StringComparison.Ordinal)
                && serverHealthScriptText.Contains("foreach ($serverAlias in $serverAliases)", StringComparison.Ordinal)
-               && !serverHealthScriptText.Contains("cmm-cn", StringComparison.Ordinal)
-               && !serverHealthScriptText.Contains("cmm-us", StringComparison.Ordinal),
-            "Server sampling must dynamically discover main aliases and must not retain fixed CN/US hosts.");
+               && !serverHealthScriptText.Contains("CMM_SERVER_", StringComparison.Ordinal),
+            "Server sampling must require exactly five explicit safe aliases instead of scanning every SSH Host.");
         Ensure(serverHealthScriptText.Contains("WaitForExit(15000)", StringComparison.Ordinal)
                && serverHealthScriptText.Contains("ConnectTimeout=8", StringComparison.Ordinal),
             "Each server must have a bounded independent SSH timeout.");
@@ -2358,7 +2369,8 @@ static async Task RunUnitTestsAsync()
         var wrongSshHashDashboard = new DashboardStatusService(
             resourceRoot,
             syntheticSshConfigPath,
-            wrongSshHash);
+            wrongSshHash,
+            syntheticServerAliases);
         var wrongSshHashResult = await wrongSshHashDashboard.RunServerHealthAsync();
         Ensure(!wrongSshHashResult.Success
                && wrongSshHashResult.Message.Contains("安全锁", StringComparison.Ordinal),
@@ -2368,7 +2380,8 @@ static async Task RunUnitTestsAsync()
         var lockedDashboard = new DashboardStatusService(
             resourceRoot,
             syntheticSshConfigPath,
-            syntheticSshConfigHash);
+            syntheticSshConfigHash,
+            syntheticServerAliases);
         Ensure(lockedDashboard.ServerCheckExists,
             "The synthetic server binding was not accepted before the tamper test.");
         var lockedServer = await lockedDashboard.RunServerHealthAsync();

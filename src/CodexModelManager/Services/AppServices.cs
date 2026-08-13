@@ -126,16 +126,11 @@ public sealed class AppServices
             CodexConfig = codexConfig,
             CodexModelCatalog = codexModelCatalog,
             Backups = backups,
-            Dashboard = RuntimeMode.IsDetachedUi
-                ? new DashboardStatusService(
-                    serverSshConfigPath: RuntimeMode.AllowsExternalStatusConnections
-                        ? ResolveLocalSshConfigPath()
-                        : null,
-                    v2rayProxyPort: settings.V2rayProxyPort)
-                : settings.ServerMonitoringEnabled
+            Dashboard = !RuntimeMode.IsDetachedUi && settings.ServerMonitoringEnabled
                 ? new DashboardStatusService(
                     serverSshConfigPath: settings.ServerSshConfigPath,
                     serverSshConfigSha256: settings.ServerSshConfigSha256,
+                    serverAliases: settings.ServerAliases,
                     v2rayProxyPort: settings.V2rayProxyPort)
                 : new DashboardStatusService(v2rayProxyPort: settings.V2rayProxyPort),
             CodexDesktop = desktop,
@@ -163,15 +158,6 @@ public sealed class AppServices
     private static BackupCatalogService CreateBackupCatalogService(string dataDirectory) => new(
         managerRoot: Path.Combine(dataDirectory, "backups"),
         dreamRoot: Path.Combine(dataDirectory, "dreamskin-backups"));
-
-    private static string? ResolveLocalSshConfigPath()
-    {
-        var path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".ssh",
-            "config");
-        return File.Exists(path) ? path : null;
-    }
 
     private static NativeEngineService CreateNativeEngineService(string dataDirectory)
     {

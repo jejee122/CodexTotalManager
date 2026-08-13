@@ -254,6 +254,44 @@ public sealed class SubagentConfigurationService
             string.Join(" ", new[] { LoadWarning, configWarning }.Where(value => !string.IsNullOrWhiteSpace(value))));
     }
 
+    public SubagentConfigurationSnapshot InspectDraftOnly()
+    {
+        var draft = LoadDraft();
+        var applied = Roles.ToDictionary(
+            role => role.Id,
+            role => new SubagentAppliedRoleState(
+                role.Id,
+                null,
+                false,
+                "Codex 未连接 · 只显示总管家草稿"),
+            StringComparer.OrdinalIgnoreCase);
+        var bridge = new SubagentBridgeStatus(
+            false,
+            false,
+            false,
+            "Codex 未连接；没有读取 MCP 区块或 Codex Agent 文件。",
+            null, null, null, null, null, null, null, null, null, null, null);
+        return new SubagentConfigurationSnapshot(
+            false,
+            false,
+            false,
+            "Codex 未连接（路径未读取）",
+            "Codex 未连接（目录未读取）",
+            draft,
+            applied,
+            bridge,
+            ComputeDraftOnlyBaselineRevision(),
+            "总管家草稿可查看；Codex 配置、Agent 文件和任务状态保持隔离。",
+            LoadWarning);
+    }
+
+    private string ComputeDraftOnlyBaselineRevision()
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        AddFileRevision(hash, "draft", _dataPath);
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
     public SubagentApplyPlan CreatePlan(
         IEnumerable<SubagentRoleSelection> selections,
         IReadOnlyCollection<string> availableNativeModels,

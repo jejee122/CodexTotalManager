@@ -1,5 +1,4 @@
 using System.Windows;
-using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -12,15 +11,6 @@ namespace CodexModelManager;
 public partial class App : Application
 {
     private Mutex? _singleInstanceMutex;
-    private bool _restartAfterCodexConnectionChange;
-    private bool _restartExpectedConnected;
-
-    public void RestartAfterCodexConnectionChange(bool connectedAfterRestart)
-    {
-        _restartAfterCodexConnectionChange = true;
-        _restartExpectedConnected = connectedAfterRestart;
-        Shutdown(0);
-    }
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -170,7 +160,9 @@ public partial class App : Application
             try
             {
                 var services = AppServices.Create();
-                var ok = Task.Run(() => services.Process.EnsureOpenCodexAsync()).GetAwaiter().GetResult();
+                // Legacy maintenance switch: it may prepare the Manager's loopback
+                // engine, but only the in-app connection toggle may write Codex routing.
+                var ok = Task.Run(() => services.Process.EnsureNativeEngineOnlyAsync()).GetAwaiter().GetResult();
                 Shutdown(ok ? 0 : 1);
             }
             catch
@@ -409,18 +401,6 @@ public partial class App : Application
             return;
         }
 
-        if (!RuntimeMode.IsDetachedUi
-            && !new CodexConfigService().IsManagedNativeProviderSelected())
-        {
-            MessageBox.Show(
-                "没有找到完整、有效的总管家 Codex 连接标记。为了保护当前 Codex，已拒绝进入连接模式。",
-                "Codex 总管家 - 保持断开",
-                MessageBoxButton.OK,
-                MessageBoxImage.Warning);
-            Shutdown(64);
-            return;
-        }
-
         var window = new MainWindow();
         MainWindow = window;
         window.Show();
@@ -496,7 +476,6 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
-        var restart = _restartAfterCodexConnectionChange;
         if (_singleInstanceMutex is not null)
         {
             try { _singleInstanceMutex.ReleaseMutex(); } catch { }
@@ -504,46 +483,6 @@ public partial class App : Application
             _singleInstanceMutex = null;
         }
         base.OnExit(e);
-        if (restart && !TryStartCleanManagerProcess() && _restartExpectedConnected)
-        {
-            try { new CodexConfigService().RemoveManagedNativeProvider(createSnapshot: false); }
-            catch { }
-        }
-    }
-
-    private static bool TryStartCleanManagerProcess()
-    {
-        var executable = Environment.ProcessPath;
-        if (string.IsNullOrWhiteSpace(executable) || !File.Exists(executable)) return false;
-
-        try
-        {
-            var start = new ProcessStartInfo
-            {
-                FileName = executable,
-                WorkingDirectory = AppContext.BaseDirectory,
-                UseShellExecute = false
-            };
-            foreach (var name in new[]
-                     {
-                         "CMM_DETACHED_UI",
-                         "CMM_DETACHED_NO_EXTERNAL_NETWORK",
-                         "CMM_DETACHED_DATA_ROOT",
-                         "CMM_SANDBOX_CODEX_HOME",
-                         "CMM_SANDBOX_APPDATA",
-                         "CMM_SANDBOX_OPENCODEX_HOME",
-                         "CMM_SANDBOX_DREAMSKIN",
-                         "CMM_SANDBOX_OCX_URL",
-                         "CMM_RUNTIME_ROOT",
-                         "CMM_NATIVE_ADMISSION_TOKEN"
-                     })
-                start.Environment.Remove(name);
-            return Process.Start(start) is not null;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private static void EnsureWindowsDirectoryEnvironment()

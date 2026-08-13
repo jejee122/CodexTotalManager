@@ -59,6 +59,11 @@ public partial class SubagentManagementView : UserControl
         ResultText.Foreground = new SolidColorBrush(Color.FromRgb(143, 183, 188));
         try
         {
+            if (!_services.CodexConfig.IsManagedNativeProviderSelected())
+            {
+                await RefreshDisconnectedAsync(preservedSelections, preservedAuthorizations);
+                return;
+            }
             var desktopTask = _services.CodexDesktop.ReadStateAsync();
             var sourceTask = _services.SubagentSources.DiscoverAsync();
             _snapshot = _services.Subagents.Inspect();
@@ -138,6 +143,32 @@ public partial class SubagentManagementView : UserControl
         {
             SetBusy(false);
         }
+    }
+
+    private async Task RefreshDisconnectedAsync(
+        IReadOnlyList<SubagentRoleSelection>? preservedSelections,
+        IReadOnlyList<SubagentSourceAuthorization>? preservedAuthorizations)
+    {
+        _snapshot = _services!.Subagents.InspectDraftOnly();
+        _nativeModels = new[] { "gpt-5.6-sol", "gpt-5.6-terra" };
+        _sources = await _services.SubagentSources.DiscoverAsync(includeCodexSources: false);
+        _codexApplyAvailable = false;
+        _codexApplyStatus = "Codex 未连接 · 只管理草稿和外部 Worker，禁止写入 Codex";
+        _codexParserStatus = "未运行 Codex 解析器";
+        var workingDraft = new SubagentConfigurationDocument
+        {
+            SchemaVersion = 3,
+            Roles = (preservedSelections ?? _snapshot.Draft.Roles).Select(CloneSelection).ToList(),
+            SourceAuthorizations = (preservedAuthorizations ?? _snapshot.Draft.SourceAuthorizations)
+                .Select(CloneAuthorization).ToList()
+        };
+        _draftAuthorizations = workingDraft.SourceAuthorizations.Select(CloneAuthorization).ToList();
+        BuildSourceRows(_snapshot.Draft);
+        BuildRows(workingDraft);
+        ApplySnapshot(_snapshot);
+        ApplyButton.IsEnabled = false;
+        ResultText.Text = "Codex 保持断开：可以查看和调整本页草稿、测试独立 Worker；点一键连接后才允许写入 Codex。";
+        ResultText.Foreground = new SolidColorBrush(Color.FromRgb(143, 183, 188));
     }
 
     private void BuildRows(SubagentConfigurationDocument draft)
@@ -458,6 +489,12 @@ public partial class SubagentManagementView : UserControl
     private async void ApplyButton_Click(object sender, RoutedEventArgs e)
     {
         if (_busy || _services is null || _snapshot is null) return;
+        if (!_services.CodexConfig.IsManagedNativeProviderSelected())
+        {
+            ResultText.Text = "Codex 目前未连接。草稿仍在界面里，但不会写入 Codex；请先点一键连接 Codex。";
+            ResultText.Foreground = Brushes.IndianRed;
+            return;
+        }
         var selections = CurrentSelections();
         var plan = _services.Subagents.CreatePlan(
             selections, CurrentAuthorizations(), _nativeModels, _sources);
