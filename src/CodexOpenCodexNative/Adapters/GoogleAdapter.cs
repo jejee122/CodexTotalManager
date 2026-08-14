@@ -45,7 +45,8 @@ public sealed class GoogleAdapter : IProviderAdapter
                 Streaming = false,
                 ContentType = "application/json",
                 JsonBody = BuildErrorBody((int)response.StatusCode, errorBody),
-                StatusCode = (int)response.StatusCode
+                StatusCode = (int)response.StatusCode,
+                Owner = response
             };
         }
 
@@ -56,17 +57,80 @@ public sealed class GoogleAdapter : IProviderAdapter
             {
                 Streaming = true,
                 ContentType = "text/event-stream",
-                Events = ParseSseStream(stream, cancellationToken)
+                Events = ParseSseStream(stream, cancellationToken),
+                Owner = response
             };
         }
 
         var jsonBody = await response.Content.ReadAsStringAsync(cancellationToken);
+        var normalized = ParseNonStreamingResponse(jsonBody);
         return new AdapterResponse
         {
             Streaming = false,
             ContentType = "application/json",
-            JsonBody = jsonBody
+            JsonBody = jsonBody,
+            Message = normalized.Message,
+            FinishReason = normalized.FinishReason,
+            Usage = normalized.Usage,
+            Owner = response
         };
+    }
+
+    internal static GoogleNormalizedResponse ParseNonStreamingResponse(string jsonBody)
+    {
+        using var document = JsonDocument.Parse(jsonBody);
+        var root = document.RootElement;
+        var message = new OcxMessage { Role = "assistant" };
+        var text = new StringBuilder();
+        var calls = new List<OcxToolCall>();
+        string? finishReason = null;
+        if (root.TryGetProperty("candidates", out var candidates) && candidates.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var candidate in candidates.EnumerateArray())
+            {
+                finishReason ??= candidate.TryGetProperty("finishReason", out var reason)
+                    ? reason.GetString()
+                    : null;
+                if (!candidate.TryGetProperty("content", out var content)
+                    || !content.TryGetProperty("parts", out var parts)
+                    || parts.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var part in parts.EnumerateArray())
+                {
+                    if (part.TryGetProperty("text", out var textNode))
+                        text.Append(textNode.GetString());
+                    if (!part.TryGetProperty("functionCall", out var functionCall)) continue;
+                    calls.Add(new OcxToolCall
+                    {
+                        Id = "call_" + Guid.NewGuid().ToString("N")[..24],
+                        Function = new OcxToolCallFunction
+                        {
+                            Name = functionCall.TryGetProperty("name", out var nameNode)
+                                ? nameNode.GetString()
+                                : null,
+                            Arguments = functionCall.TryGetProperty("args", out var args)
+                                ? args.GetRawText()
+                                : "{}"
+                        }
+                    });
+                }
+            }
+        }
+        message.Content = text.ToString();
+        if (calls.Count > 0) message.ToolCalls = calls;
+        var usage = new OcxUsage();
+        if (root.TryGetProperty("usageMetadata", out var usageNode))
+        {
+            usage.PromptTokens = ReadLong(usageNode, "promptTokenCount");
+            usage.CompletionTokens = ReadLong(usageNode, "candidatesTokenCount");
+            usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens;
+        }
+        var normalizedFinish = calls.Count > 0
+            ? "tool_calls"
+            : string.Equals(finishReason, "MAX_TOKENS", StringComparison.OrdinalIgnoreCase)
+                ? "length"
+                : "stop";
+        return new GoogleNormalizedResponse(message, normalizedFinish, usage);
     }
 
     public static string BuildRequestJson(OcxParsedRequest request)
@@ -262,4 +326,9 @@ public sealed class GoogleAdapter : IProviderAdapter
 
     private static long ReadLong(JsonElement root, string name) =>
         root.TryGetProperty(name, out var value) && value.TryGetInt64(out var number) ? number : 0;
+
+    internal sealed record GoogleNormalizedResponse(
+        OcxMessage Message,
+        string FinishReason,
+        OcxUsage Usage);
 }

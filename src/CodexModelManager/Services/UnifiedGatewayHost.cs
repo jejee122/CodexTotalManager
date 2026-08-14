@@ -21,6 +21,18 @@ public static class UnifiedGatewayHost
     private const string AdmissionSecretName = "unified-gateway:client";
     public const string SourceFingerprintHeader = "X-CMM-Source-Fingerprint";
     public const int RouteGuardVersion = 3;
+    private static readonly HashSet<string> AllowedProxyPaths = new(StringComparer.Ordinal)
+    {
+        "/v1/responses",
+        "/v1/chat/completions",
+        "/v1/messages"
+    };
+    private static readonly HashSet<string> ForwardRequestHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Accept",
+        "Accept-Encoding",
+        "User-Agent"
+    };
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -109,6 +121,15 @@ public static class UnifiedGatewayHost
             context.Response.StatusCode = StatusCodes.Status204NoContent;
             return;
         }
+        if (!TryGetAllowedUpstreamPath(context.Request.Path.Value, out var relativePath))
+        {
+            await WriteOpenAiErrorAsync(
+                context,
+                StatusCodes.Status404NotFound,
+                "unsupported_gateway_path",
+                "统一网关只允许已声明的模型接口路径。");
+            return;
+        }
         if (!context.Request.HasJsonContentType())
         {
             await WriteOpenAiErrorAsync(context, StatusCodes.Status415UnsupportedMediaType, "unsupported_media_type", "统一网关目前只接受 JSON API 请求。");
@@ -192,11 +213,23 @@ public static class UnifiedGatewayHost
 
         json["model"] = route.UpstreamModel;
         body = Encoding.UTF8.GetBytes(json.ToJsonString(JsonOptions));
-        var relativePath = context.Request.Path.Value?.StartsWith("/v1/", StringComparison.OrdinalIgnoreCase) == true
-            ? context.Request.Path.Value[4..]
-            : context.Request.Path.Value?.TrimStart('/') ?? string.Empty;
-        var upstreamBase = new Uri(route.BaseUrl.TrimEnd('/') + "/", UriKind.Absolute);
-        var target = new Uri(upstreamBase, relativePath + context.Request.QueryString.Value);
+        Uri target;
+        try
+        {
+            target = BuildConstrainedUpstreamUri(
+                route.BaseUrl,
+                relativePath,
+                context.Request.QueryString.Value);
+        }
+        catch (Exception ex)
+        {
+            await WriteOpenAiErrorAsync(
+                context,
+                StatusCodes.Status502BadGateway,
+                "invalid_upstream_endpoint",
+                ex.Message);
+            return;
+        }
 
         using var request = new HttpRequestMessage(new HttpMethod(context.Request.Method), target)
         {
@@ -205,13 +238,8 @@ public static class UnifiedGatewayHost
         request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json");
         foreach (var header in context.Request.Headers)
         {
-            if (IsHopByHop(header.Key) || header.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase)
-                                        || header.Key.Equals(SourceFingerprintHeader, StringComparison.OrdinalIgnoreCase)
-                                        || header.Key.Equals("Host", StringComparison.OrdinalIgnoreCase)
-                                        || header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)
-                                        || header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!request.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray()))
-                request.Content.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+            if (!ForwardRequestHeaders.Contains(header.Key)) continue;
+            request.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
         }
         try
         {
@@ -258,6 +286,56 @@ public static class UnifiedGatewayHost
         var left = Encoding.UTF8.GetBytes(expected);
         var right = Encoding.UTF8.GetBytes(actual);
         return left.Length == right.Length && CryptographicOperations.FixedTimeEquals(left, right);
+    }
+
+    internal static bool TryGetAllowedUpstreamPath(string? requestPath, out string relativePath)
+    {
+        relativePath = string.Empty;
+        if (string.IsNullOrEmpty(requestPath)
+            || requestPath.Contains('\\')
+            || requestPath.Contains("//", StringComparison.Ordinal)
+            || requestPath.Contains('%')
+            || requestPath.Contains("..", StringComparison.Ordinal)
+            || !AllowedProxyPaths.Contains(requestPath))
+            return false;
+        relativePath = requestPath[4..];
+        return true;
+    }
+
+    internal static Uri BuildConstrainedUpstreamUri(
+        string configuredBaseUrl,
+        string relativePath,
+        string? queryString)
+    {
+        if (relativePath is not ("responses" or "chat/completions" or "messages")
+            || relativePath.Contains('\\')
+            || relativePath.Contains("//", StringComparison.Ordinal)
+            || relativePath.Contains('%')
+            || relativePath.Contains("..", StringComparison.Ordinal))
+            throw new InvalidOperationException("上游接口路径不在允许清单中。");
+        if (!Uri.TryCreate(configuredBaseUrl, UriKind.Absolute, out var upstreamBase)
+            || upstreamBase.Scheme is not ("http" or "https")
+            || string.IsNullOrWhiteSpace(upstreamBase.Host)
+            || !string.IsNullOrEmpty(upstreamBase.UserInfo)
+            || !string.IsNullOrEmpty(upstreamBase.Query)
+            || !string.IsNullOrEmpty(upstreamBase.Fragment))
+            throw new InvalidOperationException("上游基础地址不安全或格式不正确。");
+
+        var basePath = upstreamBase.AbsolutePath.TrimEnd('/');
+        var builder = new UriBuilder(upstreamBase)
+        {
+            Path = $"{basePath}/{relativePath}",
+            Query = (queryString ?? string.Empty).TrimStart('?'),
+            Fragment = string.Empty
+        };
+        var target = builder.Uri;
+        if (!target.Scheme.Equals(upstreamBase.Scheme, StringComparison.OrdinalIgnoreCase)
+            || !target.Host.Equals(upstreamBase.Host, StringComparison.OrdinalIgnoreCase)
+            || target.Port != upstreamBase.Port
+            || !string.IsNullOrEmpty(target.UserInfo)
+            || !target.AbsolutePath.Equals($"{basePath}/{relativePath}", StringComparison.Ordinal))
+            throw new InvalidOperationException("上游目标越过了已配置的主机边界。");
+        return target;
     }
 
     private static string? ValidateFreshWorkerSource(

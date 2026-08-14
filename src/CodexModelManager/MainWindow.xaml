@@ -1023,7 +1023,7 @@
                                 CornerRadius="4" Padding="17" Margin="0,0,6,16">
                             <StackPanel>
                                 <TextBlock Text="数据口径" Foreground="#F1E7CB" FontWeight="SemiBold" FontSize="14"/>
-                                <TextBlock x:Name="TokenSourceText" Text="正在读取 ~/.opencodex/usage.jsonl"
+                                <TextBlock x:Name="TokenSourceText" Text="正在读取总管家本机请求日志"
                                            Foreground="#9CB5B8" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
                                 <TextBlock Text="这里统计调用产生的输入与输出 Token；套餐剩余百分比仍以中转站各账号卡片返回的官方额度为准。"
                                            Foreground="#78999D" FontSize="12" Margin="0,5,0,0" TextWrapping="Wrap"/>
@@ -1314,7 +1314,7 @@
                                                                 </Grid.ColumnDefinitions>
                                                                 <TextBlock Text="{Binding Label}" FontWeight="SemiBold" FontSize="12"/>
                                                                 <TextBlock Grid.Column="1" Text="{Binding SummaryText}" FontSize="12" Margin="18,0,0,0"/>
-                                                                <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="{Binding UsedPercent}"
+                                                                <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="{Binding VisualUsedPercent}"
                                                                              Width="400" Height="7" Margin="0,5,0,0" HorizontalAlignment="Left"
                                                                              Foreground="{StaticResource Jade}" Background="#38142D34"/>
                                                                 <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding ResetText}" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,4,0,0"/>

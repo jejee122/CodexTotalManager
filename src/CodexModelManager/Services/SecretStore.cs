@@ -10,6 +10,7 @@ public sealed class SecretStore
     private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("CodexModelManager:v1");
     private readonly string _path;
     private readonly string _directory;
+    private readonly object _gate = new();
 
     public string? LoadWarning { get; private set; }
 
@@ -38,18 +39,22 @@ public sealed class SecretStore
 
     private void SaveCore(string name, string secret)
     {
-        var all = LoadEncrypted();
-        EnsureWritable();
-        var clear = Encoding.UTF8.GetBytes(secret ?? string.Empty);
-        try
+        lock (_gate)
         {
-            var encrypted = ProtectedData.Protect(clear, Entropy, DataProtectionScope.CurrentUser);
-            all[name] = Convert.ToBase64String(encrypted);
-            SaveEncrypted(all);
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(clear);
+            using var fileLock = LocalFileTransaction.Acquire(_path);
+            var all = LoadEncrypted();
+            EnsureWritable();
+            var clear = Encoding.UTF8.GetBytes(secret ?? string.Empty);
+            try
+            {
+                var encrypted = ProtectedData.Protect(clear, Entropy, DataProtectionScope.CurrentUser);
+                all[name] = Convert.ToBase64String(encrypted);
+                SaveEncrypted(all);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
         }
     }
 
@@ -107,9 +112,13 @@ public sealed class SecretStore
 
     private void RemoveCore(string name)
     {
-        var all = LoadEncrypted();
-        EnsureWritable();
-        if (all.Remove(name)) SaveEncrypted(all);
+        lock (_gate)
+        {
+            using var fileLock = LocalFileTransaction.Acquire(_path);
+            var all = LoadEncrypted();
+            EnsureWritable();
+            if (all.Remove(name)) SaveEncrypted(all);
+        }
     }
 
     private static void EnsureExternalProvider(string provider)
@@ -167,8 +176,8 @@ public sealed class SecretStore
 
     private void SaveEncrypted(Dictionary<string, string> values)
     {
-        var temp = _path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(values, new JsonSerializerOptions { WriteIndented = true }));
-        File.Move(temp, _path, true);
+        LocalFileTransaction.WriteAtomic(
+            _path,
+            JsonSerializer.Serialize(values, new JsonSerializerOptions { WriteIndented = true }));
     }
 }

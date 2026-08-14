@@ -136,6 +136,8 @@
 
                 <WrapPanel Grid.Row="2" Margin="0,18,0,0">
                     <Button Style="{StaticResource PoolGhostButton}" Content="刷新实况" Click="RefreshButton_Click"/>
+                    <Button Style="{StaticResource PoolPrimaryButton}" Content="回到官方 Pro" Click="ReturnOfficialButton_Click"
+                            ToolTip="把默认线路切回官方 Pro；当前任务仍由你在 Codex 自己的模型菜单中选择"/>
                     <Button Style="{StaticResource PoolGhostButton}" Content="添加 Codex 账号" IsEnabled="False"
                             ToolTip="内建原生引擎暂不支持第二个 Codex 账号；未绑定 Plus 保持停用"/>
                     <Button Style="{StaticResource PoolGhostButton}" Content="同步账号" Click="SyncCodexAccountsButton_Click"/>
@@ -249,7 +251,7 @@
                 </StackPanel>
             </Border>
 
-            <Border Visibility="Collapsed" Background="#A60F292E" BorderBrush="#99C99747" BorderThickness="1" CornerRadius="6" Padding="22" Margin="0,0,6,14">
+            <Border Background="#A60F292E" BorderBrush="#99C99747" BorderThickness="1" CornerRadius="6" Padding="22" Margin="0,0,6,14">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -271,7 +273,6 @@
                                 ToolTip="只刷新已有账号的状态、套餐和额度，不新增账号"/>
                         <Button Style="{StaticResource PoolButton}" Content="其他 API 模型" Click="ManageOtherModelsButton_Click"
                                 ToolTip="管理不属于号池的兼容 API 模型来源"/>
-                        <Button Style="{StaticResource PoolPrimaryButton}" Content="回到官方 Pro" Click="ReturnOfficialButton_Click"/>
                     </WrapPanel>
                 </Grid>
             </Border>
@@ -534,7 +535,7 @@
                                                                             <TextBlock Grid.Column="1" Text="{Binding SummaryText}" Foreground="#A8E1C8"
                                                                                        FontSize="12" FontWeight="SemiBold" Margin="16,0,0,0"/>
                                                                             <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100"
-                                                                                         Value="{Binding UsedPercent}" Height="8" Margin="0,7,0,0"
+                                                                                         Value="{Binding VisualUsedPercent}" Height="8" Margin="0,7,0,0"
                                                                                          Foreground="#64CBB5" Background="#38142D34"/>
                                                                             <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding ResetText}"
                                                                                        Foreground="#829FA3" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>

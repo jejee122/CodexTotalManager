@@ -18,16 +18,13 @@ public sealed class ResponsesBridge
     private readonly long _createdAt;
     private int _sequenceNumber;
     private int _outputIndex;
-    private readonly List<JsonObject> _finishedItems = new();
+    private readonly List<FinishedItem> _finishedItems = new();
 
     private string? _msgItemId;
     private string _msgText = string.Empty;
     private string? _reasoningItemId;
     private string _reasoningText = string.Empty;
-    private string? _toolItemId;
-    private string? _toolCallId;
-    private string _toolName = string.Empty;
-    private string _toolArguments = string.Empty;
+    private readonly Dictionary<int, ToolItem> _toolItems = new();
 
     public ResponsesBridge(string modelId)
     {
@@ -41,6 +38,7 @@ public sealed class ResponsesBridge
     public OcxUsage? Usage { get; private set; }
 
     public string Status { get; private set; } = "completed";
+    public string? ErrorMessage { get; private set; }
 
     public async IAsyncEnumerable<string> StreamAsync(
         IAsyncEnumerable<AdapterEvent> events,
@@ -146,34 +144,40 @@ public sealed class ResponsesBridge
                     }
                     case "function_call":
                     {
-                        if (_toolItemId is null)
+                        await CloseMessageAsync(writer, cancellationToken);
+                        await CloseReasoningAsync(writer, cancellationToken);
+                        if (!_toolItems.TryGetValue(adapterEvent.ToolCallIndex, out var tool))
                         {
-                            _toolItemId = "fc_" + Guid.NewGuid().ToString("N")[..24];
-                            _toolCallId = adapterEvent.CallId ?? _toolItemId;
-                            _toolName = adapterEvent.FunctionName ?? string.Empty;
-                            _toolArguments = string.Empty;
+                            var itemId = "fc_" + Guid.NewGuid().ToString("N")[..24];
+                            tool = new ToolItem(
+                                adapterEvent.ToolCallIndex,
+                                _outputIndex++,
+                                itemId,
+                                adapterEvent.CallId ?? itemId,
+                                adapterEvent.FunctionName ?? string.Empty);
+                            _toolItems[adapterEvent.ToolCallIndex] = tool;
                             await writer.WriteAsync(Frame("response.output_item.added", new JsonObject
                             {
-                                ["output_index"] = _outputIndex,
+                                ["output_index"] = tool.OutputIndex,
                                 ["item"] = new JsonObject
                                 {
                                     ["type"] = "function_call",
-                                    ["id"] = _toolItemId,
-                                    ["call_id"] = _toolCallId,
-                                    ["name"] = _toolName,
+                                    ["id"] = tool.ItemId,
+                                    ["call_id"] = tool.CallId,
+                                    ["name"] = tool.Name,
                                     ["arguments"] = string.Empty
                                 }
                             }), cancellationToken);
                         }
                         if (!string.IsNullOrEmpty(adapterEvent.FunctionName))
-                            _toolName = adapterEvent.FunctionName;
+                            tool.Name = adapterEvent.FunctionName;
                         if (adapterEvent.Arguments is { Length: > 0 })
                         {
-                            _toolArguments += adapterEvent.Arguments;
+                            tool.Arguments.Append(adapterEvent.Arguments);
                             await writer.WriteAsync(Frame("response.function_call_arguments.delta", new JsonObject
                             {
-                                ["item_id"] = _toolItemId,
-                                ["output_index"] = _outputIndex,
+                                ["item_id"] = tool.ItemId,
+                                ["output_index"] = tool.OutputIndex,
                                 ["delta"] = adapterEvent.Arguments
                             }), cancellationToken);
                         }
@@ -181,7 +185,7 @@ public sealed class ResponsesBridge
                     }
                     case "function_call_done":
                     {
-                        await CloseToolAsync(writer, cancellationToken);
+                        await CloseToolAsync(adapterEvent.ToolCallIndex, writer, cancellationToken);
                         break;
                     }
                     case "usage":
@@ -202,9 +206,10 @@ public sealed class ResponsesBridge
                         {
                             await CloseAllAsync(writer, cancellationToken);
                             var incomplete = adapterEvent.Type == "finish"
-                                             && adapterEvent.FinishReason == "max_tokens";
+                                             && adapterEvent.FinishReason is "max_tokens" or "length";
                             if (incomplete)
                             {
+                                Status = "incomplete";
                                 await writer.WriteAsync(Frame("response.incomplete", new JsonObject
                                 {
                                     ["response"] = new JsonObject
@@ -268,6 +273,7 @@ public sealed class ResponsesBridge
                         if (!terminalEmitted)
                         {
                             Status = "error";
+                            ErrorMessage = adapterEvent.Text ?? "上游错误";
                             await CloseAllAsync(writer, cancellationToken);
                             var error = ResponsesJson.Error(
                                 adapterEvent.ErrorType ?? "proxy_error",
@@ -362,7 +368,7 @@ public sealed class ResponsesBridge
             ["output_index"] = _outputIndex,
             ["item"] = SerializeMessageItem(itemId, text)
         }), ct);
-        _finishedItems.Add(SerializeMessageItem(itemId, text));
+        _finishedItems.Add(new FinishedItem(_outputIndex, SerializeMessageItem(itemId, text)));
         _outputIndex++;
         _msgItemId = null;
         _msgText = string.Empty;
@@ -406,49 +412,42 @@ public sealed class ResponsesBridge
             ["output_index"] = _outputIndex,
             ["item"] = item
         }), ct);
-        _finishedItems.Add(item);
+        _finishedItems.Add(new FinishedItem(_outputIndex, item));
         _outputIndex++;
         _reasoningItemId = null;
         _reasoningText = string.Empty;
     }
 
-    private async Task CloseToolAsync(ChannelWriter<string> writer, CancellationToken ct)
+    private async Task CloseToolAsync(int toolCallIndex, ChannelWriter<string> writer, CancellationToken ct)
     {
-        if (_toolItemId is null) return;
-        var itemId = _toolItemId;
-        var callId = _toolCallId ?? itemId;
-        var name = _toolName;
-        var arguments = _toolArguments;
+        if (!_toolItems.Remove(toolCallIndex, out var tool)) return;
+        var arguments = tool.Arguments.ToString();
         await writer.WriteAsync(Frame("response.function_call_arguments.done", new JsonObject
         {
-            ["item_id"] = itemId,
-            ["output_index"] = _outputIndex,
+            ["item_id"] = tool.ItemId,
+            ["output_index"] = tool.OutputIndex,
             ["arguments"] = arguments
         }), ct);
         var item = new JsonObject
         {
             ["type"] = "function_call",
-            ["id"] = itemId,
-            ["call_id"] = callId,
-            ["name"] = name,
+            ["id"] = tool.ItemId,
+            ["call_id"] = tool.CallId,
+            ["name"] = tool.Name,
             ["arguments"] = arguments
         };
         await writer.WriteAsync(Frame("response.output_item.done", new JsonObject
         {
-            ["output_index"] = _outputIndex,
+            ["output_index"] = tool.OutputIndex,
             ["item"] = item
         }), ct);
-        _finishedItems.Add(item);
-        _outputIndex++;
-        _toolItemId = null;
-        _toolCallId = null;
-        _toolName = string.Empty;
-        _toolArguments = string.Empty;
+        _finishedItems.Add(new FinishedItem(tool.OutputIndex, item));
     }
 
     private async Task CloseAllAsync(ChannelWriter<string> writer, CancellationToken ct)
     {
-        await CloseToolAsync(writer, ct);
+        foreach (var index in _toolItems.Keys.OrderBy(index => index).ToArray())
+            await CloseToolAsync(index, writer, ct);
         await CloseReasoningAsync(writer, ct);
         await CloseMessageAsync(writer, ct);
     }
@@ -462,9 +461,9 @@ public sealed class ResponsesBridge
                 "msg_" + Guid.NewGuid().ToString("N")[..24],
                 upstreamText));
         }
-        foreach (var item in _finishedItems)
+        foreach (var item in _finishedItems.OrderBy(item => item.OutputIndex))
         {
-            items.Add(item.DeepClone());
+            items.Add(item.Item.DeepClone());
         }
         return new JsonObject
         {
@@ -482,9 +481,9 @@ public sealed class ResponsesBridge
     public IReadOnlyList<OcxMessage> GetContinuationMessages()
     {
         var messages = new List<OcxMessage>();
-        foreach (var item in _finishedItems)
+        foreach (var item in _finishedItems.OrderBy(item => item.OutputIndex))
         {
-            var mapped = ResponsesParser.MapInputItem(JsonSerializer.SerializeToElement(item));
+            var mapped = ResponsesParser.MapInputItem(JsonSerializer.SerializeToElement(item.Item));
             if (mapped is not null) messages.Add(mapped);
         }
         return messages;
@@ -511,9 +510,9 @@ public sealed class ResponsesBridge
     private JsonArray SerializeFinishedItems()
     {
         var array = new JsonArray();
-        foreach (var item in _finishedItems)
+        foreach (var item in _finishedItems.OrderBy(item => item.OutputIndex))
         {
-            array.Add(item.DeepClone());
+            array.Add(item.Item.DeepClone());
         }
         return array;
     }
@@ -547,5 +546,22 @@ public sealed class ResponsesBridge
             payload[key] = value?.DeepClone();
         }
         return $"event: {name}\ndata: {payload.ToJsonString()}\n\n";
+    }
+
+    private sealed record FinishedItem(int OutputIndex, JsonObject Item);
+
+    private sealed class ToolItem(
+        int toolCallIndex,
+        int outputIndex,
+        string itemId,
+        string callId,
+        string name)
+    {
+        public int ToolCallIndex { get; } = toolCallIndex;
+        public int OutputIndex { get; } = outputIndex;
+        public string ItemId { get; } = itemId;
+        public string CallId { get; } = callId;
+        public string Name { get; set; } = name;
+        public StringBuilder Arguments { get; } = new();
     }
 }

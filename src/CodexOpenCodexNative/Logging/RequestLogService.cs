@@ -10,6 +10,7 @@ public sealed class RequestLogEntry
     public DateTimeOffset StartedAt { get; set; }
     public long ElapsedMs { get; set; }
     public string? Path { get; set; }
+    public string? RequestedModel { get; set; }
     public string? Model { get; set; }
     public string? Provider { get; set; }
     public string? Status { get; set; }
@@ -26,6 +27,7 @@ public sealed class RequestLogService
     private readonly ConcurrentQueue<RequestLogEntry> _ring = new();
     private readonly string _journalPath;
     private readonly object _journalLock = new();
+    private static readonly JsonSerializerOptions JournalJsonOptions = new(JsonSerializerDefaults.Web);
 
     public RequestLogService(string? dataRoot = null)
     {
@@ -47,7 +49,8 @@ public sealed class RequestLogService
         lock (_journalLock)
         {
             File.AppendAllText(_journalPath,
-                JsonSerializer.Serialize(entry) + Environment.NewLine);
+                JsonSerializer.Serialize(entry, JournalJsonOptions) + Environment.NewLine,
+                Encoding.UTF8);
         }
     }
 
@@ -60,7 +63,7 @@ public sealed class RequestLogService
         foreach (var entry in _ring)
         {
             summary.TotalRequests++;
-            if (entry.Status == "completed") summary.CompletedRequests++;
+            if (IsCompleted(entry)) summary.CompletedRequests++;
             if (entry.PromptTokens is not null) summary.PromptTokens += entry.PromptTokens.Value;
             if (entry.CompletionTokens is not null) summary.CompletionTokens += entry.CompletionTokens.Value;
             if (entry.TotalTokens is not null) summary.TotalTokens += entry.TotalTokens.Value;
@@ -69,7 +72,7 @@ public sealed class RequestLogService
                 var bucket = summary.ByProvider.GetValueOrDefault(entry.Provider)
                              ?? new UsageSummary();
                 bucket.TotalRequests++;
-                bucket.CompletedRequests++;
+                if (IsCompleted(entry)) bucket.CompletedRequests++;
                 if (entry.PromptTokens is not null) bucket.PromptTokens += entry.PromptTokens.Value;
                 if (entry.CompletionTokens is not null) bucket.CompletionTokens += entry.CompletionTokens.Value;
                 if (entry.TotalTokens is not null) bucket.TotalTokens += entry.TotalTokens.Value;
@@ -78,6 +81,10 @@ public sealed class RequestLogService
         }
         return summary;
     }
+
+    private static bool IsCompleted(RequestLogEntry entry) =>
+        entry.Status == "completed"
+        || entry.Status == "passed-through" && entry.HttpStatus is >= 200 and < 300;
 }
 
 public sealed class UsageSummary

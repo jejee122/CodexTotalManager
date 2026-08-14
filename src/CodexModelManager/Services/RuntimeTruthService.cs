@@ -35,8 +35,13 @@ public sealed class DefaultRuntimeTruthSource : IRuntimeTruthSource
     {
         var active = _poolCatalog.GetActive();
         var pool = _poolCatalog.Find(active.PoolId);
-        var native = pool?.Transport is PoolTransport.OfficialCodex or PoolTransport.NativeCodexAccount;
-        var expectedTaskModel = native ? active.Model : pool?.RouteAlias;
+        var expectedTaskModel = pool?.Transport switch
+        {
+            PoolTransport.OfficialCodex or PoolTransport.NativeCodexAccount => active.Model,
+            PoolTransport.CliProxyApi when !string.IsNullOrWhiteSpace(pool.ProviderId) =>
+                $"{pool.ProviderId}/{active.Model}",
+            _ => pool?.RouteAlias
+        };
         var accountId = !string.IsNullOrWhiteSpace(pool?.NativeAccountId)
             ? pool.NativeAccountId
             : pool?.ProviderId;

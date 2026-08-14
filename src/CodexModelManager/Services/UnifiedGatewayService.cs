@@ -279,9 +279,7 @@ public sealed class UnifiedGatewayService
             var modelsTask = _openCodex.GetModelsAsync(_settings, cancellationToken);
             await Task.WhenAll(providersTask, modelsTask);
             var providers = providersTask.Result.Where(provider => !provider.Disabled
-                && !provider.Id.Equals("openai", StringComparison.OrdinalIgnoreCase)
-                && !provider.Id.Equals("cmm-plus-agent-api-1", StringComparison.OrdinalIgnoreCase)
-                && !provider.Id.Equals("cmm-pro-agent-api-1", StringComparison.OrdinalIgnoreCase)).ToArray();
+                && !provider.Id.Equals("openai", StringComparison.OrdinalIgnoreCase)).ToArray();
             var customCount = 0;
             foreach (var provider in providers)
             {
@@ -310,18 +308,21 @@ public sealed class UnifiedGatewayService
                         routePrefix,
                         fingerprint,
                         provider.Adapter));
-                    routes.Add(Route(
-                        model.Id,
-                        model.Id,
-                        endpoint,
-                        null,
-                        sourceId,
-                        provider.DisplayName,
-                        sourceId,
-                        SubagentSourceKind.OpenAiCompatible,
-                        routePrefix,
-                        fingerprint,
-                        provider.Adapter));
+                    if (!provider.Id.StartsWith("cmm-", StringComparison.OrdinalIgnoreCase))
+                    {
+                        routes.Add(Route(
+                            model.Id,
+                            model.Id,
+                            endpoint,
+                            null,
+                            sourceId,
+                            provider.DisplayName,
+                            sourceId,
+                            SubagentSourceKind.OpenAiCompatible,
+                            routePrefix,
+                            fingerprint,
+                            provider.Adapter));
+                    }
                     customCount++;
                 }
             }

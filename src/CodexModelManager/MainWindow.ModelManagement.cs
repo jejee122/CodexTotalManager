@@ -324,7 +324,7 @@ public partial class MainWindow
     {
         if (_busy) return;
         ShowAccountsPage();
-        FooterMessage.Text = "请在中转站顶部点“回到官方 Pro”；它会同时切换默认模型和当前任务，并执行回滚保护。";
+        FooterMessage.Text = "请在中转站顶部点“回到官方 Pro”；它会切回官方线路和默认模型。当前任务仍由你在 Codex 自己的模型菜单中选择，总管家不会自动点击或重启 Codex。";
     }
 
     private static string FormatUptime(TimeSpan? uptime)

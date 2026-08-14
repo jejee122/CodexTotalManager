@@ -119,6 +119,13 @@ if (mode == "ledger-checkpoint-location-publication")
     return;
 }
 
+if (mode == "ledger-recovery-regression")
+{
+    await AssertLedgerRecoveryRegressionsAsync();
+    Console.WriteLine("LEDGER_RECOVERY_REGRESSION_OK projection_retry tail_newline tail_truncate direct_reorder quota_read_recovery quota_atomic_rebuild");
+    return;
+}
+
 if (mode == "catalog-startup-isolation")
 {
     var isolationRoot = CreateOwnedTestRoot("cmm-catalog-startup-isolation");
@@ -132,6 +139,10 @@ if (mode == "catalog-startup-isolation")
             isolationRoot,
             "null-active",
             """{"SchemaVersion":2,"Pools":[],"Active":null}""");
+        await AssertCatalogStartupIsolationAsync(
+            isolationRoot,
+            "null-active-pool-id",
+            """{"SchemaVersion":2,"Pools":[{"Id":"official-pro","DisplayName":"官方保底","Transport":"OfficialCodex"}],"Active":{"PoolId":null,"Model":"gpt-5.6-sol"}}""");
         await AssertCatalogStartupIsolationAsync(
             isolationRoot,
             "duplicate-pool-ids",
@@ -156,7 +167,8 @@ if (mode == "catalog-startup-isolation")
             isolationRoot,
             "duplicate-cli-port",
             """{"SchemaVersion":2,"Pools":[{"Id":"port-a","DisplayName":"Port A","Transport":"CliProxyApi","ProviderId":"cmm-port-a","BaseUrl":"http://127.0.0.1:8404/v1","LocalPort":8404},{"Id":"port-b","DisplayName":"Port B","Transport":"CliProxyApi","ProviderId":"cmm-port-b","BaseUrl":"http://127.0.0.1:8404/v1","LocalPort":8404}],"Active":{"PoolId":"port-a","Model":"gpt-5.6-sol"}}""");
-        Console.WriteLine("CATALOG_STARTUP_ISOLATION_OK cases=8 writes=0 network_calls=0 model_calls=0");
+        await AssertCatalogCaseInsensitiveJsonAsync(isolationRoot);
+        Console.WriteLine("CATALOG_STARTUP_ISOLATION_OK cases=9 case_insensitive=1 writes=0 network_calls=0 model_calls=0");
     }
     finally
     {
@@ -638,6 +650,52 @@ static async Task RunUnitTestsAsync()
         Ensure(Directory.GetFiles(secretDirectory, "secrets.corrupt-*.json").Length == 1,
             "损坏密钥没有保留副本。");
 
+        var apiErrorClient = new HttpClient(new ScriptedHttpHandler((_, _) => Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent("""{"error":{"message":"端口被占用，请更换端口"}}""", Encoding.UTF8, "application/json")
+            })))
+        {
+            BaseAddress = new Uri("http://127.0.0.1:10100")
+        };
+        string? apiErrorMessage = null;
+        try
+        {
+            await new OpenCodexClient(apiErrorClient).SetCodexAutoSwitchThresholdAsync(50);
+        }
+        catch (InvalidOperationException ex)
+        {
+            apiErrorMessage = ex.Message;
+        }
+        Ensure(apiErrorMessage == "端口被占用，请更换端口",
+            "结构化 API 错误没有提取 message，仍向用户显示整段 JSON。");
+
+        var nativeHistoryRoot = Path.Combine(root, "native-history-source");
+        Directory.CreateDirectory(nativeHistoryRoot);
+        var nativeHistoryPath = Path.Combine(nativeHistoryRoot, "request-log.jsonl");
+        await File.WriteAllTextAsync(nativeHistoryPath,
+            """{"id":"history-1","startedAt":"2026-08-13T08:00:00Z","elapsedMs":12,"path":"/v1/responses","requestedModel":"openai/gpt-5.6-sol","model":"gpt-5.6-sol","provider":"openai","status":"completed","httpStatus":200,"promptTokens":11,"completionTokens":7,"totalTokens":18,"error":null}""" + Environment.NewLine);
+        var nativeHistoryHttp = new HttpClient(new ScriptedHttpHandler((_, _) => Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("[]", Encoding.UTF8, "application/json")
+            })))
+        {
+            BaseAddress = new Uri("http://127.0.0.1:10100")
+        };
+        var nativeHistoryClient = new OpenCodexClient(nativeHistoryHttp, nativeHistoryRoot);
+        var nativeHistoryTimeline = await nativeHistoryClient.GetUsageTimelineAsync();
+        var nativeHistoryUsage = await nativeHistoryClient.GetNativeAccountUsageAsync(
+            [new CodexAccountView { Id = "__main__", IsMain = true, Plan = "pro" }]);
+        var nativeHistoryAudit = await nativeHistoryClient.GetNativeRoutingAuditAsync(
+            [new CodexAccountView { Id = "__main__", IsMain = true, Plan = "pro" }],
+            DateTimeOffset.Parse("2026-08-13T07:00:00Z"));
+        Ensure(nativeHistoryTimeline.LogCount == 1
+               && nativeHistoryTimeline.TotalTokens == 18
+               && nativeHistoryUsage["pro"].TotalTokens == 18
+               && nativeHistoryAudit.NativeSuccessCount == 1,
+            $"历史时间线、账号用量或路由审计仍未读取总管家 request-log.jsonl：path={nativeHistoryTimeline.SourcePath} available={nativeHistoryTimeline.SourceAvailable} message={nativeHistoryTimeline.Message} timeline={nativeHistoryTimeline.LogCount}/{nativeHistoryTimeline.TotalTokens} account={nativeHistoryUsage["pro"].TotalTokens}/{nativeHistoryUsage["pro"].Available} audit={nativeHistoryAudit.NativeSuccessCount}/{nativeHistoryAudit.Message}。");
+
         var isolatedSecretDirectory = Path.Combine(root, "isolated-secrets");
         var isolatedSecrets = new SecretStore(isolatedSecretDirectory);
         isolatedSecrets.Save("provider-one", "provider-secret");
@@ -846,6 +904,14 @@ static async Task RunUnitTestsAsync()
             """{"SchemaVersion":2,"Pools":[],"Active":null}""");
         await AssertCatalogStartupIsolationAsync(
             root,
+            "null-active-pool-id",
+            """{"SchemaVersion":4,"Pools":[{"Id":"official-pro","DisplayName":"Official","Transport":"OfficialCodex"}],"Active":{"PoolId":null,"Model":"gpt-5.6-sol"}}""");
+        await AssertCatalogStartupIsolationAsync(
+            root,
+            "null-pool-id",
+            """{"SchemaVersion":4,"Pools":[{"Id":null,"DisplayName":"Broken","Transport":"OfficialCodex"}],"Active":{"PoolId":"official-pro","Model":"gpt-5.6-sol"}}""");
+        await AssertCatalogStartupIsolationAsync(
+            root,
             "duplicate-pool-ids",
             """{"SchemaVersion":2,"Pools":[{"Id":"duplicate","DisplayName":"One","Transport":"OfficialCodex"},{"Id":"DUPLICATE","DisplayName":"Two","Transport":"NativeCodexAccount"}],"Active":{"PoolId":"duplicate","Model":"gpt-5.6-sol"}}""");
         var dynamicGateway = new UnifiedGatewayService(
@@ -985,6 +1051,8 @@ static async Task RunUnitTestsAsync()
         {
             await cliProxy.StopOwnedAsync(cliPool.Id);
         }
+
+        await AssertCliProxyOwnedInstanceReconciliationAsync(root);
 
         var codexPath = Path.Combine(root, ".codex", "config.toml");
         var backupDirectory = Path.Combine(root, "backups");
@@ -2483,7 +2551,7 @@ static async Task RunUnitTestsAsync()
         Console.WriteLine("UNIT_PHASE account_usage_hardening");
         await AssertAccountUsageLedgerHardeningAsync();
 
-        Console.WriteLine("UNIT_TESTS_OK settings_corruption secrets_corruption secret_process_isolation secret_namespace_guard pool_defaults native_account_sync official_pool_guard pool_unique_identity catalog_startup_isolation reserved_cli_port_migration malformed_cli_source_isolation cli_endpoint_identity_guard dynamic_subagent_source_discovery subagent_source_manual_authorization subagent_source_identity_revocation gateway_route_identity_guard cli_account_identity_guard gateway_last_hop_pool_guard future_schema_guard legacy_external_api_fail_closed legacy_mcp_fail_closed_guard duplicate_role_guard usage_format quota_windows cliproxy_binary_hash cliproxy_loopback_management cliproxy_same_pool_gate codex_snapshot subagent_safe_apply subagent_mcp_apply subagent_mcp_idempotent subagent_mcp_remove subagent_baseline_guard subagent_user_agent_validation subagent_agent_ownership subagent_mcp_ownership subagent_mcp_inline_guard subagent_corrupt_draft_guard subagent_custom_guard subagent_agents_disabled_guard subagent_malformed_toml_guard subagent_invalid_utf8_guard subagent_codex_validator_candidate subagent_codex_validator_reject_guard subagent_codex_validator_unavailable_guard external_worker_route_lock external_worker_source_grant_guard external_worker_role_enum external_worker_cross_process_gate external_worker_cancel external_worker_audit_redaction external_worker_audit_fail_closed external_worker_audit_cross_process external_worker_runtime_state external_worker_mcp_protocol external_worker_model_injection_guard probe_fallback url_guard server_health_single_ssh server_health_config_hash_required server_health_us_proxyjump public_endpoint_retry resource_hash_current dynamic_account_single dynamic_account_states dynamic_account_unique dynamic_account_empty dynamic_account_invalid resource_hash_lock dream_skin_catalog dream_skin_official_restore dream_skin_path_guard dream_skin_hash_lock runtime_truth_missing runtime_truth_stale runtime_truth_failover runtime_truth_all_failed runtime_truth_answering runtime_truth_account_identity runtime_truth_preference_identity runtime_truth_pre_switch runtime_truth_route_evidence runtime_truth_log_order runtime_truth_explicit_selection runtime_truth_unattributed_attempts runtime_truth_failure_classification runtime_truth_redaction runtime_truth_event_isolation runtime_truth_wait_cancel runtime_truth_read_cancel runtime_truth_concurrency account_identity_acl_reload_guard account_usage_attempt_idempotency account_usage_multi_attempt account_usage_unattributed account_usage_outcomes account_usage_token_truth account_usage_source_recovery account_usage_bad_line account_usage_concurrency account_usage_payload_collision account_quota_separation account_quota_provenance account_quota_stale account_usage_redaction account_usage_runtime_ingestion");
+        Console.WriteLine("UNIT_TESTS_OK settings_corruption secrets_corruption secret_process_isolation secret_namespace_guard pool_defaults native_account_sync official_pool_guard pool_unique_identity catalog_startup_isolation reserved_cli_port_migration malformed_cli_source_isolation cli_endpoint_identity_guard dynamic_subagent_source_discovery subagent_source_manual_authorization subagent_source_identity_revocation gateway_route_identity_guard cli_account_identity_guard gateway_last_hop_pool_guard future_schema_guard legacy_external_api_fail_closed legacy_mcp_fail_closed_guard duplicate_role_guard usage_format quota_windows cliproxy_binary_hash cliproxy_loopback_management cliproxy_same_pool_gate cliproxy_owned_instance_reconciliation codex_snapshot subagent_safe_apply subagent_mcp_apply subagent_mcp_idempotent subagent_mcp_remove subagent_baseline_guard subagent_user_agent_validation subagent_agent_ownership subagent_mcp_ownership subagent_mcp_inline_guard subagent_corrupt_draft_guard subagent_custom_guard subagent_agents_disabled_guard subagent_malformed_toml_guard subagent_invalid_utf8_guard subagent_codex_validator_candidate subagent_codex_validator_reject_guard subagent_codex_validator_unavailable_guard external_worker_route_lock external_worker_source_grant_guard external_worker_role_enum external_worker_cross_process_gate external_worker_cancel external_worker_audit_redaction external_worker_audit_fail_closed external_worker_audit_cross_process external_worker_runtime_state external_worker_mcp_protocol external_worker_model_injection_guard probe_fallback url_guard server_health_single_ssh server_health_config_hash_required server_health_us_proxyjump public_endpoint_retry resource_hash_current dynamic_account_single dynamic_account_states dynamic_account_unique dynamic_account_empty dynamic_account_invalid resource_hash_lock dream_skin_catalog dream_skin_official_restore dream_skin_path_guard dream_skin_hash_lock runtime_truth_missing runtime_truth_stale runtime_truth_failover runtime_truth_all_failed runtime_truth_answering runtime_truth_account_identity runtime_truth_preference_identity runtime_truth_pre_switch runtime_truth_route_evidence runtime_truth_log_order runtime_truth_explicit_selection runtime_truth_unattributed_attempts runtime_truth_failure_classification runtime_truth_redaction runtime_truth_event_isolation runtime_truth_wait_cancel runtime_truth_read_cancel runtime_truth_concurrency account_identity_acl_reload_guard account_usage_attempt_idempotency account_usage_multi_attempt account_usage_unattributed account_usage_outcomes account_usage_token_truth account_usage_source_recovery account_usage_bad_line account_usage_concurrency account_usage_payload_collision account_quota_separation account_quota_provenance account_quota_stale account_usage_redaction account_usage_runtime_ingestion");
     }
     finally
     {
@@ -3264,6 +3332,68 @@ static async Task AssertAccountUsageLedgerAsync()
                && noRequestSnapshot.StoredAttemptCount == 1 && noRequestSnapshot.AnomalyCount >= 1,
             "无 requestId 的完整语义行发生双计，或 primary cursor 删除后未从独立 generation marker 恢复。");
 
+        var sourceUpgradeRoot = Path.Combine(root, "source-contract-upgrade");
+        Directory.CreateDirectory(sourceUpgradeRoot);
+        var upgradedRequestLog = Path.Combine(sourceUpgradeRoot, "request-log.jsonl");
+        const string alreadyPresentNativeLine = """{"requestId":"native-before-upgrade","requestedModel":"openai/gpt","provider":"openai","model":"gpt","status":200,"timestamp":"2026-08-01T06:22:00Z","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}""";
+        const string appendedAfterUpgradeLine = """{"requestId":"native-after-upgrade","requestedModel":"openai/gpt","provider":"openai","model":"gpt","status":200,"timestamp":"2026-08-01T06:23:00Z","usage":{"inputTokens":3,"outputTokens":2,"totalTokens":5}}""";
+        await File.WriteAllTextAsync(upgradedRequestLog, alreadyPresentNativeLine + "\n", new UTF8Encoding(false));
+        using var sourceUpgradeLedger = new AccountUsageLedgerService(
+            sourceUpgradeRoot, upgradedRequestLog, () => now);
+        var preUpgradeExecution = OpenCodexClient.ParseLatestRouteExecution(
+                                      "[" + alreadyPresentNativeLine.Replace("native-before-upgrade", "old-ledger-request", StringComparison.Ordinal) + "]")
+                                  ?? throw new InvalidOperationException("旧账本升级种子无法解析。 ");
+        await sourceUpgradeLedger.IngestExecutionsAsync(new[] { preUpgradeExecution });
+        var legacyGeneration = new string('A', 64);
+        var legacyPrefix = new string('B', 64);
+        var legacyCursor = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 4,
+            offset = 0,
+            anchorStart = 0,
+            anchorLength = 0,
+            anchorHash = string.Empty,
+            sourceLength = 0,
+            sourceLastWriteUtcTicks = 0,
+            sourceIdentity = "legacy-opencodex-source",
+            generation = legacyGeneration,
+            updatedAt = now,
+            generationMarkerOnly = true
+        });
+        var legacyMarker = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 2,
+            sourceIdentity = "legacy-opencodex-source",
+            sourceLength = 0,
+            observedOffset = 0,
+            generation = legacyGeneration,
+            prefixHash = legacyPrefix,
+            digestBlockBytes = 64 * 1024,
+            contentBlockHashes = Array.Empty<string>(),
+            initializedAt = now
+        });
+        await File.WriteAllTextAsync(sourceUpgradeLedger.CursorPath, legacyCursor, new UTF8Encoding(false));
+        await File.WriteAllTextAsync(sourceUpgradeLedger.CursorRecoveryPath, legacyCursor, new UTF8Encoding(false));
+        await File.WriteAllTextAsync(sourceUpgradeLedger.SourceInitializedPath, legacyMarker, new UTF8Encoding(false));
+
+        var sourceUpgrade = await sourceUpgradeLedger.IngestSourceAsync();
+        var sourceUpgradeSnapshot = await sourceUpgradeLedger.ReadAsync();
+        Ensure(sourceUpgrade.SourceContractMigrated && sourceUpgrade.AppendedCount == 0
+               && !sourceUpgrade.CoverageGapDetected && sourceUpgradeSnapshot.StoredAttemptCount == 1,
+            "旧 usage.jsonl 游标切换到 request-log.jsonl 时重复导入历史请求、丢掉旧账或误报覆盖缺口。 ");
+        await File.AppendAllTextAsync(upgradedRequestLog, appendedAfterUpgradeLine + "\n", new UTF8Encoding(false));
+        var firstNativeAppend = await sourceUpgradeLedger.IngestSourceAsync();
+        var sourceUpgradeRestart = new AccountUsageLedgerService(sourceUpgradeRoot, upgradedRequestLog, () => now.AddMinutes(1));
+        var restartNativeAppend = await sourceUpgradeRestart.IngestSourceAsync();
+        var sourceUpgradeAfterRestart = await sourceUpgradeRestart.ReadAsync();
+        using var upgradedCursorDocument = JsonDocument.Parse(await File.ReadAllTextAsync(sourceUpgradeRestart.CursorPath));
+        Ensure(firstNativeAppend.AppendedCount == 1 && !restartNativeAppend.SourceContractMigrated
+               && restartNativeAppend.AppendedCount == 0 && sourceUpgradeAfterRestart.StoredAttemptCount == 2
+               && upgradedCursorDocument.RootElement.GetProperty("schemaVersion").GetInt32() == 5
+               && upgradedCursorDocument.RootElement.GetProperty("sourceContract").GetString()
+                  == "codex-total-manager:request-log.jsonl:v1",
+            "新 request-log 基线后的追加请求没有恰好归账一次，或升级游标未绑定新来源契约。 ");
+
         var sourceRoot = Path.Combine(root, "source-recovery");
         Directory.CreateDirectory(sourceRoot);
         var sourcePath = Path.Combine(sourceRoot, "usage.jsonl");
@@ -3310,9 +3440,9 @@ static async Task AssertAccountUsageLedgerAsync()
         var recovered = await restartedSourceLedger.ReadAsync();
         var recoveredAfterRestart = await new AccountUsageLedgerService(sourceRoot, sourcePath, () => now).ReadAsync();
         Ensure(recovered.StoredAttemptCount == 5
-               && recovered.BadAttemptLineCount >= 1
+               && recovered.BadAttemptLineCount == 0
                && recoveredAfterRestart.StoredAttemptCount == 5,
-            "台账中途半行后没有隔离坏行、续写完整事件并在重启后恢复。");
+            "台账断尾没有一次性截断修复、续写完整事件并在重启后恢复，或把已修复断尾永久记成坏行。");
 
         var concurrentRoot = Path.Combine(root, "concurrent");
         var concurrentA = new AccountUsageLedgerService(concurrentRoot, Path.Combine(root, "none-a"), () => now);
@@ -3567,10 +3697,16 @@ static async Task AssertAccountUsageLedgerHardeningAsync()
                 "relay", observationScope: "pool:c")
         });
         var recoveredQuota = await scopeLedger.ReadAsync();
-        Ensure(invalidSnapshot.QuotaIntegrityFailureCount > 0 && invalidSnapshot.TokenIntegrityFailureCount == 0
+        Ensure(invalidSnapshot.QuotaIntegrityFailureCount == 0 && invalidSnapshot.TokenIntegrityFailureCount == 0
                && recoveredQuota.LatestQuotaSnapshots.Any(view => view.Fact.ObservationScope == "pool:c" && view.Fact.Value == 40)
-               && recoveredQuota.QuotaIntegrityFailureCount > 0,
-            "无效 quota 值未使额度域降级，污染了 Token 域，或后续正常值覆盖了历史审计异常。 ");
+               && recoveredQuota.QuotaIntegrityFailureCount == 0,
+            "percent_used 超过 100 被误当作完整性损坏、污染了 Token 域，或后续正常值未更新展示。 ");
+        var overageWindow = new UsageWindowView { PeriodKey = "weekly", Label = "Weekly", UsedPercent = 150 };
+        Ensure(overageWindow.ValueValidation == QuotaValueValidationState.Valid
+               && overageWindow.VisualUsedPercent == 100
+               && overageWindow.RemainingPercent == 0
+               && overageWindow.SummaryText.Contains("已超用 50%", StringComparison.Ordinal),
+            "供应商返回超过 100% 的真实超用值仍被界面当作损坏数据。 ");
 
         var rotationRoot = Path.Combine(root, "archive-tail");
         Directory.CreateDirectory(rotationRoot);
@@ -4481,13 +4617,14 @@ static async Task AssertAccountUsageLedgerHardeningAsync()
             new UTF8Encoding(false));
         var ambiguousStickyLedger = new AccountUsageLedgerService(ambiguousStickyRoot, ambiguousStickySource, () => now);
         var ambiguousImport = await ambiguousStickyLedger.IngestSourceAsync();
-        Ensure(ambiguousImport.DuplicateCount == 1 && File.Exists(ambiguousStickyLedger.SourceIntegrityStatePath),
-            "Ambiguous duplicate did not create independent sticky integrity evidence.");
-        File.Delete(ambiguousStickyLedger.AnomalyPath);
+        Ensure(ambiguousImport.DuplicateCount == 1
+               && !File.Exists(ambiguousStickyLedger.SourceIntegrityStatePath),
+            "A normal replay without requestId incorrectly created sticky integrity damage.");
+        if (File.Exists(ambiguousStickyLedger.AnomalyPath)) File.Delete(ambiguousStickyLedger.AnomalyPath);
         var ambiguousAfterLoss = await new AccountUsageLedgerService(
             ambiguousStickyRoot, ambiguousStickySource, () => now.AddMinutes(1)).ReadAsync();
-        Ensure(ambiguousAfterLoss.TokenIntegrityFailureCount > 0 && ambiguousAfterLoss.TokenSourceStale,
-            "An anomaly-only ambiguous duplicate was washed healthy after anomaly JSONL deletion/restart.");
+        Ensure(ambiguousAfterLoss.TokenIntegrityFailureCount == 0 && !ambiguousAfterLoss.TokenSourceStale,
+            "A normal replay without requestId remained permanently degraded after restart.");
 
         var quotaOnlyImporterStatus = new AccountUsageImporterStatus(
             AccountUsageImporterHealth.Degraded, now, "QuotaIntegrity", "Available", null)
@@ -4541,19 +4678,16 @@ static async Task AssertAccountUsageLedgerHardeningAsync()
         shutdownImporter.Start();
         await Task.Delay(80);
         var noSecondLoop = shutdownImporter.RefreshCount == refreshAtTimeout;
-        var secondStop = await shutdownImporter.StopAsync(TimeSpan.FromMilliseconds(100));
         releaseReadPools.TrySetResult();
-        var completedStop = await shutdownImporter.StopAsync(TimeSpan.FromSeconds(2));
-        shutdownImporter.Start();
         var restartDeadline = Stopwatch.StartNew();
-        while (shutdownImporter.RefreshCount == refreshAtTimeout && restartDeadline.Elapsed < TimeSpan.FromSeconds(2))
+        while (shutdownImporter.RefreshCount < refreshAtTimeout + 2 && restartDeadline.Elapsed < TimeSpan.FromSeconds(2))
             await Task.Delay(20);
-        var restartedAfterDurableStop = shutdownImporter.RefreshCount > refreshAtTimeout;
+        var restartedAfterTimedOutStop = shutdownImporter.RefreshCount >= refreshAtTimeout + 2;
         var finalStop = await shutdownImporter.StopAsync(TimeSpan.FromSeconds(2));
         await shutdownImporter.DisposeAsync();
-        Ensure(!firstStop && !secondStop && noSecondLoop && completedStop && restartedAfterDurableStop && finalStop
+        Ensure(!firstStop && noSecondLoop && restartedAfterTimedOutStop && finalStop
                && shutdownTimer.Elapsed < TimeSpan.FromSeconds(1),
-            $"Importer shutdown/restart boundary failed: first={firstStop}, second={secondStop}, noSecondLoop={noSecondLoop}, completed={completedStop}, restarted={restartedAfterDurableStop}, final={finalStop}, elapsedMs={shutdownTimer.ElapsedMilliseconds}.");
+            $"Importer shutdown/restart boundary failed: first={firstStop}, noSecondLoop={noSecondLoop}, autoRestarted={restartedAfterTimedOutStop}, final={finalStop}, elapsedMs={shutdownTimer.ElapsedMilliseconds}.");
 
         Console.WriteLine("LEDGER_PHASE snapshot_revision_cas");
         var revisionRoot = Path.Combine(root, "snapshot-revision-cas");
@@ -5060,6 +5194,171 @@ static RuntimeRouteExecution LedgerPerformanceExecution(int index)
         }, null, request);
 }
 
+static async Task AssertLedgerRecoveryRegressionsAsync()
+{
+    var root = CreateOwnedTestRoot("cmm-ledger-recovery");
+    var now = DateTimeOffset.Parse("2026-08-01T08:00:00Z");
+    try
+    {
+        var projectionRoot = Path.Combine(root, "projection-retry");
+        using (var seed = new AccountUsageLedgerService(projectionRoot, Path.Combine(projectionRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            await seed.IngestExecutionsAsync(new[] { LedgerPerformanceExecution(1), LedgerPerformanceExecution(2) });
+            if (File.Exists(seed.ProjectionCheckpointPath)) File.Delete(seed.ProjectionCheckpointPath);
+        }
+        using (var retry = new AccountUsageLedgerService(projectionRoot, Path.Combine(projectionRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            var barrier = typeof(AccountUsageLedgerService).GetProperty(
+                              "ProjectionRowAcceptedBarrierForTests",
+                              System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                          ?? throw new InvalidOperationException("Projection row test barrier was not found.");
+            var interrupted = false;
+            barrier.SetValue(retry, (Action)(() =>
+            {
+                if (interrupted) return;
+                interrupted = true;
+                throw new OperationCanceledException("simulated projection interruption");
+            }));
+            try { _ = await retry.ReadAsync(); }
+            catch (OperationCanceledException) { }
+            Ensure(interrupted, "Projection interruption hook was not reached.");
+            barrier.SetValue(retry, null);
+            var recovered = await retry.ReadAsync();
+            Ensure(recovered.StoredAttemptCount == 2
+                   && recovered.Accounts.Single().RequestCount == 2
+                   && recovered.TokenIntegrityFailureCount == 0,
+                "Interrupted attempt projection was counted twice or did not rebuild cleanly.");
+        }
+
+        var validTailRoot = Path.Combine(root, "valid-tail-no-newline");
+        string validTailPath;
+        using (var seed = new AccountUsageLedgerService(validTailRoot, Path.Combine(validTailRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            await seed.IngestExecutionsAsync(new[] { LedgerPerformanceExecution(10) });
+            validTailPath = seed.AttemptLedgerPath;
+        }
+        var validTailBytes = await File.ReadAllBytesAsync(validTailPath);
+        Ensure(validTailBytes.Length > 0 && validTailBytes[^1] == (byte)'\n', "Seed ledger did not end in a newline.");
+        await File.WriteAllBytesAsync(validTailPath, validTailBytes[..^1]);
+        using (var repaired = new AccountUsageLedgerService(validTailRoot, Path.Combine(validTailRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            var snapshot = await repaired.ReadAsync();
+            var repairedBytes = await File.ReadAllBytesAsync(validTailPath);
+            Ensure(snapshot.StoredAttemptCount == 1 && repairedBytes[^1] == (byte)'\n',
+                "A complete JSON tail without a newline was discarded instead of repaired.");
+        }
+
+        var truncatedTailRoot = Path.Combine(root, "truncated-tail");
+        string truncatedTailPath;
+        long completeLength;
+        using (var seed = new AccountUsageLedgerService(truncatedTailRoot, Path.Combine(truncatedTailRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            await seed.IngestExecutionsAsync(new[] { LedgerPerformanceExecution(20) });
+            truncatedTailPath = seed.AttemptLedgerPath;
+            completeLength = new FileInfo(truncatedTailPath).Length;
+        }
+        await File.AppendAllTextAsync(truncatedTailPath, "{\"schemaVersion\":4", new UTF8Encoding(false));
+        using (var repaired = new AccountUsageLedgerService(truncatedTailRoot, Path.Combine(truncatedTailRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            var snapshot = await repaired.ReadAsync();
+            Ensure(snapshot.StoredAttemptCount == 1
+                   && new FileInfo(truncatedTailPath).Length == completeLength,
+                "A half-written JSONL tail was not truncated back to the last durable row.");
+        }
+
+        var reorderRoot = Path.Combine(root, "direct-reorder");
+        using (var ledger = new AccountUsageLedgerService(reorderRoot, Path.Combine(reorderRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            var first = LedgerPerformanceExecution(31);
+            var second = LedgerPerformanceExecution(32);
+            var initial = await ledger.IngestExecutionsAsync(new[] { first, second }, "stable-import-batch");
+            var replay = await ledger.IngestExecutionsAsync(new[] { second, first }, "stable-import-batch");
+            var snapshot = await ledger.ReadAsync();
+            Ensure(initial.AppendedCount == 2 && replay.AppendedCount == 0 && replay.DuplicateCount == 2
+                   && snapshot.StoredAttemptCount == 2,
+                "Reordering a stable direct import batch created new billable facts.");
+        }
+
+        var quotaRecoveryRoot = Path.Combine(root, "quota-read-recovery");
+        string quotaCommitPath;
+        using (var seed = new AccountUsageLedgerService(quotaRecoveryRoot, Path.Combine(quotaRecoveryRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            var batch = seed.CreateQuotaObservationBatch("provider-recovery", "account-recovery", now, true,
+                "fetch-recovery", "pool:recovery");
+            await seed.IngestQuotaSnapshotsAsync(new[]
+            {
+                seed.CreateQuotaSnapshot("provider-recovery", true, "account-recovery", "five_hour", "5h", 23,
+                    "percent_used", AccountQuotaAvailability.Provided, now, true, now, false, batch, false,
+                    null, "test", observationScope: "pool:recovery"),
+                seed.CreateQuotaSnapshot("provider-recovery", true, "account-recovery", "weekly", "Weekly", 41,
+                    "percent_used", AccountQuotaAvailability.Provided, now, true, now, false, batch, false,
+                    null, "test", observationScope: "pool:recovery")
+            });
+            quotaCommitPath = seed.QuotaCommitLedgerPath;
+        }
+        File.Delete(quotaCommitPath);
+        using (var recovered = new AccountUsageLedgerService(quotaRecoveryRoot, Path.Combine(quotaRecoveryRoot, "disabled"),
+                   () => now.AddMinutes(1), sourceDisabled: true))
+        {
+            var snapshot = await recovered.ReadAsync();
+            Ensure(File.Exists(quotaCommitPath)
+                   && snapshot.LatestQuotaSnapshots.Count(view => view.Fact.ObservationScope == "pool:recovery") == 2
+                   && snapshot.QuotaIntegrityFailureCount == 0,
+                "A complete prepare+facts quota batch without commit was not recovered during read-only startup.");
+        }
+
+        var quotaAtomicRoot = Path.Combine(root, "quota-atomic-rebuild");
+        using (var seed = new AccountUsageLedgerService(quotaAtomicRoot, Path.Combine(quotaAtomicRoot, "disabled"),
+                   () => now, sourceDisabled: true))
+        {
+            var batch = seed.CreateQuotaObservationBatch("provider-atomic", "account-atomic", now, true,
+                "fetch-atomic", "pool:atomic");
+            await seed.IngestQuotaSnapshotsAsync(new[]
+            {
+                seed.CreateQuotaSnapshot("provider-atomic", true, "account-atomic", "weekly", "Weekly", 125,
+                    "percent_used", AccountQuotaAvailability.Provided, now, true, now, false, batch, false,
+                    null, "test", observationScope: "pool:atomic")
+            });
+            if (File.Exists(seed.ProjectionCheckpointPath)) File.Delete(seed.ProjectionCheckpointPath);
+        }
+        using (var retry = new AccountUsageLedgerService(quotaAtomicRoot, Path.Combine(quotaAtomicRoot, "disabled"),
+                   () => now.AddMinutes(1), sourceDisabled: true))
+        {
+            var barrier = typeof(AccountUsageLedgerService).GetProperty(
+                              "ProjectionRowAcceptedBarrierForTests",
+                              System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                          ?? throw new InvalidOperationException("Projection row test barrier was not found.");
+            var interrupted = false;
+            barrier.SetValue(retry, (Action)(() =>
+            {
+                if (interrupted) return;
+                interrupted = true;
+                throw new IOException("simulated quota projection failure");
+            }));
+            try { _ = await retry.ReadAsync(); }
+            catch (IOException) { }
+            Ensure(interrupted, "Quota projection interruption hook was not reached.");
+            barrier.SetValue(retry, null);
+            var snapshot = await retry.ReadAsync();
+            Ensure(snapshot.LatestQuotaSnapshots.Count(view => view.Fact.ObservationScope == "pool:atomic") == 1
+                   && snapshot.QuotaIntegrityFailureCount == 0,
+                "A failed quota stage left mixed facts/prepare/commit projection state after retry.");
+        }
+    }
+    finally
+    {
+        DeleteOwnedTestRoot(root);
+    }
+}
+
 static (IReadOnlyList<PoolAccountView> Accounts, AccountRosterCompleteness Completeness) ParsePrivateRoster(
     Type serviceType,
     PoolDefinition pool,
@@ -5437,6 +5736,21 @@ static async Task AssertCatalogStartupIsolationAsync(
         $"Catalog startup isolation failed for {caseName}.");
 }
 
+static async Task AssertCatalogCaseInsensitiveJsonAsync(string root)
+{
+    var directory = Path.Combine(root, "catalog-case-insensitive");
+    Directory.CreateDirectory(directory);
+    var path = Path.Combine(directory, "pools.json");
+    await File.WriteAllTextAsync(path,
+        """{"schemaVersion":4,"pools":[{"id":"official-pro","displayName":"官方保底","description":"测试","transport":"OfficialCodex","product":"CodexPro","isProtected":true,"enabled":true,"defaultModel":"gpt-5.6-sol","baseUrl":"OpenAI 原生账号"},{"id":"plus-api-1","displayName":"Plus","description":"未绑定","transport":"NativeCodexAccount","product":"CodexPlus","enabled":false,"defaultModel":"gpt-5.6-sol","baseUrl":"OpenAI 原生账号"},{"id":"plus-agent-api-1","displayName":"Plus Agent","description":"测试","transport":"CliProxyApi","product":"CodexPlus","enabled":true,"routeAlias":"cmm/agent-plus-1","providerId":"cmm-plus-agent-api-1","defaultModel":"gpt-5.6-sol","baseUrl":"http://127.0.0.1:8411/v1","localPort":8411},{"id":"pro-agent-api-1","displayName":"Pro Agent","description":"测试","transport":"CliProxyApi","product":"CodexPro","enabled":true,"routeAlias":"cmm/agent-pro-1","providerId":"cmm-pro-agent-api-1","defaultModel":"gpt-5.6-sol","baseUrl":"http://127.0.0.1:8412/v1","localPort":8412}],"active":{"poolId":"official-pro","model":"gpt-5.6-sol","verification":"official-direct"}}""");
+
+    var catalog = new PoolCatalogService(directory);
+    Ensure(catalog.LoadWarning is null
+           && catalog.GetActive().PoolId == PoolCatalogDefaults.OfficialPoolId
+           && catalog.GetPools().Count == 4,
+        "pools.json 的 camelCase/PascalCase 大小写兼容失败。");
+}
+
 static SubagentApplyPlan CreateCanonicalExternalPlan(
     SubagentConfigurationService service,
     IEnumerable<SubagentRoleSelection> selections)
@@ -5570,6 +5884,103 @@ static async Task RunProbeFallbackAsync()
     {
         listener.Stop();
     }
+}
+
+static async Task AssertCliProxyOwnedInstanceReconciliationAsync(string root)
+{
+    var testRoot = Path.Combine(root, "cliproxy-owned-instance-reconciliation");
+    var settings = new AppSettingsService(testRoot);
+    var catalog = new PoolCatalogService(testRoot, settings.ReservedLocalPorts);
+    var secrets = new SecretStore(testRoot);
+    var binary = RequireCliProxyTestArtifact();
+
+    // Trusted old instance: after its catalog port changes, reconciliation must
+    // stop exactly the recorded PID and remove the matching historical record.
+    var trustedPool = catalog.AddCliProxyPool(AccountProduct.CodexPlus);
+    var trustedService = new CliProxyPoolService(settings, secrets, binaryPath: binary, poolCatalog: catalog);
+    Ensure(await trustedService.EnsureRunningAsync(trustedPool),
+        "CLIProxy 可信旧实例没有启动，无法验证端口变更回收。 ");
+    var trustedRecordPath = Path.Combine(testRoot, "cli-proxy", "pools", trustedPool.Id, "instance.json");
+    using var trustedRecord = JsonDocument.Parse(await File.ReadAllTextAsync(trustedRecordPath));
+    var trustedPid = trustedRecord.RootElement.GetProperty("Pid").GetInt32();
+    var oldPort = trustedPool.LocalPort;
+    catalog.ReassignCliPort(trustedPool);
+    Ensure(trustedPool.LocalPort != oldPort, "CLIProxy 端口变更测试没有获得新端口。 ");
+    await trustedService.ReconcileOwnedInstancesAsync(force: true);
+    Ensure(await WaitForProcessExitAsync(trustedPid, TimeSpan.FromSeconds(5))
+           && !File.Exists(trustedRecordPath),
+        "端口变化后，证据完整的旧 CLIProxy 实例没有被精确回收。 ");
+
+    // Deleted pool: a trusted historical instance no longer present in the
+    // catalog is also owned and should be reclaimed.
+    var deletedPool = catalog.AddCliProxyPool(AccountProduct.CodexPro);
+    var deletedService = new CliProxyPoolService(settings, secrets, binaryPath: binary, poolCatalog: catalog);
+    Ensure(await deletedService.EnsureRunningAsync(deletedPool),
+        "CLIProxy 待删除号池实例没有启动。 ");
+    var deletedRecordPath = Path.Combine(testRoot, "cli-proxy", "pools", deletedPool.Id, "instance.json");
+    using var deletedRecord = JsonDocument.Parse(await File.ReadAllTextAsync(deletedRecordPath));
+    var deletedPid = deletedRecord.RootElement.GetProperty("Pid").GetInt32();
+    catalog.RemoveCliProxyPool(deletedPool.Id);
+    await deletedService.ReconcileOwnedInstancesAsync(force: true);
+    Ensure(await WaitForProcessExitAsync(deletedPid, TimeSpan.FromSeconds(5)),
+        "号池从清单删除后，证据完整的旧 CLIProxy 实例没有被回收。 ");
+
+    // Forged record: even with a live trusted binary and listening port, one
+    // mismatched field must make reconciliation fail closed and leave it alone.
+    var forgedPool = catalog.AddCliProxyPool(AccountProduct.CodexPlus);
+    var forgedService = new CliProxyPoolService(settings, secrets, binaryPath: binary, poolCatalog: catalog);
+    Ensure(await forgedService.EnsureRunningAsync(forgedPool),
+        "CLIProxy 伪造记录保护测试实例没有启动。 ");
+    var forgedRecordPath = Path.Combine(testRoot, "cli-proxy", "pools", forgedPool.Id, "instance.json");
+    var forgedNode = JsonNode.Parse(await File.ReadAllTextAsync(forgedRecordPath))!.AsObject();
+    var forgedPid = forgedNode["Pid"]!.GetValue<int>();
+    var forgedRecordPaths = Directory.GetFiles(
+        Path.Combine(testRoot, "cli-proxy", "pools", forgedPool.Id),
+        "*.json",
+        SearchOption.AllDirectories);
+    foreach (var recordPath in forgedRecordPaths)
+    {
+        var recordNode = JsonNode.Parse(await File.ReadAllTextAsync(recordPath))!.AsObject();
+        recordNode["BinaryPath"] = Path.Combine(testRoot, "not-the-running-binary.exe");
+        await File.WriteAllTextAsync(
+            recordPath,
+            recordNode.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+    }
+    catalog.ReassignCliPort(forgedPool);
+    await forgedService.ReconcileOwnedInstancesAsync(force: true);
+    Ensure(IsProcessRunning(forgedPid),
+        "二进制路径不匹配的伪造记录导致总管家误杀了进程。 ");
+
+    // The test created this exact process through this live service instance,
+    // so the normal in-memory owned-stop path can clean it without trusting the
+    // deliberately forged disk records.
+    await forgedService.StopOwnedAsync(forgedPool.Id);
+    Ensure(await WaitForProcessExitAsync(forgedPid, TimeSpan.FromSeconds(5)),
+        "CLIProxy 伪造记录保护测试的自有进程没有完成清理。 ");
+}
+
+static bool IsProcessRunning(int pid)
+{
+    try
+    {
+        using var process = Process.GetProcessById(pid);
+        return !process.HasExited;
+    }
+    catch (ArgumentException)
+    {
+        return false;
+    }
+}
+
+static async Task<bool> WaitForProcessExitAsync(int pid, TimeSpan timeout)
+{
+    var deadline = DateTimeOffset.UtcNow + timeout;
+    while (DateTimeOffset.UtcNow < deadline)
+    {
+        if (!IsProcessRunning(pid)) return true;
+        await Task.Delay(50);
+    }
+    return !IsProcessRunning(pid);
 }
 
 static string RequireCliProxyTestArtifact()

@@ -377,6 +377,7 @@ public sealed record AccountUsageIngestResult(
 {
     public AccountUsageSourceAvailability SourceAvailability { get; init; } = AccountUsageSourceAvailability.Available;
     public bool CoverageGapDetected { get; init; }
+    public bool SourceContractMigrated { get; init; }
 }
 
 public sealed record AccountQuotaIngestResult(

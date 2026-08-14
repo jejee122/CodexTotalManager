@@ -64,8 +64,19 @@ public partial class MainWindow
         UpdateServerFreshnessClock();
     }
 
-    private async void ServerTimer_Tick(object? sender, EventArgs e) =>
-        await RefreshServerTelemetryAsync(showBusy: false);
+    private async void ServerTimer_Tick(object? sender, EventArgs e)
+    {
+        try
+        {
+            await RefreshServerTelemetryAsync(showBusy: false);
+        }
+        catch (Exception ex)
+        {
+            _serverRefreshRunning = false;
+            ServerResultText.Text = $"自动刷新没有完成：{FriendlyError(ex)}";
+            _nextServerSample = DateTimeOffset.Now + (_serverTimer?.Interval ?? TimeSpan.FromSeconds(60));
+        }
+    }
 
     private void ServerClockTimer_Tick(object? sender, EventArgs e) => UpdateServerFreshnessClock();
 

@@ -8,7 +8,9 @@
 [CmdletBinding()]
 param(
   [string]$BuildProfile = 'Debug',
-  [switch]$MarkDeployable
+  [switch]$MarkDeployable,
+  [string]$ExternalAcceptanceEvidencePath,
+  [string]$PayloadManifestPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,15 +19,27 @@ $evidenceDir = Join-Path $repoRoot 'evidence'
 $runDir = Join-Path $evidenceDir ("run-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 
-# --- git 信息 ---
-$gitResult = git -C $repoRoot rev-parse HEAD 2>$null; $gitHash = if ($gitResult) { $gitResult } else { "no-git" }
+# --- git 信息（无 Git/无仓库也必须生成可读证据，但不得标记可部署） ---
+$gitCommand = Get-Command git -ErrorAction SilentlyContinue
+$gitAvailable = $false
+$gitHash = 'no-git'
+$gitStatus = @()
+$gitClean = $false
+$gitLog = ''
+if ($gitCommand) {
+  $gitResult = & $gitCommand.Source -C $repoRoot rev-parse HEAD 2>$null
+  if ($LASTEXITCODE -eq 0 -and $gitResult) {
+    $gitAvailable = $true
+    $gitHash = [string]$gitResult
+    $gitStatusRaw = @(& $gitCommand.Source -C $repoRoot status --porcelain=v1 --untracked-files=all 2>$null)
+    $gitStatus = @($gitStatusRaw |
+      ForEach-Object { ($_ -replace '^[ MARC?]{1,2}\s+', '').Trim('"') } |
+      Where-Object { $_ -and $_ -notmatch '^(?:out|bin|obj|evidence)(?:[/\\]|$)' })
+    $gitClean = $gitStatus.Count -eq 0
+    $gitLog = (& $gitCommand.Source -C $repoRoot log --oneline -5 2>$null) -join "`n"
+  }
+}
 $gitShort = $gitHash.Substring(0, [Math]::Min(12, $gitHash.Length))
-$gitStatusRaw = @(git -C $repoRoot status --porcelain=v1 --untracked-files=all 2>$null)
-$gitStatus = @($gitStatusRaw |
-  ForEach-Object { ($_ -replace '^[ MARC?]{1,2}\s+', '').Trim('"') } |
-  Where-Object { $_ -and $_ -notmatch '^(?:out|bin|obj|evidence)(?:[/\\]|$)' })
-$gitClean = $gitStatus.Count -eq 0
-$gitLog = (git -C $repoRoot log --oneline -5 2>$null) -join "`n"
 
 # --- SDK 信息（优先 ~/.dotnet 的 SDK 10，避免 PATH 里旧版本）---
 $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
@@ -52,6 +66,7 @@ $buildManifest = [ordered]@{
   schemaVersion = 1
   generatedAt = (Get-Date).ToUniversalTime().ToString('o')
   gitCommit = $gitHash
+  gitAvailable = $gitAvailable
   gitShort = $gitShort
   gitClean = $gitClean
   gitStatus = @($gitStatus)
@@ -87,7 +102,7 @@ $testEvidence = [ordered]@{
 }
 $testEvidence | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $runDir 'test-evidence.json') -Encoding UTF8
 
-# --- 部署决策（强制全流程验证：构建+安全测试+集成测试+工作区干净）---
+# --- 部署决策（自动测试只能晋级候选；DEPLOYABLE 还必须绑定专用测试电脑的真实验收）---
 $buildPassed = $false
 $testsPassed = $false
 $integrationPassed = $false
@@ -112,7 +127,33 @@ $executionEvidence = [ordered]@{
 }
 $executionEvidence | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $runDir 'execution-evidence.json') -Encoding UTF8
 
-$eligible = $MarkDeployable -and $buildPassed -and $testsPassed -and $gitClean
+$externalAcceptance = $null
+$externalAcceptancePassed = $false
+$externalAcceptanceError = $null
+if ($MarkDeployable) {
+  if ([string]::IsNullOrWhiteSpace($ExternalAcceptanceEvidencePath) -or
+      [string]::IsNullOrWhiteSpace($PayloadManifestPath)) {
+    $externalAcceptanceError = '请求 DEPLOYABLE 时必须同时提供真实 Codex 验收证据和被验收的 payload-manifest.json。'
+  } else {
+    try {
+      $validator = Join-Path $repoRoot 'scripts\validate-external-acceptance.ps1'
+      $validationJson = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        -File $validator `
+        -AcceptanceEvidencePath $ExternalAcceptanceEvidencePath `
+        -PayloadManifestPath $PayloadManifestPath `
+        -ProductVersion $productVersion
+      if ($LASTEXITCODE -ne 0) { throw '真实 Codex 验收证据校验失败。' }
+      $externalAcceptance = ($validationJson -join "`n") | ConvertFrom-Json
+      $externalAcceptancePassed = $externalAcceptance.valid -eq $true
+    }
+    catch {
+      $externalAcceptanceError = $_.Exception.Message
+    }
+  }
+}
+
+$eligible = $MarkDeployable -and $buildPassed -and $testsPassed -and $gitAvailable -and $gitClean `
+  -and $externalAcceptancePassed
 # 主集成自检失败时绝不允许 DEPLOYABLE（真实链路未验证）
 if ($eligible -and -not $integrationPassed) { $eligible = $false }
 $decision = if ($eligible) { 'DEPLOYABLE' } else { 'CANDIDATE_ONLY' }
@@ -124,8 +165,12 @@ $reason = if ($eligible) {
   '请求 DEPLOYABLE 但安全测试未全部通过，已强制降级为候选。'
 } elseif ($MarkDeployable -and -not $integrationPassed) {
   '请求 DEPLOYABLE 但主集成自检未通过，已强制降级为候选。'
+} elseif ($MarkDeployable -and -not $gitAvailable) {
+  '请求 DEPLOYABLE 但无法验证 Git 仓库身份，已强制降级为候选。'
 } elseif ($MarkDeployable -and -not $gitClean) {
   '请求 DEPLOYABLE 但工作区有未提交改动，已强制降级为候选。'
+} elseif ($MarkDeployable -and -not $externalAcceptancePassed) {
+  "请求 DEPLOYABLE 但缺少与候选包哈希绑定的专用测试电脑真实验收：$externalAcceptanceError"
 } else {
   '候选源码: 功能完整+安全修复完成, 但缺真实环境端到端验收'
 }
@@ -137,6 +182,10 @@ $deployable = [ordered]@{
   productVersion = $productVersion
   decision = $decision
   reason = $reason
+  externalAcceptance = if ($externalAcceptancePassed) { $externalAcceptance } else { [ordered]@{
+    passed = $false
+    error = $externalAcceptanceError
+  } }
   requiresBeforeProduction = @(
     '真实 Codex 上端到端验证引擎路由/换肤/子代理'
     '真实账号 OAuth 登录验证'

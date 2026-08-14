@@ -19,8 +19,8 @@ public sealed class AccountUsageLedgerService : IDisposable
     public const string UnattributedAccountId = "__unattributed__";
     public const string UnlinkedProviderId = "__unlinked_provider__";
     private const int LedgerSchemaVersion = 4;
-    private const int CursorSchemaVersion = 4;
-    private const string OpenCodexSourceNamespace = "opencodex:usage.jsonl:v4";
+    private const int CursorSchemaVersion = 5;
+    private const string OpenCodexSourceNamespace = "codex-total-manager:request-log.jsonl:v1";
     private const string DirectSourceNamespace = "direct:runtime-execution:v4";
     private const int MaximumPersistedStringLength = 240;
     private const int MaximumSourceLineBytes = 1024 * 1024;
@@ -65,7 +65,6 @@ public sealed class AccountUsageLedgerService : IDisposable
     private readonly MembershipIndex _scopeRequestMembership = new();
     private readonly AttemptProjectionCache _attemptProjection;
     private readonly QuotaProjectionCache _quotaProjection = new();
-    private readonly Dictionary<QuotaBatchKey, List<AccountQuotaSnapshotFact>> _quotaWriteFactsByBatch = new();
     private int _cachedIncompleteQuotaFactCount;
     private int _cachedCommittedQuotaFactCount;
     private int _cachedOrphanCommitCount;
@@ -82,8 +81,6 @@ public sealed class AccountUsageLedgerService : IDisposable
     private int _quotaProjectionItemCount;
     private int _quotaPrepareProjectionItemCount;
     private int _quotaCommitProjectionItemCount;
-    private long _quotaWriteRebuildGeneration = -1;
-    private int _quotaWriteItemCount;
     private int _cachedOverflowCount;
     private int _cachedStoredAttemptCount;
     private int _anomalyCount;
@@ -98,7 +95,6 @@ public sealed class AccountUsageLedgerService : IDisposable
     private long _ledgerVerificationBytes;
     private long _attemptProjectionRowsProcessed;
     private long _quotaProjectionRowsProcessed;
-    private long _quotaWriteIndexRowsProcessed;
     private bool _quotaSourceReadFailed;
     private bool _tokenSourceStale;
     private bool _coverageGapDetected;
@@ -118,6 +114,7 @@ public sealed class AccountUsageLedgerService : IDisposable
     private long _snapshotRevision;
     private Action? SnapshotImmediateBarrierForTests { get; set; }
     private Action? ProjectionCheckpointRestoredBarrierForTests { get; set; }
+    private Action? ProjectionRowAcceptedBarrierForTests { get; set; }
     private readonly object _checkpointGate = new();
     private bool _checkpointLoadAttempted;
     private long _checkpointLoadCount;
@@ -157,7 +154,8 @@ public sealed class AccountUsageLedgerService : IDisposable
         SchemaRebuildRequiredPath = Path.Combine(_dataDirectory, "account-ledger-schema-rebuild-required.json");
         ProjectionCheckpointPath = Path.Combine(_dataDirectory, "account-usage-projection-v1.json");
         SourcePath = sourcePath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".opencodex", "usage.jsonl");
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CodexTotalManager", "runtime-v3", "native-proxy", "request-log.jsonl");
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
         _sourceRequired = sourceRequired;
         _sourceDisabled = sourceDisabled;
@@ -207,7 +205,7 @@ public sealed class AccountUsageLedgerService : IDisposable
         Interlocked.Read(ref _ledgerVerificationBytes),
         Interlocked.Read(ref _attemptProjectionRowsProcessed),
         Interlocked.Read(ref _quotaProjectionRowsProcessed),
-        Interlocked.Read(ref _quotaWriteIndexRowsProcessed))
+        0)
     {
         CheckpointLoadCount = Interlocked.Read(ref _checkpointLoadCount),
         CheckpointRebuildCount = Interlocked.Read(ref _checkpointRebuildCount),
@@ -271,14 +269,20 @@ public sealed class AccountUsageLedgerService : IDisposable
             var segmentPath = AttemptSegmentPath(operationNow);
             await using var ledgerLock = await AcquireFileLockAsync(AttemptLockPath, cancellationToken).ConfigureAwait(false);
             await using var cacheLock = await AcquireFileLockAsync(DerivedCacheLockPath, cancellationToken).ConfigureAwait(false);
+            var legacyTrackingMigration = LegacySourceTrackingCanMigrate();
+            if (legacyTrackingMigration) MigrateLegacySourceTrackingArtifacts();
             EnsureIdentityKeyForWrite();
             TryLoadProjectionCheckpoint();
             cancellationToken.ThrowIfCancellationRequested();
             var existing = await RefreshAttemptsAsync(cancellationToken).ConfigureAwait(false);
-            var cursorRead = ReadCursorCore();
+            var cursorRead = legacyTrackingMigration
+                ? new CursorRead(null, null, true)
+                : ReadCursorCore();
             PublishSignal(SourceReadStarted);
             cancellationToken.ThrowIfCancellationRequested();
-            var scan = await Task.Run(() => ReadSourceBatch(cursorRead.Cursor, cancellationToken), cancellationToken).ConfigureAwait(false);
+            var scan = await Task.Run(
+                () => ReadSourceBatch(cursorRead.Cursor, cursorRead.LegacyContractMigration, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
             // Establish durable source history before any fact/anomaly append. A crash after the
             // first committed row but before cursor publication must fail closed after rotation.
             if (scan.Availability == AccountUsageSourceAvailability.Available && scan.NextCursor is not null)
@@ -351,10 +355,13 @@ public sealed class AccountUsageLedgerService : IDisposable
                 append.CandidateCount, append.AppendedCount, append.DuplicateCount, append.ConflictingReplayCount,
                 existing.BadLineCount, anomalies.Count(item => item.Kind is "bad_source_line" or "oversized_source_line" or "unrecognized_source_line"),
                 scan.SourceResetDetected,
-                $"逐 attempt 台账新增 {append.AppendedCount} 条，重复 {append.DuplicateCount} 条，碰撞 anomaly {append.ConflictingReplayCount} 条")
+                scan.SourceContractMigrated
+                    ? "旧用量来源已安全切换到总管家请求日志；旧账保留，切换前已有的新日志只作基线，不重复归账"
+                    : $"逐 attempt 台账新增 {append.AppendedCount} 条，重复 {append.DuplicateCount} 条，碰撞 anomaly {append.ConflictingReplayCount} 条")
             {
                 SourceAvailability = scan.Availability
                 ,CoverageGapDetected = scan.CoverageGapDetected
+                ,SourceContractMigrated = scan.SourceContractMigrated
             };
         }
         finally { _gate.Release(); }
@@ -393,9 +400,12 @@ public sealed class AccountUsageLedgerService : IDisposable
             var envelopes = executionArray.Select((execution, index) => new ExecutionEnvelope(
                 execution,
                 DirectSourceNamespace,
-                sharedIdentity is null
-                    ? HmacDigest("direct-event:v1", new { requestIdentity = execution.RequestIdentityMaterial ?? execution.RequestId, index })
-                    : HmacDigest("direct-event:v1", new { external = sharedIdentity, index }),
+                HmacDigest("direct-event:v2", new
+                {
+                    external = sharedIdentity,
+                    requestIdentity = execution.RequestIdentityMaterial ?? execution.RequestId,
+                    semantic = DirectExecutionIdentity(execution)
+                }),
                 Hash(Canonical(new { direct = true, index })),
                 sharedIdentity is not null)).ToArray();
             var anomalies = new List<AccountUsageAnomaly>();
@@ -896,11 +906,8 @@ public sealed class AccountUsageLedgerService : IDisposable
                 if (FixedHexEquals(priorPayload, candidate.PayloadHash))
                 {
                     duplicate++;
-                    if (!candidate.IdentityVerified)
-                        anomalies.Add(new AccountUsageAnomaly(
-                            LedgerSchemaVersion, "ambiguous_duplicate_without_request_id", candidate.IdempotencyKey,
-                            priorPayload, candidate.PayloadHash, null, SafeSourceKind(candidate.Source),
-                            "无 requestId 的相同语义事件被保守去重；未重复计费", UtcNow()));
+                    // A cursor recovery or an explicit stable-event retry is a normal idempotent replay.
+                    // It must not append another sticky anomaly or degrade the token domain forever.
                 }
                 else
                 {
@@ -962,13 +969,52 @@ public sealed class AccountUsageLedgerService : IDisposable
             _quotaCommitIndex.Clear();
             _quotaProjection.Reset();
         }
-        var facts = await RefreshQuotaAsync(cancellationToken).ConfigureAwait(false);
-        var prepares = await RefreshQuotaPreparesAsync(cancellationToken).ConfigureAwait(false);
-        var commits = await RefreshQuotaCommitsAsync(cancellationToken).ConfigureAwait(false);
-        _quotaProjectionRebuildGeneration = _quotaIndex.RebuildGeneration;
-        _quotaPrepareProjectionRebuildGeneration = _quotaPrepareIndex.RebuildGeneration;
-        _quotaCommitProjectionRebuildGeneration = _quotaCommitIndex.RebuildGeneration;
-        return (facts, prepares, commits);
+        try
+        {
+            var facts = await RefreshQuotaAsync(cancellationToken).ConfigureAwait(false);
+            var prepares = await RefreshQuotaPreparesAsync(cancellationToken).ConfigureAwait(false);
+            var commits = await RefreshQuotaCommitsAsync(cancellationToken).ConfigureAwait(false);
+            var recoveredCommits = _quotaProjection.GetRecoverablePreparedBatches()
+                .Select(batch => CreateQuotaBatchCommit(batch, UtcNow()))
+                .Where(commit => !_quotaCommitIndex.TryGetPayload(commit.IdempotencyKey, out _))
+                .ToArray();
+            if (recoveredCommits.Length > 0)
+            {
+                await AppendJsonLinesCoreAsync(QuotaCommitSegmentPath(UtcNow()), recoveredCommits, cancellationToken)
+                    .ConfigureAwait(false);
+                commits = await RefreshQuotaCommitsAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            _quotaProjectionRebuildGeneration = _quotaIndex.RebuildGeneration;
+            _quotaPrepareProjectionRebuildGeneration = _quotaPrepareIndex.RebuildGeneration;
+            _quotaCommitProjectionRebuildGeneration = _quotaCommitIndex.RebuildGeneration;
+            return (facts, prepares, commits);
+        }
+        catch
+        {
+            // The facts, prepare and commit ledgers form one projection. If any stage fails,
+            // keeping the other two stage watermarks would expose a mixed, partially projected
+            // transaction set. Invalidate all derived quota state so the next refresh rebuilds
+            // the complete transaction set from the durable JSONL ledgers.
+            InvalidateQuotaDerivedState();
+            throw;
+        }
+    }
+
+    private void InvalidateQuotaDerivedState()
+    {
+        _quotaIndex.Clear();
+        _quotaPrepareIndex.Clear();
+        _quotaCommitIndex.Clear();
+        _quotaProjection.Reset();
+        _quotaProjectionVersion = -1;
+        _quotaPrepareProjectionVersion = -1;
+        _quotaCommitProjectionVersion = -1;
+        _quotaProjectionRebuildGeneration = -1;
+        _quotaPrepareProjectionRebuildGeneration = -1;
+        _quotaCommitProjectionRebuildGeneration = -1;
+        _quotaProjectionItemCount = 0;
+        _quotaPrepareProjectionItemCount = 0;
+        _quotaCommitProjectionItemCount = 0;
     }
 
     private async Task<JsonLineRead<AccountQuotaSnapshotFact>> RefreshQuotaAsync(CancellationToken cancellationToken)
@@ -987,30 +1033,6 @@ public sealed class AccountUsageLedgerService : IDisposable
             }), cancellationToken).ConfigureAwait(false);
         if (!changed) Interlocked.Increment(ref _noChangeRefreshCount);
         return _quotaIndex.Read();
-    }
-
-    private void EnsureQuotaWriteIndex()
-    {
-        if (_quotaWriteRebuildGeneration != _quotaIndex.RebuildGeneration
-            || _quotaWriteItemCount > _quotaIndex.Items.Count)
-        {
-            _quotaWriteFactsByBatch.Clear();
-            _quotaWriteItemCount = 0;
-        }
-        var added = 0;
-        for (var index = _quotaWriteItemCount; index < _quotaIndex.Items.Count; index++)
-        {
-            var fact = _quotaIndex.Items[index];
-            var key = new QuotaBatchKey(fact.ProviderId, fact.ObservationScope,
-                fact.StableAccountIdentity, fact.AccountAttributed, fact.ObservationBatch);
-            if (!_quotaWriteFactsByBatch.TryGetValue(key, out var facts))
-                _quotaWriteFactsByBatch[key] = facts = new List<AccountQuotaSnapshotFact>();
-            facts.Add(fact);
-            added++;
-        }
-        _quotaWriteItemCount = _quotaIndex.Items.Count;
-        _quotaWriteRebuildGeneration = _quotaIndex.RebuildGeneration;
-        Interlocked.Add(ref _quotaWriteIndexRowsProcessed, added);
     }
 
     private async Task<JsonLineRead<AccountQuotaBatchCommit>> RefreshQuotaCommitsAsync(CancellationToken cancellationToken)
@@ -1082,36 +1104,54 @@ public sealed class AccountUsageLedgerService : IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!File.Exists(path)) continue;
+            if (RepairIncompleteJsonLineTail(path, validate)) changed = true;
             var start = index.Segments.TryGetValue(path, out var prior) ? prior.ParsedLength : 0;
             using var indexSession = index.OpenSession();
+            var staged = new List<(T Item, long LineOffset)>();
             var read = ReadJsonLinesIncrementalStreaming<T>(path, start, cancellationToken, (item, lineOffset) =>
+                staged.Add((item, lineOffset)));
+            try
             {
-                if (!validate(item)) { index.IntegrityFailureCount++; return; }
-                var itemKey = key(item);
-                var occurrence = LedgerRowOccurrence(path, lineOffset);
-                if (index.TryGetPayload(itemKey, out var priorPayload, out var priorOccurrence))
+                foreach (var (item, lineOffset) in staged)
                 {
-                    if (!FixedHexEquals(priorPayload, payloadHash(item)))
+                    if (!validate(item)) { index.IntegrityFailureCount++; continue; }
+                    var itemKey = key(item);
+                    var occurrence = LedgerRowOccurrence(path, lineOffset);
+                    if (index.TryGetPayload(itemKey, out var priorPayload, out var priorOccurrence))
                     {
-                        index.IntegrityFailureCount++;
-                        index.CollisionCount++;
+                        if (!FixedHexEquals(priorPayload, payloadHash(item)))
+                        {
+                            index.IntegrityFailureCount++;
+                            index.CollisionCount++;
+                        }
+                        else if (FixedHexEquals(priorOccurrence, occurrence))
+                        {
+                            // Another initialized process may already have indexed this exact durable row.
+                            // If our durable segment watermark is behind the shared idempotency index,
+                            // this instance still has to advance its projection exactly once.
+                            if (onAccepted is null) index.Items.Add(item); else onAccepted(item);
+                            ProjectionRowAcceptedBarrierForTests?.Invoke();
+                        }
+                        else if (duplicateIsIntegrity)
+                        {
+                            index.IntegrityFailureCount++;
+                            index.DuplicateCount++;
+                        }
+                        continue;
                     }
-                    else if (FixedHexEquals(priorOccurrence, occurrence))
-                    {
-                        // Another initialized process may already have indexed this exact durable row.
-                        // This instance still has to advance its own projection watermark exactly once.
-                        if (onAccepted is null) index.Items.Add(item); else onAccepted(item);
-                    }
-                    else if (duplicateIsIntegrity)
-                    {
-                        index.IntegrityFailureCount++;
-                        index.DuplicateCount++;
-                    }
-                    return;
+                    index.Remember(itemKey, payloadHash(item), occurrence);
+                    if (onAccepted is null) index.Items.Add(item); else onAccepted(item);
+                    ProjectionRowAcceptedBarrierForTests?.Invoke();
                 }
-                index.Remember(itemKey, payloadHash(item), occurrence);
-                if (onAccepted is null) index.Items.Add(item); else onAccepted(item);
-            });
+            }
+            catch
+            {
+                // No segment watermark has been published yet. Discard the derived index so the
+                // next refresh rebuilds from durable JSONL instead of replaying into a partial projection.
+                index.Clear();
+                onRebuild?.Invoke();
+                throw;
+            }
             if (read.ParsedLength > start || read.BadLineCount > 0) changed = true;
             index.BadLineCount += read.BadLineCount;
             index.Segments[path] = CreateSegmentState(path, read.ParsedLength, prior);
@@ -1148,6 +1188,59 @@ public sealed class AccountUsageLedgerService : IDisposable
         }
         bad += lines.OversizedLineCount;
         return new IncrementalRead<T>(items, bad, lines.NextOffset, lines.HasIncompleteTail);
+    }
+
+    private bool RepairIncompleteJsonLineTail<T>(string path, Func<T, bool> validate) where T : class
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read,
+            64 * 1024, FileOptions.WriteThrough);
+        if (stream.Length == 0) return false;
+        stream.Position = stream.Length - 1;
+        if (stream.ReadByte() == (byte)'\n') return false;
+
+        var end = stream.Length;
+        var start = end;
+        var scanned = 0;
+        while (start > 0 && scanned <= MaximumSourceLineBytes)
+        {
+            start--;
+            stream.Position = start;
+            if (stream.ReadByte() == (byte)'\n') { start++; break; }
+            scanned++;
+        }
+        if (scanned > MaximumSourceLineBytes) start = end;
+
+        var keepTail = false;
+        if (start < end && end - start <= MaximumSourceLineBytes)
+        {
+            var bytes = new byte[checked((int)(end - start))];
+            stream.Position = start;
+            stream.ReadExactly(bytes);
+            try
+            {
+                var text = StrictUtf8.GetString(bytes);
+                var item = JsonSerializer.Deserialize<T>(text, _jsonOptions);
+                keepTail = item is not null && validate(item);
+            }
+            catch (Exception ex) when (ex is JsonException or DecoderFallbackException)
+            {
+                keepTail = false;
+            }
+        }
+
+        if (keepTail)
+        {
+            stream.Position = end;
+            stream.WriteByte((byte)'\n');
+        }
+        else
+        {
+            stream.SetLength(start);
+        }
+        stream.Flush(true);
+        try { File.Delete(AppendSealPath(path)); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        return true;
     }
 
     private StreamingRead ReadJsonLinesIncrementalStreaming<T>(
@@ -1479,14 +1572,14 @@ public sealed class AccountUsageLedgerService : IDisposable
             : _cachedHealthyQuotaViews;
         var integrity = _attemptIndex.IntegrityFailureCount + _quotaIndex.IntegrityFailureCount
                         + _quotaPrepareIndex.IntegrityFailureCount + _quotaCommitIndex.IntegrityFailureCount
-                        + _cachedIncompleteQuotaFactCount + _cachedOrphanCommitCount + _cachedOrphanPrepareCount
+                        + _cachedIncompleteQuotaFactCount + _cachedOrphanCommitCount
                         + _cachedOverflowCount;
         var tokenIntegrity = _attemptIndex.IntegrityFailureCount + _attemptIndex.BadLineCount
                              + _cachedOverflowCount + (_persistentTokenIntegrityIssue ? 1 : 0);
         var quotaIntegrity = _quotaIndex.IntegrityFailureCount + _quotaPrepareIndex.IntegrityFailureCount
                              + _quotaCommitIndex.IntegrityFailureCount + _quotaIndex.BadLineCount
                              + _quotaPrepareIndex.BadLineCount + _quotaCommitIndex.BadLineCount
-                             + _cachedIncompleteQuotaFactCount + _cachedOrphanCommitCount + _cachedOrphanPrepareCount
+                             + _cachedIncompleteQuotaFactCount + _cachedOrphanCommitCount
                              + _cachedInvalidQuotaValueCount + _persistentQuotaIntegrityCount;
         var importerStatus = Volatile.Read(ref _importerStatus) with { IdentityKeyState = _identityKeyState.ToString() };
         var tokenHealth = importerStatus.TokenHealth == AccountUsageImporterHealth.NotStarted
@@ -1534,41 +1627,6 @@ public sealed class AccountUsageLedgerService : IDisposable
             QuotaIntegrityFailureCount = quotaIntegrity
         };
         return snapshot;
-    }
-
-    private static (IReadOnlyList<AccountTokenAggregate> Aggregates, int OverflowCount) BuildAggregates(
-        IReadOnlyList<AccountUsageAttemptFact> facts)
-    {
-        var overflowCount = 0;
-        var result = new List<AccountTokenAggregate>();
-        foreach (var group in facts.Where(fact => !fact.RequestLevelUsage && fact.IdentityVerified).GroupBy(fact => new AccountGroupKey(
-                     fact.ProviderId, fact.StableAccountIdentity, fact.AccountAttributed)))
-        {
-            var rows = group.ToArray();
-            var input = Metric(rows, usage => usage.InputTokens);
-            var cached = Metric(rows, usage => usage.CachedInputTokens);
-            var cacheRead = Metric(rows, usage => usage.CacheReadInputTokens);
-            var cacheCreate = Metric(rows, usage => usage.CacheCreationInputTokens);
-            var output = Metric(rows, usage => usage.OutputTokens);
-            var reasoning = Metric(rows, usage => usage.ReasoningTokens);
-            var total = Metric(rows, usage => usage.TotalTokens);
-            var overflows = new[] { input, cached, cacheRead, cacheCreate, output, reasoning, total }.Count(metric => metric.IsOverflow);
-            overflowCount += overflows;
-            result.Add(new AccountTokenAggregate(
-                rows[0].ProviderId, DeriveAccountDisplay(rows[0].StableAccountIdentity, rows[0].AccountAttributed), rows[0].AccountAttributed,
-                rows.Length, rows.Select(row => row.RequestIdentity).Distinct(StringComparer.Ordinal).Count(),
-                rows.Count(row => row.Result == RuntimeExecutionOutcome.Succeeded),
-                rows.Count(row => row.Result == RuntimeExecutionOutcome.Failed),
-                rows.Count(row => row.Result == RuntimeExecutionOutcome.Cancelled),
-                rows.Count(row => row.Usage is not null && row.Usage.TotalValidation != TokenTotalValidationState.InvalidValue),
-                rows.Count(row => row.Usage?.TotalValidation == TokenTotalValidationState.InvalidValue),
-                rows.Count(row => row.Usage?.TotalValidation == TokenTotalValidationState.Mismatch),
-                overflows, input, cached, cacheRead, cacheCreate, output, reasoning, total,
-                rows.Select(row => row.OccurredAt).Where(value => value is not null).DefaultIfEmpty().Max()));
-        }
-        return (result.OrderBy(item => item.AccountAttributed ? 0 : 1)
-            .ThenBy(item => item.ProviderId, StringComparer.Ordinal)
-            .ThenBy(item => item.AccountId, StringComparer.Ordinal).ToArray(), overflowCount);
     }
 
     private static TokenMetricAggregate Metric(
@@ -1714,7 +1772,7 @@ public sealed class AccountUsageLedgerService : IDisposable
         var normalizedStableIdentity = fact.AccountAttributed ? SafeOpaque(fact.StableAccountIdentity) : string.Empty;
         var valueValidation = fact.Availability != AccountQuotaAvailability.Provided || fact.Value is null
             ? QuotaValueValidationState.Unknown
-            : fact.Value < 0m || (string.Equals(fact.Unit, "percent_used", StringComparison.OrdinalIgnoreCase) && fact.Value > 100m)
+            : fact.Value < 0m
                 ? QuotaValueValidationState.InvalidRange
                 : QuotaValueValidationState.Valid;
         var normalized = fact with
@@ -1982,6 +2040,39 @@ public sealed class AccountUsageLedgerService : IDisposable
         fact.RequestLevelUsage
     });
 
+    private static object DirectExecutionIdentity(RuntimeRouteExecution execution) => new
+    {
+        execution.RequestId,
+        execution.RequestIdentityMaterial,
+        execution.RequestedModel,
+        execution.HttpStatus,
+        execution.DurationMs,
+        timestamp = execution.Timestamp is null ? null : Utc(execution.Timestamp.Value).ToString("O"),
+        execution.Outcome,
+        execution.ErrorCode,
+        execution.ErrorMessage,
+        execution.SelectionBasis,
+        attempts = execution.Attempts.OrderBy(item => item.Ordinal).Select(item => new
+        {
+            item.Ordinal,
+            item.ProviderId,
+            item.ProviderDisplayName,
+            item.AccountIdentityMaterial,
+            item.AccountId,
+            item.AccountIdentitySource,
+            item.Model,
+            item.HttpStatus,
+            item.DurationMs,
+            item.Outcome,
+            item.ErrorCode,
+            item.FailoverReason,
+            item.Selected,
+            item.SelectionEvidence,
+            item.TokenUsage
+        }).ToArray(),
+        execution.RequestLevelTokenUsage
+    };
+
     private string AttemptPayloadCanonical(AccountUsageAttemptFact fact) => Canonical(new
     {
         v = LedgerSchemaVersion,
@@ -2016,7 +2107,10 @@ public sealed class AccountUsageLedgerService : IDisposable
         fact.ResetLabel, fact.ResetState
     });
 
-    private SourceScan ReadSourceBatch(SourceCursor? cursor, CancellationToken cancellationToken)
+    private SourceScan ReadSourceBatch(
+        SourceCursor? cursor,
+        bool legacyContractMigration,
+        CancellationToken cancellationToken)
     {
         if (_sourceDisabled) return SourceScan.Disabled;
         FileStream? stream = null;
@@ -2041,6 +2135,40 @@ public sealed class AccountUsageLedgerService : IDisposable
         var info = continuing ? null : new FileInfo(SourcePath);
         var creationUtcTicks = continuing ? _sourceContinuationCreationUtcTicks : info!.CreationTimeUtc.Ticks;
         var lastWriteUtcTicks = continuing ? _sourceContinuationLastWriteUtcTicks : info!.LastWriteTimeUtc.Ticks;
+        if (legacyContractMigration)
+        {
+            var migrationLength = activeStream.Length;
+            var baselineOffset = FindCompleteLineBoundary(activeStream, migrationLength);
+            var migrationGeneration = Hash(Canonical(new
+            {
+                sourceContract = OpenCodexSourceNamespace,
+                fileIdentity,
+                creationUtcTicks,
+                lastWriteUtcTicks,
+                length = migrationLength,
+                prefix = ReadWindowHash(activeStream, 0, (int)Math.Min(PrefixWindowBytes, migrationLength))
+            }));
+            var prefixHash = ReadWindowHash(activeStream, 0, (int)Math.Min(PrefixWindowBytes, migrationLength));
+            var contentBlockHashes = BuildIncrementalSourceBlockHashes(
+                activeStream, fileIdentity, migrationLength, forceFull: true);
+            var marker = baselineOffset == 0
+                ? new SourceCursor(CursorSchemaVersion, 0, 0, 0, string.Empty,
+                    migrationLength, lastWriteUtcTicks, fileIdentity, migrationGeneration, UtcNow(),
+                    OpenCodexSourceNamespace, GenerationMarkerOnly: true)
+                : new SourceCursor(CursorSchemaVersion, baselineOffset,
+                    baselineOffset - (int)Math.Min(AnchorWindowBytes, baselineOffset),
+                    (int)Math.Min(AnchorWindowBytes, baselineOffset),
+                    ReadWindowHash(activeStream,
+                        baselineOffset - (int)Math.Min(AnchorWindowBytes, baselineOffset),
+                        (int)Math.Min(AnchorWindowBytes, baselineOffset)),
+                    migrationLength, lastWriteUtcTicks, fileIdentity, migrationGeneration, UtcNow(),
+                    OpenCodexSourceNamespace);
+            activeStream.Dispose();
+            return new SourceScan(
+                Array.Empty<SourceLine>(), Array.Empty<BadSourceLine>(), marker, true, migrationGeneration,
+                AccountUsageSourceAvailability.Available, false, cursor?.Offset, prefixHash,
+                contentBlockHashes, SourceContractMigrated: true);
+        }
         var resumingPriorGeneration = continuing;
         var readingArchive = false;
         var archivedTailComplete = false;
@@ -2109,9 +2237,11 @@ public sealed class AccountUsageLedgerService : IDisposable
                 var contentBlockHashes = BuildIncrementalSourceBlockHashes(activeStream, fileIdentity, observedSourceLength, reset);
                 activeStream.Dispose();
                 var marker = new SourceCursor(CursorSchemaVersion, 0, 0, 0, string.Empty,
-                    observedSourceLength, lastWriteUtcTicks, fileIdentity, generation, UtcNow(), GenerationMarkerOnly: true);
+                    observedSourceLength, lastWriteUtcTicks, fileIdentity, generation, UtcNow(),
+                    OpenCodexSourceNamespace, GenerationMarkerOnly: true);
                 return new SourceScan(read.Lines, bad, marker, reset, generation,
-                    AccountUsageSourceAvailability.Available, coverageGap, cursor?.Offset, prefixHash, contentBlockHashes);
+                    AccountUsageSourceAvailability.Available, coverageGap, cursor?.Offset, prefixHash,
+                    contentBlockHashes, legacyContractMigration);
             }
             var anchorLength = (int)Math.Min(AnchorWindowBytes, nextOffset);
             var anchorStart = nextOffset - anchorLength;
@@ -2119,7 +2249,8 @@ public sealed class AccountUsageLedgerService : IDisposable
             var sourcePrefixHash = ReadWindowHash(activeStream, 0, (int)Math.Min(PrefixWindowBytes, observedSourceLength));
             var sourceBlockHashes = BuildIncrementalSourceBlockHashes(activeStream, fileIdentity, observedSourceLength, reset);
             var next = new SourceCursor(CursorSchemaVersion, nextOffset, anchorStart, anchorLength, anchorHash,
-                observedSourceLength, lastWriteUtcTicks, fileIdentity, generation, UtcNow());
+                observedSourceLength, lastWriteUtcTicks, fileIdentity, generation, UtcNow(),
+                OpenCodexSourceNamespace);
             if (read.StoppedAtLimit)
             {
                 _sourceContinuationStream = activeStream;
@@ -2130,7 +2261,7 @@ public sealed class AccountUsageLedgerService : IDisposable
             }
             else activeStream.Dispose();
             return new SourceScan(read.Lines, bad, next, reset, generation, AccountUsageSourceAvailability.Available,
-                coverageGap, cursor?.Offset, sourcePrefixHash, sourceBlockHashes);
+                coverageGap, cursor?.Offset, sourcePrefixHash, sourceBlockHashes, legacyContractMigration);
         }
         catch
         {
@@ -2145,6 +2276,25 @@ public sealed class AccountUsageLedgerService : IDisposable
         _sourceContinuationStream = null;
         _sourceContinuationIdentity = null;
         _sourceContinuationGeneration = null;
+    }
+
+    private static long FindCompleteLineBoundary(FileStream stream, long length)
+    {
+        if (length <= 0) return 0;
+        const int window = 64 * 1024;
+        var buffer = new byte[window];
+        var end = length;
+        while (end > 0)
+        {
+            var start = Math.Max(0, end - window);
+            var count = checked((int)(end - start));
+            stream.Seek(start, SeekOrigin.Begin);
+            stream.ReadExactly(buffer.AsSpan(0, count));
+            for (var index = count - 1; index >= 0; index--)
+                if (buffer[index] == (byte)'\n') return start + index + 1;
+            end = start;
+        }
+        return 0;
     }
 
     private ArchivedSourceResume? TryOpenArchivedSource(SourceCursor cursor)
@@ -2238,6 +2388,131 @@ public sealed class AccountUsageLedgerService : IDisposable
         }
     }
 
+    private bool LegacySourceTrackingCanMigrate()
+    {
+        if (HasCurrentSourceContractTag(CursorPath)
+            || HasCurrentSourceContractTag(CursorRecoveryPath)
+            || HasCurrentSourceContractTag(SourceInitializedPath)) return false;
+        var cursor = ReadLegacySourceCursor(CursorPath) ?? ReadLegacySourceCursor(CursorRecoveryPath);
+        var marker = ReadLegacySourceMarker(SourceInitializedPath);
+        if (cursor is null || marker is null)
+            return cursor is not null || marker is not null || ExistingLedgerUsesLegacySource();
+        return string.Equals(cursor.SourceIdentity, marker.SourceIdentity, StringComparison.Ordinal)
+               && string.Equals(cursor.Generation, marker.Generation, StringComparison.Ordinal)
+               && cursor.Offset <= marker.SourceLength
+               && marker.ObservedOffset <= marker.SourceLength;
+    }
+
+    private static bool HasCurrentSourceContractTag(string path)
+    {
+        if (!File.Exists(path)) return false;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+            foreach (var property in document.RootElement.EnumerateObject())
+                if (property.Name.Equals("sourceContract", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return false;
+        }
+    }
+
+    private bool ExistingLedgerUsesLegacySource()
+    {
+        foreach (var path in GetSegments("account-token-attempts-*.jsonl", "account-token-attempts.jsonl"))
+        {
+            foreach (var line in File.ReadLines(path, StrictUtf8))
+            {
+                if (!line.Contains("opencodex:usage.jsonl:v4", StringComparison.OrdinalIgnoreCase)) continue;
+                try
+                {
+                    using var document = JsonDocument.Parse(line);
+                    foreach (var property in document.RootElement.EnumerateObject())
+                        if (property.Name.Equals("sourceNamespace", StringComparison.OrdinalIgnoreCase)
+                            && property.Value.ValueKind == JsonValueKind.String
+                            && property.Value.GetString()?.Equals("opencodex:usage.jsonl:v4", StringComparison.OrdinalIgnoreCase) == true)
+                            return true;
+                }
+                catch (JsonException)
+                {
+                    // Normal ledger validation handles malformed durable rows. Do not use an
+                    // unverified text fragment as authority to baseline a different source.
+                }
+            }
+        }
+        return false;
+    }
+
+    private void MigrateLegacySourceTrackingArtifacts()
+    {
+        CloseSourceContinuation();
+        var suffix = $".legacy-opencodex-v4-{UtcNow():yyyyMMdd-HHmmss-fff}-{Guid.NewGuid():N}.bak";
+        foreach (var path in new[] { CursorPath, CursorRecoveryPath, SourceInitializedPath })
+        {
+            if (!File.Exists(path)) continue;
+            var backup = path + suffix;
+            File.Move(path, backup, overwrite: false);
+        }
+    }
+
+    private static LegacySourceCursor? ReadLegacySourceCursor(string path)
+    {
+        if (!File.Exists(path)) return null;
+        try
+        {
+            var bytes = File.ReadAllBytes(path);
+            using var document = JsonDocument.Parse(bytes);
+            if (document.RootElement.TryGetProperty("sourceContract", out _)
+                || document.RootElement.TryGetProperty("SourceContract", out _)) return null;
+            var cursor = JsonSerializer.Deserialize<LegacySourceCursor>(bytes,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (cursor is null || cursor.SchemaVersion != 4 || cursor.SourceLength < 0
+                || cursor.Offset < 0 || cursor.Offset > cursor.SourceLength
+                || cursor.SourceLastWriteUtcTicks < 0 || string.IsNullOrWhiteSpace(cursor.SourceIdentity)
+                || !IsSha256Hex(cursor.Generation)) return null;
+            if (cursor.GenerationMarkerOnly)
+                return cursor.Offset == 0 && cursor.AnchorStart == 0 && cursor.AnchorLength == 0
+                       && string.IsNullOrEmpty(cursor.AnchorHash) ? cursor : null;
+            return cursor.Offset > 0 && cursor.AnchorStart >= 0 && cursor.AnchorLength > 0
+                   && cursor.AnchorStart + cursor.AnchorLength == cursor.Offset
+                   && IsSha256Hex(cursor.AnchorHash) ? cursor : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static LegacySourceInitializedMarker? ReadLegacySourceMarker(string path)
+    {
+        if (!File.Exists(path)) return null;
+        try
+        {
+            var bytes = File.ReadAllBytes(path);
+            using var document = JsonDocument.Parse(bytes);
+            if (document.RootElement.TryGetProperty("sourceContract", out _)
+                || document.RootElement.TryGetProperty("SourceContract", out _)) return null;
+            var marker = JsonSerializer.Deserialize<LegacySourceInitializedMarker>(bytes,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (marker is null || marker.SchemaVersion != 2 || marker.SourceLength < 0
+                || marker.ObservedOffset < 0 || marker.ObservedOffset > marker.SourceLength
+                || string.IsNullOrWhiteSpace(marker.SourceIdentity) || !IsSha256Hex(marker.Generation)
+                || !IsSha256Hex(marker.PrefixHash) || marker.DigestBlockBytes != SourceDigestBlockBytes)
+                return null;
+            var expectedBlocks = marker.SourceLength == 0
+                ? 0
+                : (int)((marker.SourceLength + SourceDigestBlockBytes - 1) / SourceDigestBlockBytes);
+            return marker.ContentBlockHashes.Count == expectedBlocks
+                   && marker.ContentBlockHashes.All(IsSha256Hex) ? marker : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
+
     private SourceCursor? ReadCursorRecoveryCore()
     {
         if (!File.Exists(CursorRecoveryPath)) return null;
@@ -2288,6 +2563,7 @@ public sealed class AccountUsageLedgerService : IDisposable
     private static bool SourceMarkerIsValid(SourceInitializedMarker? marker)
     {
         if (marker is null || marker.SchemaVersion != SourceMarkerSchemaVersion || !IsSha256Hex(marker.Generation)
+                || !string.Equals(marker.SourceContract, OpenCodexSourceNamespace, StringComparison.Ordinal)
                 || !IsSha256Hex(marker.PrefixHash) || marker.SourceLength < 0
                 || marker.ObservedOffset < 0 || marker.ObservedOffset > marker.SourceLength
                 || marker.DigestBlockBytes != SourceDigestBlockBytes) return false;
@@ -2312,6 +2588,7 @@ public sealed class AccountUsageLedgerService : IDisposable
         {
             var bytes = Utf8NoBom.GetBytes(JsonSerializer.Serialize(new SourceInitializedMarker(
                 SourceMarkerSchemaVersion, cursor.SourceIdentity, cursor.SourceLength, cursor.Offset, cursor.Generation,
+                OpenCodexSourceNamespace,
                 prefixHash, SourceDigestBlockBytes, contentBlockHashes.ToArray(), Utc(observedAt)), _jsonOptions));
             using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
             { stream.Write(bytes); stream.Flush(true); }
@@ -2397,6 +2674,7 @@ public sealed class AccountUsageLedgerService : IDisposable
 
     private static bool CursorIsValid(SourceCursor cursor) =>
         cursor.SchemaVersion == CursorSchemaVersion
+        && string.Equals(cursor.SourceContract, OpenCodexSourceNamespace, StringComparison.Ordinal)
         && (cursor.GenerationMarkerOnly
             ? cursor.Offset == 0 && cursor.AnchorStart == 0 && cursor.AnchorLength == 0
               && string.IsNullOrEmpty(cursor.AnchorHash)
@@ -2497,22 +2775,18 @@ public sealed class AccountUsageLedgerService : IDisposable
     }
 
     private async Task AppendJsonLinesCoreAsync<T>(string path, IEnumerable<T> items, CancellationToken cancellationToken)
+        where T : class
     {
         var rows = items.ToArray();
         if (rows.Length == 0) return;
         cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        if (File.Exists(path)) RepairIncompleteJsonLineTail<T>(path, _ => true);
         await using var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read,
             64 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough);
         var startLength = stream.Length;
         var fileIdentity = GetFileIdentity(stream, path);
         var appendBytes = new List<byte>();
-        if (startLength > 0)
-        {
-            stream.Seek(-1, SeekOrigin.End);
-            if (stream.ReadByte() != (byte)'\n')
-                appendBytes.Add((byte)'\n');
-        }
         foreach (var item in rows)
             appendBytes.AddRange(Utf8NoBom.GetBytes(JsonSerializer.Serialize(item, _jsonOptions) + "\n"));
         var priorSeal = TryReadAppendSeal(path, out var seal) && AppendSealIsValid(seal)
@@ -2577,7 +2851,7 @@ public sealed class AccountUsageLedgerService : IDisposable
                 return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1,
                     FileOptions.WriteThrough);
             }
-            catch (IOException) when (Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(10))
+            catch (IOException) when (Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(1))
             { Thread.Sleep(25); }
             catch (IOException ex)
             { throw new IOException("Waiting for the account usage ledger cross-process lock timed out.", ex); }
@@ -2823,8 +3097,7 @@ public sealed class AccountUsageLedgerService : IDisposable
         }
         var durableIntegrity = read.Items.Where(item => item.Kind is
             "bad_source_line" or "oversized_source_line" or "unrecognized_source_line"
-            or "truncated_archived_tail" or "idempotency_payload_collision"
-            or "ambiguous_duplicate_without_request_id").ToArray();
+            or "truncated_archived_tail" or "idempotency_payload_collision").ToArray();
         if (durableIntegrity.Length > 0)
         {
             _persistentTokenIntegrityIssue = true;
@@ -3443,7 +3716,30 @@ public sealed class AccountUsageLedgerService : IDisposable
                 line.SetLength(0);
             }
         }
-        if (line.Length != 0) throw new CryptographicException("identity key-domain ledger ends with an incomplete row");
+        if (line.Length != 0)
+        {
+            var tail = line.ToArray();
+            try
+            {
+                // A complete final JSON object remains identity evidence even if a crash omitted
+                // only its newline. The normal ledger refresh will append that delimiter.
+                ReadIdentityKeyIdsFromLine(tail, result);
+            }
+            catch (CryptographicException)
+            {
+                try
+                {
+                    // Structurally complete but invalid identity evidence must still fail closed.
+                    using var _ = JsonDocument.Parse(tail);
+                    throw;
+                }
+                catch (JsonException)
+                {
+                    // A syntactically incomplete final fragment is not a committed fact. Ignore it
+                    // for key-domain discovery; the locked ledger refresh truncates it before use.
+                }
+            }
+        }
     }
 
     private static void ReadIdentityKeyIdsFromLine(byte[] bytes, ISet<string> result)
@@ -3571,7 +3867,7 @@ public sealed class AccountUsageLedgerService : IDisposable
         while (true)
         {
             try { return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.WriteThrough); }
-            catch (IOException) when (Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(10)) { Thread.Sleep(25); }
+            catch (IOException) when (Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(1)) { Thread.Sleep(25); }
             catch (IOException ex) { throw new AccountLedgerIdentityKeyUnavailableException("等待身份密钥跨进程锁超时。", ex); }
         }
     }
@@ -3652,7 +3948,7 @@ public sealed class AccountUsageLedgerService : IDisposable
 
     private AccountUsageAnomaly SourceAnomaly(string kind, long? offset, string message) => new(
         LedgerSchemaVersion, Safe(kind, "source_anomaly"), null, null, null, offset,
-        "OpenCodex usage.jsonl", Safe(message, "源日志异常"), UtcNow());
+                    "总管家 request-log.jsonl", Safe(message, "源日志异常"), UtcNow());
 
     private void PublishIfFullyInitialized(int recentAttemptLimit, bool quotaSourceReadFailed)
     {
@@ -3923,15 +4219,22 @@ public sealed class AccountUsageLedgerService : IDisposable
         string PreviousChainDigest, string AppendedHash, string ChainDigest, DateTimeOffset UpdatedAt);
     private sealed record SourceCursor(int SchemaVersion, long Offset, long AnchorStart, int AnchorLength, string AnchorHash,
         long SourceLength, long SourceLastWriteUtcTicks, string SourceIdentity, string Generation, DateTimeOffset UpdatedAt,
+        string SourceContract,
         bool GenerationMarkerOnly = false);
     private sealed record SourceInitializedMarker(int SchemaVersion, string SourceIdentity, long SourceLength,
+        long ObservedOffset, string Generation, string SourceContract, string PrefixHash, int DigestBlockBytes,
+        IReadOnlyList<string> ContentBlockHashes, DateTimeOffset InitializedAt);
+    private sealed record LegacySourceCursor(int SchemaVersion, long Offset, long AnchorStart, int AnchorLength, string AnchorHash,
+        long SourceLength, long SourceLastWriteUtcTicks, string SourceIdentity, string Generation, DateTimeOffset UpdatedAt,
+        bool GenerationMarkerOnly = false);
+    private sealed record LegacySourceInitializedMarker(int SchemaVersion, string SourceIdentity, long SourceLength,
         long ObservedOffset, string Generation, string PrefixHash, int DigestBlockBytes,
         IReadOnlyList<string> ContentBlockHashes, DateTimeOffset InitializedAt);
     private sealed record StickyIntegrityEvidence(
         DateTimeOffset FirstSeen, string ErrorClass, string Message, DateTimeOffset UpdatedAt);
     private sealed record SourceIntegrityState(int SchemaVersion, StickyIntegrityEvidence? CoverageGap,
         StickyIntegrityEvidence? SourceMalformed, DateTimeOffset UpdatedAt);
-    private sealed record CursorRead(SourceCursor? Cursor, AccountUsageAnomaly? Anomaly);
+    private sealed record CursorRead(SourceCursor? Cursor, AccountUsageAnomaly? Anomaly, bool LegacyContractMigration = false);
     private sealed record SourceLine(long Offset, string Text);
     private sealed record BadSourceLine(string Kind, long Offset, string Message);
     private sealed record CompleteLineRead(
@@ -3949,7 +4252,8 @@ public sealed class AccountUsageLedgerService : IDisposable
         bool CoverageGapDetected = false,
         long? PreviousOffset = null,
         string PrefixHash = "",
-        IReadOnlyList<string>? ContentBlockHashesValue = null)
+        IReadOnlyList<string>? ContentBlockHashesValue = null,
+        bool SourceContractMigrated = false)
     {
         public IReadOnlyList<string> ContentBlockHashes => ContentBlockHashesValue ?? Array.Empty<string>();
         public static SourceScan Missing { get; } = new(Array.Empty<SourceLine>(), Array.Empty<BadSourceLine>(), null, false,
@@ -4313,6 +4617,23 @@ public sealed class AccountUsageLedgerService : IDisposable
 
         public IReadOnlyList<AccountQuotaSnapshotFact> GetOpenFacts(QuotaBatchKey key) =>
             _facts.TryGetValue(key, out var facts) ? facts : Array.Empty<AccountQuotaSnapshotFact>();
+
+        public IReadOnlyList<IReadOnlyList<AccountQuotaSnapshotFact>> GetRecoverablePreparedBatches()
+        {
+            var result = new List<IReadOnlyList<AccountQuotaSnapshotFact>>();
+            foreach (var (key, prepare) in _prepares)
+            {
+                if (_commits.ContainsKey(key) || !_facts.TryGetValue(key, out var sourceFacts)) continue;
+                var facts = sourceFacts.OrderBy(item => item.PeriodKey, StringComparer.Ordinal).ToArray();
+                if (facts.Length != prepare.ExpectedFactCount) continue;
+                var digest = Hash(JsonSerializer.Serialize(
+                    facts.Select(item => item.PayloadHash)
+                        .OrderBy(value => value, StringComparer.Ordinal).ToArray()));
+                if (!FixedHexEquals(prepare.FactsDigest, digest)) continue;
+                result.Add(facts);
+            }
+            return result;
+        }
 
         public void Reset()
         {

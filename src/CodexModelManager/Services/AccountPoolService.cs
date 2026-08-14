@@ -82,9 +82,9 @@ public sealed class AccountPoolService
         var native = await ReadNativeCodexSnapshotCachedAsync(cancellationToken);
         var nativeUsage = await _openCodex.GetNativeAccountUsageAsync(native.Accounts, cancellationToken);
         var pro = nativeUsage.GetValueOrDefault("pro")
-                  ?? LiveTokenUsageView.Empty("pro", "Codex Pro", "OpenCodex 本机完整日志");
+                  ?? LiveTokenUsageView.Empty("pro", "Codex Pro", "总管家本机完整日志");
         var plus = nativeUsage.GetValueOrDefault("plus")
-                   ?? LiveTokenUsageView.Empty("plus", "Codex Plus", "OpenCodex 本机完整日志");
+                   ?? LiveTokenUsageView.Empty("plus", "Codex Plus", "总管家本机完整日志");
 
         var others = nativeUsage.Values
             .Where(usage => usage.Key.StartsWith("provider:", StringComparison.OrdinalIgnoreCase))
@@ -417,17 +417,16 @@ public sealed class AccountPoolService
         if (!_codexConfig.IsManagedNativeProviderSelected())
             return OperationResult.Fail("Codex 目前没有连接总管家。你仍可添加、登录和管理号池；要把某个号池切给 Codex 使用，请先点“一键连接 Codex”。");
 
-        var desktopBefore = await _desktop.ReadStateAsync(cancellationToken);
-        if (!desktopBefore.Connected && IsCodexProcessRunning())
+        var desktopState = await _desktop.ReadStateAsync(cancellationToken);
+        if (!desktopState.Connected && IsCodexProcessRunning())
             return OperationResult.Fail("Codex is running, but the Manager cannot verify its current task. Close Codex or restore the desktop bridge before switching pools.");
-        if (desktopBefore.IsTurnRunning)
+        if (desktopState.IsTurnRunning)
             return OperationResult.Fail("Codex 正在回答，等回答结束后再切换。");
 
         var oldActive = _catalog.GetActive();
         var codexSnapshot = _codexConfig.CreateSnapshot();
         CodexPoolSettings? nativeSettingsBefore = null;
         var nativeRoutingTouched = false;
-        var desktopRoutingTouched = false;
         var openCodexConfigTouched = false;
         var openCodexBackup = _backups.Create();
         try
@@ -447,7 +446,7 @@ public sealed class AccountPoolService
                 VerifyFreshTarget(target);
                 nativeSettingsBefore = native.Settings;
                 nativeRoutingTouched = true;
-                return await SwitchNativeCodexAccountAsync(target, account, nativeModel, desktopBefore, cancellationToken);
+                return await SwitchNativeCodexAccountAsync(target, account, nativeModel, cancellationToken);
             }
 
             var backend = target.Transport switch
@@ -524,16 +523,7 @@ public sealed class AccountPoolService
             catch (Exception restore) { rollback.Add($"Codex 默认模型恢复失败：{restore.Message}"); }
             try { _catalog.RestoreActive(oldActive); }
             catch (Exception restore) { rollback.Add($"号池状态恢复失败：{restore.Message}"); }
-            if (desktopRoutingTouched && !string.IsNullOrWhiteSpace(desktopBefore.CurrentModel))
-            {
-                try
-                {
-                    var restored = await EnsureDesktopModelAsync(desktopBefore.CurrentModel!, rollbackToken);
-                    if (restored.Status != CodexAliasSwitchStatus.Success) rollback.Add("当前任务模型未完整恢复");
-                }
-                catch (Exception restore) { rollback.Add($"当前任务恢复失败：{restore.Message}"); }
-            }
-            var detail = rollback.Count == 0 ? "原来的账号、默认模型和当前任务状态已恢复。" : string.Join("；", rollback);
+            var detail = rollback.Count == 0 ? "原来的账号和默认模型已恢复；总管家从未操作当前任务菜单。" : string.Join("；", rollback);
             return OperationResult.Fail($"切换失败：{ex.Message} {detail}");
         }
     }
@@ -542,7 +532,6 @@ public sealed class AccountPoolService
         PoolDefinition target,
         CodexAccountView account,
         string model,
-        CodexDesktopState desktopBefore,
         CancellationToken cancellationToken)
     {
         if (!account.HasCredential || account.NeedsReauth)
@@ -617,13 +606,6 @@ public sealed class AccountPoolService
             throw new InvalidOperationException("OpenCodex did not persist the exact CLIProxy provider identity and endpoint.");
     }
 
-    private async Task<CodexAliasSwitchResult> EnsureDesktopModelAsync(
-        string model,
-        CancellationToken cancellationToken)
-    {
-        return await _desktop.EnsureCurrentChatUsesAliasAsync(model, cancellationToken);
-    }
-
     private void VerifyFreshTarget(PoolDefinition target)
     {
         var fresh = _catalog.FindFresh(target.Id)
@@ -659,20 +641,7 @@ public sealed class AccountPoolService
     }
 
     private static bool IsCodexProcessRunning()
-    {
-        try
-        {
-            return Process.GetProcessesByName("Codex").Any(process =>
-            {
-                try { return !process.HasExited; }
-                finally { process.Dispose(); }
-            });
-        }
-        catch
-        {
-            return true;
-        }
-    }
+        => CodexDesktopProcessDetector.IsRunning();
 
     private async Task<AccountPoolView> ReadViewAsync(
         PoolDefinition pool,

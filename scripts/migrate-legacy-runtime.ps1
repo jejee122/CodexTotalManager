@@ -61,11 +61,14 @@ if ($sourceFiles.Count -lt 10) { throw 'Legacy ledger file set is unexpectedly s
 $required = @(
     'account-ledger-identity.key',
     'account-ledger-key-domain.json',
-    'account-token-attempts-2026-08.jsonl',
     'account-usage-projection-v1.json'
 )
 foreach ($name in $required) {
     if ($sourceFiles.Name -notcontains $name) { throw "Legacy ledger is missing $name" }
+}
+$attemptSegments = @($sourceFiles | Where-Object { $_.Name -match '^account-token-attempts-\d{4}-\d{2}\.jsonl$' })
+if ($attemptSegments.Count -eq 0) {
+    throw 'Legacy ledger has no monthly account-token-attempts-YYYY-MM.jsonl segment.'
 }
 $sourceHashes = @{}
 foreach ($file in $sourceFiles) {

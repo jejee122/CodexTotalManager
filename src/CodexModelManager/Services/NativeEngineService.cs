@@ -25,6 +25,8 @@ public sealed class NativeEngineService
     private string? _stateDetail;
     private string? _activeDataRoot;
 
+    internal Action? StoppedForTest { get; set; }
+
     public string EngineDataRoot { get; set; } = Path.Combine(
         AppSettingsService.ResolveDefaultDataDirectory(), "native-proxy");
 
@@ -90,26 +92,14 @@ public sealed class NativeEngineService
                 var dataRoot = dataRootOverride ?? EngineDataRoot;
                 _activeDataRoot = dataRoot;
                 Directory.CreateDirectory(dataRoot);
-                var configPath = Path.Combine(dataRoot, "config.json");
-                if (!File.Exists(configPath))
-                {
-                    new NativeProxyConfigStore(dataRoot).Save(new NativeProxyConfig
-                    {
-                        ListenPort = port,
-                        DefaultProvider = "openai",
-                        AdmissionToken = GenerateAdmissionToken()
-                    });
-                }
-
                 var store = new NativeProxyConfigStore(dataRoot);
-                var config = store.Load();
-                config.ListenPort = port;
-                if (string.IsNullOrWhiteSpace(config.AdmissionToken))
+                store.Update(latest =>
                 {
-                    config.AdmissionToken = GenerateAdmissionToken();
-                    store.UpgradePlaintextSecrets(config);
-                }
-                store.UpgradePlaintextSecrets(config);
+                    latest.ListenPort = port;
+                    latest.DefaultProvider ??= "openai";
+                    if (string.IsNullOrWhiteSpace(latest.AdmissionToken))
+                        latest.AdmissionToken = GenerateAdmissionToken();
+                });
 
                 var host = new NativeProxyHost(store, admissionTokenOverride: null, dataRootOverride: dataRoot);
                 ConfigurePipeline?.Invoke(host.Application);
@@ -158,6 +148,7 @@ public sealed class NativeEngineService
                 _shutdown = null;
                 _state = NativeEngineState.Stopped;
                 _stateDetail = "内置原生引擎已停止";
+                StoppedForTest?.Invoke();
             }
             return true;
         }

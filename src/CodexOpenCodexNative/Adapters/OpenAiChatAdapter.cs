@@ -43,7 +43,8 @@ public sealed class OpenAiChatAdapter : IProviderAdapter
                 Streaming = false,
                 ContentType = "application/json",
                 JsonBody = BuildErrorBody((int)response.StatusCode, errorBody),
-                StatusCode = (int)response.StatusCode
+                StatusCode = (int)response.StatusCode,
+                Owner = response
             };
         }
 
@@ -54,16 +55,25 @@ public sealed class OpenAiChatAdapter : IProviderAdapter
             {
                 Streaming = true,
                 ContentType = "text/event-stream",
-                Events = ParseSseStream(stream, modelId, cancellationToken)
+                Events = ParseSseStream(stream, modelId, cancellationToken),
+                Owner = response
             };
         }
 
         var jsonBody = await response.Content.ReadAsStringAsync(cancellationToken);
+        ChatCompletionResponse? normalized = null;
+        try { normalized = JsonSerializer.Deserialize<ChatCompletionResponse>(jsonBody); }
+        catch (JsonException) { }
+        var choice = normalized?.Choices.FirstOrDefault();
         return new AdapterResponse
         {
             Streaming = false,
             ContentType = "application/json",
-            JsonBody = jsonBody
+            JsonBody = jsonBody,
+            Message = choice?.Message,
+            FinishReason = choice?.FinishReason,
+            Usage = normalized?.Usage,
+            Owner = response
         };
     }
 
@@ -129,7 +139,7 @@ public sealed class OpenAiChatAdapter : IProviderAdapter
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         using var reader = new StreamReader(raw, Encoding.UTF8);
-        var pendingToolCall = new Dictionary<string, (string Name, StringBuilder Arguments)>();
+        var pendingToolCalls = new Dictionary<int, PendingToolCall>();
         var pendingReasoning = new StringBuilder();
         var hasReasoning = false;
         while (await reader.ReadLineAsync(cancellationToken) is { } line)
@@ -163,29 +173,17 @@ public sealed class OpenAiChatAdapter : IProviderAdapter
             {
                 foreach (var toolCall in delta.ToolCalls)
                 {
-                    var index = 0;
-                    string? id = null;
-                    string? name = null;
-                    string? arguments = null;
-                    if (toolCall.ValueKind == JsonValueKind.Object)
+                    var index = toolCall.Index;
+                    var id = toolCall.Id;
+                    var name = toolCall.Function.Name;
+                    var arguments = toolCall.Function.Arguments;
+                    if (!pendingToolCalls.TryGetValue(index, out var pending))
                     {
-                        if (toolCall.TryGetProperty("index", out var indexValue))
-                            index = indexValue.GetInt32();
-                        if (toolCall.TryGetProperty("id", out var idValue))
-                            id = idValue.GetString();
-                        if (toolCall.TryGetProperty("function", out var function))
-                        {
-                            if (function.TryGetProperty("name", out var nameValue))
-                                name = nameValue.GetString();
-                            if (function.TryGetProperty("arguments", out var argsValue))
-                                arguments = argsValue.GetString();
-                        }
+                        pending = new PendingToolCall(index);
+                        pendingToolCalls[index] = pending;
                     }
-                    if (!pendingToolCall.TryGetValue(index.ToString(), out var pending))
-                    {
-                        pending = (name ?? string.Empty, new StringBuilder());
-                        pendingToolCall[index.ToString()] = pending;
-                    }
+                    if (!string.IsNullOrEmpty(id))
+                        pending.CallId = id;
                     if (!string.IsNullOrEmpty(name))
                         pending.Name = name;
                     if (!string.IsNullOrEmpty(arguments))
@@ -195,24 +193,27 @@ public sealed class OpenAiChatAdapter : IProviderAdapter
                         Type = "function_call",
                         CallId = id,
                         FunctionName = name,
-                        Arguments = arguments
+                        Arguments = arguments,
+                        ToolCallIndex = index
                     };
                 }
             }
             if (chunk.Choices[0].FinishReason is not null)
             {
-                if (pendingToolCall.Count > 0)
+                if (pendingToolCalls.Count > 0)
                 {
-                    foreach (var (_, call) in pendingToolCall)
+                    foreach (var call in pendingToolCalls.Values.OrderBy(call => call.Index))
                     {
                         yield return new AdapterEvent
                         {
                             Type = "function_call_done",
+                            CallId = call.CallId,
                             FunctionName = call.Name,
-                            Arguments = call.Arguments.ToString()
+                            Arguments = call.Arguments.ToString(),
+                            ToolCallIndex = call.Index
                         };
                     }
-                    pendingToolCall.Clear();
+                    pendingToolCalls.Clear();
                 }
                 if (hasReasoning)
                 {
@@ -242,4 +243,12 @@ public sealed class OpenAiChatAdapter : IProviderAdapter
 
     private static string Truncate(string value, int max) =>
         value.Length <= max ? value : value[..max];
+
+    private sealed class PendingToolCall(int index)
+    {
+        public int Index { get; } = index;
+        public string? CallId { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public StringBuilder Arguments { get; } = new();
+    }
 }

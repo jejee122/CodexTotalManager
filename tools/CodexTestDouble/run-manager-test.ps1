@@ -11,8 +11,18 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$enginePort = 19100
-$gatewayPort = 19110
+function Get-FreeLoopbackPort {
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
+$enginePort = Get-FreeLoopbackPort
+do { $gatewayPort = Get-FreeLoopbackPort } while ($gatewayPort -eq $enginePort)
 $dotnetCommand = Get-Command dotnet -ErrorAction SilentlyContinue
 $dotnet = if ($null -ne $dotnetCommand) {
     $dotnetCommand.Source
@@ -36,12 +46,6 @@ if (-not ($runFull.TrimEnd('\') + '\').StartsWith($tempRoot, [StringComparison]:
 }
 if (Test-Path -LiteralPath $runFull) { throw "Test root already exists: $runFull" }
 
-$listeners = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-    Where-Object { $_.LocalPort -in @($enginePort, $gatewayPort) })
-if ($listeners.Count -gt 0) {
-    throw "Test ports are already occupied; their owners were not touched: $($listeners.LocalPort -join ',')"
-}
-
 New-Item -ItemType Directory -Path $runFull | Out-Null
 $token = [Guid]::NewGuid().ToString('N')
 $markerPath = Join-Path $runFull '.cmm-codex-test-double-run'
@@ -64,15 +68,15 @@ function New-TestProcessInfo([string]$Path, [string]$Arguments) {
     $info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
     $info.RedirectStandardOutput = $false
     $info.RedirectStandardError = $false
-    $info.Environment['CMM_CODEX_TEST_DOUBLE_TOKEN'] = $token
-    $info.Environment['CMM_DETACHED_NO_EXTERNAL_NETWORK'] = '1'
-    $info.Environment['CMM_DETACHED_DATA_ROOT'] = $runFull
-    $info.Environment['CMM_CODEX_TEST_DOUBLE_ENGINE_URL'] = 'http://127.0.0.1:19100/'
-    $info.Environment['CMM_CODEX_TEST_DOUBLE_GATEWAY_URL'] = 'http://127.0.0.1:19110/'
-    $info.Environment['HTTP_PROXY'] = 'http://127.0.0.1:1'
-    $info.Environment['HTTPS_PROXY'] = 'http://127.0.0.1:1'
-    $info.Environment['ALL_PROXY'] = 'socks5://127.0.0.1:1'
-    $info.Environment['NO_PROXY'] = '127.0.0.1,localhost'
+$info.EnvironmentVariables['CMM_CODEX_TEST_DOUBLE_TOKEN'] = $token
+$info.EnvironmentVariables['CMM_DETACHED_NO_EXTERNAL_NETWORK'] = '1'
+$info.EnvironmentVariables['CMM_DETACHED_DATA_ROOT'] = $runFull
+$info.EnvironmentVariables['CMM_CODEX_TEST_DOUBLE_ENGINE_URL'] = "http://127.0.0.1:$enginePort/"
+$info.EnvironmentVariables['CMM_CODEX_TEST_DOUBLE_GATEWAY_URL'] = "http://127.0.0.1:$gatewayPort/"
+$info.EnvironmentVariables['HTTP_PROXY'] = 'http://127.0.0.1:1'
+$info.EnvironmentVariables['HTTPS_PROXY'] = 'http://127.0.0.1:1'
+$info.EnvironmentVariables['ALL_PROXY'] = 'socks5://127.0.0.1:1'
+$info.EnvironmentVariables['NO_PROXY'] = '127.0.0.1,localhost'
     $info.Environment.Remove('CMM_DETACHED_UI') | Out-Null
     return $info
 }

@@ -15,14 +15,26 @@ public interface IProviderAdapter
         CancellationToken cancellationToken);
 }
 
-public sealed class AdapterResponse
+public sealed class AdapterResponse : IAsyncDisposable
 {
     public bool Streaming { get; init; }
     public required string ContentType { get; init; }
     public string? JsonBody { get; init; }
     public IAsyncEnumerable<AdapterEvent>? Events { get; init; }
+    public Stream? RawStream { get; init; }
+    public OcxMessage? Message { get; init; }
+    public string? FinishReason { get; init; }
     public OcxUsage? Usage { get; init; }
     public int StatusCode { get; init; } = 200;
+    internal HttpResponseMessage? Owner { get; init; }
+
+    public ValueTask DisposeAsync()
+    {
+        Owner?.Dispose();
+        if (Owner is null)
+            RawStream?.Dispose();
+        return ValueTask.CompletedTask;
+    }
 }
 
 public sealed class AdapterEvent
@@ -37,6 +49,7 @@ public sealed class AdapterEvent
     public string? CallId { get; init; }
     public string? FunctionName { get; init; }
     public string? Arguments { get; init; }
+    public int ToolCallIndex { get; init; }
 }
 
 public sealed class ChatCompletionChunk
@@ -60,7 +73,29 @@ public sealed class ChunkDelta
 {
     [JsonPropertyName("role")] public string? Role { get; set; }
     [JsonPropertyName("content")] public string? Content { get; set; }
-    [JsonPropertyName("tool_calls")] public List<JsonElement>? ToolCalls { get; set; }
+    [JsonPropertyName("tool_calls")] public List<ChatToolCallDelta>? ToolCalls { get; set; }
+}
+
+public sealed class ChatToolCallDelta
+{
+    [JsonPropertyName("index")] public int Index { get; set; }
+    [JsonPropertyName("id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Id { get; set; }
+    [JsonPropertyName("type")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Type { get; set; }
+    [JsonPropertyName("function")] public ChatToolCallFunctionDelta Function { get; set; } = new();
+}
+
+public sealed class ChatToolCallFunctionDelta
+{
+    [JsonPropertyName("name")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Name { get; set; }
+    [JsonPropertyName("arguments")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Arguments { get; set; }
 }
 
 public sealed class ChatCompletionResponse

@@ -80,6 +80,7 @@ public sealed class NativeProxyHost
         var token = config.AdmissionToken;
         var registry = new ProviderRegistry(config);
         var continuationStore = new ResponseContinuationStore();
+        var codexSessionAdmission = new CodexSessionAdmissionRegistry();
         var startedAt = DateTimeOffset.Now;
 
         _app.MapGet("/healthz", (HttpContext context) =>
@@ -115,7 +116,13 @@ public sealed class NativeProxyHost
 
         _app.MapGet("/v1/models", (HttpContext context) =>
         {
-            if (!AdmittedInference(context, token)) return Results.Json(new { error = new { message = "unauthorized" } }, statusCode: 401);
+            // Codex Desktop keeps using its real ChatGPT Bearer token after
+            // openai_base_url is pointed at this loopback engine. That token is
+            // acceptable only for the built-in official pass-through surface.
+            // It must never authorize namespaced third-party models or any
+            // management API.
+            if (!AdmittedInference(context, token) && !HasOfficialBearer(context))
+                return Results.Json(new { error = new { message = "unauthorized" } }, statusCode: 401);
             return Results.Json(new { @object = "list", data = registry.ListModels() });
         });
 
@@ -124,8 +131,8 @@ public sealed class NativeProxyHost
         // native accounts must not be synthesized from unrelated credentials.
         var managementGate = new object();
         var activeAccountId = "__main__";
-        var autoSwitchThreshold = 0;
-        var failoverThreshold = 0;
+        var autoSwitchThreshold = config.AutoSwitchThreshold;
+        var failoverThreshold = config.FailoverThreshold;
         var accountMode = "direct";
 
         _app.MapGet("/api/models", (HttpContext context) =>
@@ -356,7 +363,12 @@ public sealed class NativeProxyHost
             using var body = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
             if (!body.RootElement.TryGetProperty("threshold", out var value) || !value.TryGetInt32(out var threshold) || threshold is < 0 or > 100)
                 return Results.Json(new { error = new { message = "invalid threshold" } }, statusCode: 400);
-            lock (managementGate) autoSwitchThreshold = threshold;
+            lock (managementGate)
+            {
+                autoSwitchThreshold = threshold;
+                config.AutoSwitchThreshold = threshold;
+                _store.Save(config);
+            }
             return Results.Json(new { ok = true, threshold });
         });
 
@@ -366,7 +378,12 @@ public sealed class NativeProxyHost
             using var body = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
             if (!body.RootElement.TryGetProperty("threshold", out var value) || !value.TryGetInt32(out var threshold) || threshold is < 0 or > 20)
                 return Results.Json(new { error = new { message = "invalid threshold" } }, statusCode: 400);
-            lock (managementGate) failoverThreshold = threshold;
+            lock (managementGate)
+            {
+                failoverThreshold = threshold;
+                config.FailoverThreshold = threshold;
+                _store.Save(config);
+            }
             return Results.Json(new { ok = true, threshold });
         });
 
@@ -454,6 +471,7 @@ public sealed class NativeProxyHost
                 timestamp = entry.StartedAt,
                 status = entry.HttpStatus ?? (entry.Status == "completed" ? 200 : 500),
                 durationMs = entry.ElapsedMs,
+                requestedModel = entry.RequestedModel ?? entry.Model,
                 provider = entry.Provider,
                 model = entry.Model,
                 resolvedModel = entry.Model,
@@ -465,7 +483,28 @@ public sealed class NativeProxyHost
                     totalTokens = entry.TotalTokens ?? 0
                 },
                 totalTokens = entry.TotalTokens ?? 0,
-                error = entry.Error
+                error = entry.Error,
+                errorMessage = entry.Error,
+                attempts = new[]
+                {
+                    new
+                    {
+                        selected = true,
+                        status = entry.HttpStatus ?? (entry.Status == "completed" ? 200 : 500),
+                        provider = entry.Provider,
+                        model = entry.Model,
+                        resolvedModel = entry.Model,
+                        durationMs = entry.ElapsedMs,
+                        error = entry.Error,
+                        errorMessage = entry.Error,
+                        usage = new
+                        {
+                            inputTokens = entry.PromptTokens ?? 0,
+                            outputTokens = entry.CompletionTokens ?? 0,
+                            totalTokens = entry.TotalTokens ?? 0
+                        }
+                    }
+                }
             }).ToArray());
         });
 
@@ -477,7 +516,9 @@ public sealed class NativeProxyHost
 
         _app.MapPost("/v1/chat/completions", async (HttpContext context, CancellationToken ct) =>
         {
-            if (!AdmittedInference(context, token))
+            var locallyAdmitted = AdmittedInference(context, token);
+            var hasOfficialBearer = HasOfficialBearer(context);
+            if (!locallyAdmitted && !hasOfficialBearer)
             {
                 context.Response.StatusCode = 401;
                 await context.Response.WriteAsJsonAsync(new { error = new { message = "unauthorized" } });
@@ -514,27 +555,67 @@ public sealed class NativeProxyHost
                 await context.Response.WriteAsJsonAsync(new { error = new { message = ex.Message, type = "model_not_found", model = ex.Model } });
                 return;
             }
+            if (!locallyAdmitted
+                && !IsOfficialPassThrough(route)
+                && !codexSessionAdmission.Contains(context))
+            {
+                context.Response.StatusCode = 403;
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    error = new { message = "the Codex session credential may use only the built-in official provider" }
+                });
+                return;
+            }
             var adapter = CreateAdapter(route.Provider);
-            var result = await adapter.FetchAsync(route.Provider, request, route.ModelId, ct);
+            await using var result = await adapter.FetchAsync(route.Provider, request, route.ModelId, ct);
+            if (IsOfficialPassThrough(route) && result.StatusCode is >= 200 and < 300)
+                codexSessionAdmission.Remember(context);
 
             if (!result.Streaming)
             {
                 context.Response.StatusCode = result.StatusCode;
                 context.Response.ContentType = "application/json; charset=utf-8";
-                await context.Response.WriteAsync(result.JsonBody ?? "{}", ct);
-                var upstream = ParseChatCompletion(result.JsonBody);
+                var upstream = result.Message is null
+                    ? ParseChatCompletion(result.JsonBody)
+                    : new ChatCompletionResponse
+                    {
+                        Id = $"chatcmpl-{Guid.NewGuid():N}"[..24],
+                        Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        Model = route.ModelId,
+                        Choices =
+                        [
+                            new ChatChoice
+                            {
+                                Index = 0,
+                                Message = result.Message,
+                                FinishReason = result.FinishReason
+                            }
+                        ],
+                        Usage = result.Usage
+                    };
+                await context.Response.WriteAsync(
+                    upstream is null ? result.JsonBody ?? "{}" : JsonSerializer.Serialize(upstream),
+                    ct);
                 sw.Stop();
                 _requestLog.Record(new RequestLogEntry
                 {
                     Path = "/v1/chat/completions",
+                    RequestedModel = request.Model,
                     Model = route.ModelId,
                     Provider = route.ProviderId,
-                    Status = upstream is null ? "error" : "completed",
+                    Status = upstream is null
+                        ? "error"
+                        : upstream.Choices.FirstOrDefault()?.FinishReason is "length" or "max_tokens"
+                            ? "incomplete"
+                            : "completed",
                     HttpStatus = result.StatusCode,
                     ElapsedMs = sw.ElapsedMilliseconds,
                     PromptTokens = upstream?.Usage?.PromptTokens,
                     CompletionTokens = upstream?.Usage?.CompletionTokens,
-                    TotalTokens = upstream?.Usage?.TotalTokens
+                    TotalTokens = upstream?.Usage?.TotalTokens,
+                    Error = result.StatusCode is >= 200 and < 300
+                        ? null
+                        : ExtractErrorMessage(result.JsonBody)
                 });
                 return;
             }
@@ -544,14 +625,38 @@ public sealed class NativeProxyHost
             var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             var sessionId = $"chatcmpl-{Guid.NewGuid():N}"[..24];
             var status = "completed";
+            string? streamError = null;
             OcxUsage? usage = null;
 
             await foreach (var adapterEvent in result.Events!)
             {
                 if (ct.IsCancellationRequested) break;
                 if (adapterEvent.Type == "usage") usage = adapterEvent.Usage;
-                if (adapterEvent.Type == "error") status = "error";
+                if (adapterEvent.Type == "error")
+                {
+                    status = "error";
+                    streamError ??= adapterEvent.Text;
+                }
                 if (adapterEvent.Type == "incomplete") status = "incomplete";
+                if (adapterEvent.Type is "finish" or "done"
+                    && adapterEvent.FinishReason is "length" or "max_tokens")
+                    status = "incomplete";
+                var toolCalls = adapterEvent.Type == "function_call"
+                    ? new List<ChatToolCallDelta>
+                    {
+                        new()
+                        {
+                            Index = adapterEvent.ToolCallIndex,
+                            Id = adapterEvent.CallId,
+                            Type = adapterEvent.CallId is null ? null : "function",
+                            Function = new ChatToolCallFunctionDelta
+                            {
+                                Name = adapterEvent.FunctionName,
+                                Arguments = adapterEvent.Arguments
+                            }
+                        }
+                    }
+                    : null;
                 var chunk = new ChatCompletionChunk
                 {
                     Id = sessionId,
@@ -562,7 +667,12 @@ public sealed class NativeProxyHost
                         new ChunkChoice
                         {
                             Index = 0,
-                            Delta = new ChunkDelta { Role = adapterEvent.Role, Content = adapterEvent.Text },
+                            Delta = new ChunkDelta
+                            {
+                                Role = adapterEvent.Role,
+                                Content = adapterEvent.Text,
+                                ToolCalls = toolCalls
+                            },
                             FinishReason = adapterEvent.FinishReason
                         }
                     ]
@@ -578,6 +688,7 @@ public sealed class NativeProxyHost
             _requestLog.Record(new RequestLogEntry
             {
                 Path = "/v1/chat/completions",
+                RequestedModel = request.Model,
                 Model = route.ModelId,
                 Provider = route.ProviderId,
                 Status = status,
@@ -585,13 +696,16 @@ public sealed class NativeProxyHost
                 ElapsedMs = sw.ElapsedMilliseconds,
                 PromptTokens = usage?.PromptTokens,
                 CompletionTokens = usage?.CompletionTokens,
-                TotalTokens = usage?.TotalTokens
+                TotalTokens = usage?.TotalTokens,
+                Error = streamError
             });
         });
 
         _app.MapPost("/v1/responses", async (HttpContext context, CancellationToken ct) =>
         {
-            if (!AdmittedInference(context, token))
+            var locallyAdmitted = AdmittedInference(context, token);
+            var hasOfficialBearer = HasOfficialBearer(context);
+            if (!locallyAdmitted && !hasOfficialBearer)
             {
                 context.Response.StatusCode = 401;
                 await context.Response.WriteAsJsonAsync(new { error = new { message = "unauthorized" } });
@@ -641,23 +755,51 @@ public sealed class NativeProxyHost
                 });
                 return;
             }
-            if (continuationStore.TryExpand(
-                    parsed.PreviousResponseId,
-                    parsed.Messages,
-                    out var expandedMessages))
+            var officialPassThrough = route.Provider.Adapter == "openai-responses"
+                                      && OpenAiResponsesAdapter.IsOfficialCodexProvider(route.Provider);
+            if (!locallyAdmitted
+                && !officialPassThrough
+                && !codexSessionAdmission.Contains(context))
             {
+                context.Response.StatusCode = 403;
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    error = ResponsesJson.Error(
+                        "forbidden_provider",
+                        "Codex 自己的登录令牌只能原样访问 OpenAI 官方模型；第三方模型和账号池必须使用总管家本机准入令牌。")
+                }, cancellationToken: ct);
+                return;
+            }
+            if (!officialPassThrough && !string.IsNullOrWhiteSpace(parsed.PreviousResponseId))
+            {
+                if (!continuationStore.TryExpand(
+                        parsed.PreviousResponseId,
+                        parsed.Messages,
+                        out var expandedMessages))
+                {
+                    context.Response.StatusCode = StatusCodes.Status409Conflict;
+                    await context.Response.WriteAsJsonAsync(new
+                    {
+                        error = ResponsesJson.Error(
+                            "previous_response_not_found",
+                            "总管家找不到上一轮回复记录；请让客户端用完整历史重建对话后再试。")
+                    }, cancellationToken: ct);
+                    return;
+                }
                 parsed.Messages = expandedMessages;
                 parsed.PreviousResponseId = null;
                 parsed.RawBody = null;
             }
-            else if (!route.ProviderId.Equals("openai", StringComparison.OrdinalIgnoreCase))
+            else if (!officialPassThrough)
             {
                 // Total Manager's provider/model prefix is only a local routing name.
                 // Rebuild the request with the provider's bare upstream model id.
                 parsed.RawBody = null;
             }
             var adapter = CreateAdapter(route.Provider);
-            var result = await adapter.FetchAsync(route.Provider, parsed, route.ModelId, ct);
+            await using var result = await adapter.FetchAsync(route.Provider, parsed, route.ModelId, ct);
+            if (officialPassThrough && result.StatusCode is >= 200 and < 300)
+                codexSessionAdmission.Remember(context);
             var status = "completed";
             OcxUsage? usage = null;
 
@@ -669,7 +811,7 @@ public sealed class NativeProxyHost
                     context.Response.StatusCode = result.StatusCode;
                     context.Response.ContentType = "application/json; charset=utf-8";
                     await context.Response.WriteAsync(result.JsonBody ?? "{}", ct);
-                    if (result.StatusCode is >= 200 and < 300)
+                    if (result.StatusCode is >= 200 and < 300 && !officialPassThrough)
                         continuationStore.SaveFromResponseJson(result.JsonBody, parsed.Messages);
                 }
                 else
@@ -682,22 +824,27 @@ public sealed class NativeProxyHost
                     }
                     else
                     {
-                        var upstream = ParseChatCompletion(result.JsonBody);
-                        var bridge = new ResponsesBridge(route.ModelId);
-                        var text = upstream?.Choices.FirstOrDefault()?.Message.Content?.ToString();
-                        var responseJson = bridge.BuildNonStreamingResponse(
-                            text,
-                            upstream?.Usage is null ? null : JsonSerializer.SerializeToElement(upstream.Usage));
+                        var upstream = result.Message is null ? ParseChatCompletion(result.JsonBody) : null;
+                        var message = result.Message ?? upstream?.Choices.FirstOrDefault()?.Message;
+                        var upstreamUsage = result.Usage ?? upstream?.Usage;
+                        var finishReason = result.FinishReason ?? upstream?.Choices.FirstOrDefault()?.FinishReason;
+                        var responseJson = BuildResponsesNonStreamingResponse(
+                            route.ModelId,
+                            message,
+                            upstreamUsage,
+                            finishReason);
                         context.Response.ContentType = "application/json; charset=utf-8";
                         await context.Response.WriteAsync(responseJson.ToJsonString(), ct);
                         continuationStore.SaveFromResponseJson(responseJson.ToJsonString(), parsed.Messages);
-                        usage = upstream?.Usage;
+                        usage = upstreamUsage;
+                        status = finishReason is "length" or "max_tokens" ? "incomplete" : "completed";
                     }
                 }
                 sw.Stop();
                 _requestLog.Record(new RequestLogEntry
                 {
                     Path = "/v1/responses",
+                    RequestedModel = request.Model,
                     Model = route.ModelId,
                     Provider = route.ProviderId,
                     Status = status,
@@ -705,7 +852,33 @@ public sealed class NativeProxyHost
                     ElapsedMs = sw.ElapsedMilliseconds,
                     PromptTokens = usage?.PromptTokens,
                     CompletionTokens = usage?.CompletionTokens,
-                    TotalTokens = usage?.TotalTokens
+                    TotalTokens = usage?.TotalTokens,
+                    Error = result.StatusCode is >= 200 and < 300
+                        ? null
+                        : ExtractErrorMessage(result.JsonBody)
+                });
+                return;
+            }
+
+            if (officialPassThrough)
+            {
+                if (result.RawStream is null)
+                    throw new InvalidOperationException("官方 Codex 流式响应缺少原始响应流，已停止以避免伪造事件。");
+                context.Response.StatusCode = result.StatusCode;
+                context.Response.ContentType = result.ContentType;
+                context.Response.Headers.CacheControl = "no-cache";
+                await result.RawStream.CopyToAsync(context.Response.Body, ct);
+                await context.Response.Body.FlushAsync(ct);
+                sw.Stop();
+                _requestLog.Record(new RequestLogEntry
+                {
+                    Path = "/v1/responses",
+                    RequestedModel = request.Model,
+                    Model = route.ModelId,
+                    Provider = route.ProviderId,
+                    Status = "passed-through",
+                    HttpStatus = result.StatusCode,
+                    ElapsedMs = sw.ElapsedMilliseconds
                 });
                 return;
             }
@@ -725,6 +898,7 @@ public sealed class NativeProxyHost
             _requestLog.Record(new RequestLogEntry
             {
                 Path = "/v1/responses",
+                RequestedModel = request.Model,
                 Model = route.ModelId,
                 Provider = route.ProviderId,
                 Status = bridgeStream.Status,
@@ -732,13 +906,16 @@ public sealed class NativeProxyHost
                 ElapsedMs = sw.ElapsedMilliseconds,
                 PromptTokens = bridgeStream.Usage?.PromptTokens,
                 CompletionTokens = bridgeStream.Usage?.CompletionTokens,
-                TotalTokens = bridgeStream.Usage?.TotalTokens
+                TotalTokens = bridgeStream.Usage?.TotalTokens,
+                Error = bridgeStream.ErrorMessage
             });
         });
 
         _app.MapPost("/v1/messages", async (HttpContext context, CancellationToken ct) =>
         {
-            if (!AdmittedInference(context, token))
+            var locallyAdmitted = AdmittedInference(context, token);
+            var hasOfficialBearer = HasOfficialBearer(context);
+            if (!locallyAdmitted && !hasOfficialBearer)
             {
                 context.Response.StatusCode = 401;
                 await context.Response.WriteAsJsonAsync(new { error = new { message = "unauthorized" } });
@@ -786,8 +963,21 @@ public sealed class NativeProxyHost
                 await context.Response.WriteAsJsonAsync(new { error = new { message = ex.Message, type = "model_not_found" } });
                 return;
             }
+            if (!locallyAdmitted
+                && !IsOfficialPassThrough(route)
+                && !codexSessionAdmission.Contains(context))
+            {
+                context.Response.StatusCode = 403;
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    error = new { message = "the Codex session credential may use only the built-in official provider" }
+                });
+                return;
+            }
             var adapter = CreateAdapter(route.Provider);
-            var result = await adapter.FetchAsync(route.Provider, parsed, route.ModelId, ct);
+            await using var result = await adapter.FetchAsync(route.Provider, parsed, route.ModelId, ct);
+            if (IsOfficialPassThrough(route) && result.StatusCode is >= 200 and < 300)
+                codexSessionAdmission.Remember(context);
             if (!result.Streaming)
             {
                 if (result.StatusCode is < 200 or >= 300)
@@ -799,47 +989,48 @@ public sealed class NativeProxyHost
                     _requestLog.Record(new RequestLogEntry
                     {
                         Path = "/v1/messages",
+                        RequestedModel = request.Model,
                         Model = route.ModelId,
                         Provider = route.ProviderId,
                         Status = "error",
                         HttpStatus = result.StatusCode,
-                        ElapsedMs = sw.ElapsedMilliseconds
+                        ElapsedMs = sw.ElapsedMilliseconds,
+                        Error = ExtractErrorMessage(result.JsonBody)
                     });
                     return;
                 }
-                var text = ExtractUpstreamText(result.JsonBody, route.Provider.Adapter);
-                var responseJson = new JsonObject
+                var message = result.Message ?? new OcxMessage
                 {
-                    ["id"] = "msg_" + Guid.NewGuid().ToString("N")[..24],
-                    ["type"] = "message",
-                    ["role"] = "assistant",
-                    ["model"] = route.ModelId,
-                    ["content"] = new JsonArray
-                    {
-                        new JsonObject { ["type"] = "text", ["text"] = text }
-                    },
-                    ["stop_reason"] = "end_turn",
-                    ["stop_sequence"] = null,
-                    ["usage"] = new JsonObject
-                    {
-                        ["input_tokens"] = ExtractUsageToken(result.JsonBody, "prompt_tokens") ?? 0,
-                        ["output_tokens"] = ExtractUsageToken(result.JsonBody, "completion_tokens") ?? 0
-                    }
+                    Role = "assistant",
+                    Content = ExtractUpstreamText(result.JsonBody, route.Provider.Adapter)
                 };
+                var promptTokens = result.Usage?.PromptTokens
+                                   ?? ExtractUsageToken(result.JsonBody, "prompt_tokens")
+                                   ?? 0;
+                var completionTokens = result.Usage?.CompletionTokens
+                                       ?? ExtractUsageToken(result.JsonBody, "completion_tokens")
+                                       ?? 0;
+                var responseJson = BuildAnthropicNonStreamingResponse(
+                    route.ModelId,
+                    message,
+                    result.FinishReason,
+                    promptTokens,
+                    completionTokens);
                 context.Response.ContentType = "application/json; charset=utf-8";
                 await context.Response.WriteAsync(responseJson.ToJsonString(), ct);
                 sw.Stop();
                 _requestLog.Record(new RequestLogEntry
                 {
                     Path = "/v1/messages",
+                    RequestedModel = request.Model,
                     Model = route.ModelId,
                     Provider = route.ProviderId,
-                    Status = "completed",
+                    Status = result.FinishReason is "length" or "max_tokens" ? "incomplete" : "completed",
                     HttpStatus = result.StatusCode,
                     ElapsedMs = sw.ElapsedMilliseconds,
-                    PromptTokens = ExtractUsageToken(result.JsonBody, "prompt_tokens"),
-                    CompletionTokens = ExtractUsageToken(result.JsonBody, "completion_tokens"),
-                    TotalTokens = ExtractUsageTotal(result.JsonBody)
+                    PromptTokens = promptTokens,
+                    CompletionTokens = completionTokens,
+                    TotalTokens = promptTokens + completionTokens
                 });
                 return;
             }
@@ -855,11 +1046,16 @@ public sealed class NativeProxyHost
             _requestLog.Record(new RequestLogEntry
             {
                 Path = "/v1/messages",
+                RequestedModel = request.Model,
                 Model = route.ModelId,
                 Provider = route.ProviderId,
-                Status = "completed",
-                HttpStatus = 200,
-                ElapsedMs = sw.ElapsedMilliseconds
+                Status = outbound.Status,
+                HttpStatus = outbound.Status == "completed" ? 200 : 500,
+                ElapsedMs = sw.ElapsedMilliseconds,
+                PromptTokens = outbound.Usage?.PromptTokens,
+                CompletionTokens = outbound.Usage?.CompletionTokens,
+                TotalTokens = outbound.Usage?.TotalTokens,
+                Error = outbound.ErrorMessage
             });
         });
 
@@ -1099,6 +1295,114 @@ public sealed class NativeProxyHost
         }
     }
 
+    public static JsonObject BuildResponsesNonStreamingResponse(
+        string modelId,
+        OcxMessage? message,
+        OcxUsage? usage,
+        string? finishReason)
+    {
+        var output = new JsonArray();
+        var text = message?.Content?.ToString();
+        if (!string.IsNullOrEmpty(text))
+        {
+            output.Add(new JsonObject
+            {
+                ["type"] = "message",
+                ["id"] = "msg_" + Guid.NewGuid().ToString("N")[..24],
+                ["status"] = "completed",
+                ["role"] = "assistant",
+                ["content"] = new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["type"] = "output_text",
+                        ["text"] = text,
+                        ["annotations"] = new JsonArray()
+                    }
+                }
+            });
+        }
+        foreach (var call in message?.ToolCalls ?? Enumerable.Empty<OcxToolCall>())
+        {
+            output.Add(new JsonObject
+            {
+                ["type"] = "function_call",
+                ["id"] = "fc_" + Guid.NewGuid().ToString("N")[..24],
+                ["call_id"] = call.Id ?? "call_" + Guid.NewGuid().ToString("N")[..24],
+                ["name"] = call.Function?.Name ?? string.Empty,
+                ["arguments"] = call.Function?.Arguments ?? "{}"
+            });
+        }
+        var incomplete = finishReason is "length" or "max_tokens";
+        var response = new JsonObject
+        {
+            ["id"] = "resp_" + Guid.NewGuid().ToString("N")[..24],
+            ["object"] = "response",
+            ["created_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            ["status"] = incomplete ? "incomplete" : "completed",
+            ["model"] = modelId,
+            ["output"] = output,
+            ["usage"] = ResponsesUsage.Build(
+                usage is null ? null : JsonSerializer.SerializeToElement(usage)),
+            ["end_turn"] = !incomplete && (message?.ToolCalls?.Count ?? 0) == 0
+        };
+        if (incomplete)
+        {
+            response["incomplete_details"] = new JsonObject
+            {
+                ["reason"] = "max_output_tokens"
+            };
+        }
+        return response;
+    }
+
+    public static JsonObject BuildAnthropicNonStreamingResponse(
+        string modelId,
+        OcxMessage message,
+        string? finishReason,
+        long promptTokens,
+        long completionTokens)
+    {
+        var content = new JsonArray();
+        var text = message.Content?.ToString();
+        if (!string.IsNullOrEmpty(text))
+            content.Add(new JsonObject { ["type"] = "text", ["text"] = text });
+        foreach (var call in message.ToolCalls ?? Enumerable.Empty<OcxToolCall>())
+        {
+            JsonNode input;
+            try { input = JsonNode.Parse(call.Function?.Arguments ?? "{}") ?? new JsonObject(); }
+            catch (JsonException) { input = new JsonObject { ["input"] = call.Function?.Arguments ?? string.Empty }; }
+            content.Add(new JsonObject
+            {
+                ["type"] = "tool_use",
+                ["id"] = call.Id ?? "toolu_" + Guid.NewGuid().ToString("N")[..24],
+                ["name"] = call.Function?.Name ?? string.Empty,
+                ["input"] = input
+            });
+        }
+        var stopReason = finishReason switch
+        {
+            "tool_calls" => "tool_use",
+            "length" or "max_tokens" => "max_tokens",
+            _ => "end_turn"
+        };
+        return new JsonObject
+        {
+            ["id"] = "msg_" + Guid.NewGuid().ToString("N")[..24],
+            ["type"] = "message",
+            ["role"] = "assistant",
+            ["model"] = modelId,
+            ["content"] = content,
+            ["stop_reason"] = stopReason,
+            ["stop_sequence"] = null,
+            ["usage"] = new JsonObject
+            {
+                ["input_tokens"] = promptTokens,
+                ["output_tokens"] = completionTokens
+            }
+        };
+    }
+
     private static string ExtractUpstreamText(string? jsonBody, string adapter)
     {
         if (string.IsNullOrWhiteSpace(jsonBody)) return string.Empty;
@@ -1169,6 +1473,35 @@ public sealed class NativeProxyHost
             }
         }
         return builder.ToString();
+    }
+
+    private static string? ExtractErrorMessage(string? jsonBody)
+    {
+        if (string.IsNullOrWhiteSpace(jsonBody)) return null;
+        try
+        {
+            using var json = JsonDocument.Parse(jsonBody);
+            var root = json.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
+            if (root.TryGetProperty("error", out var error))
+            {
+                if (error.ValueKind == JsonValueKind.String) return error.GetString();
+                if (error.ValueKind == JsonValueKind.Object)
+                {
+                    if (error.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.String)
+                        return message.GetString();
+                    if (error.TryGetProperty("detail", out var detail) && detail.ValueKind == JsonValueKind.String)
+                        return detail.GetString();
+                }
+            }
+            return root.TryGetProperty("message", out var direct) && direct.ValueKind == JsonValueKind.String
+                ? direct.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static void AppendAnyText(StringBuilder builder, JsonElement content)
@@ -1247,15 +1580,88 @@ public sealed class NativeProxyHost
     private static bool AdmittedInference(HttpContext context, string? token)
     {
         if (Admitted(context, token)) return true;
-        // openai_base_url keeps Codex on its built-in provider, which does not
-        // support Total Manager's custom admission header. It does, however,
-        // send the user's normal Bearer authorization. Accept that only on the
-        // loopback listener and only for inference/model routes.
-        if (context.Connection.RemoteIpAddress is not { } remote || !System.Net.IPAddress.IsLoopback(remote))
-            return false;
+        if (string.IsNullOrWhiteSpace(token)) return false;
+        // Inference clients that cannot set X-CMM-Admission may use the same
+        // per-installation admission secret as their Bearer credential. Never
+        // accept an arbitrary non-empty Bearer merely because it is loopback:
+        // every process running as the user can reach a loopback listener.
+        var authorization = context.Request.Headers.Authorization.ToString();
+        if (!authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return false;
+        var supplied = authorization["Bearer ".Length..].Trim();
+        var expectedBytes = Encoding.UTF8.GetBytes(token);
+        var suppliedBytes = Encoding.UTF8.GetBytes(supplied);
+        return expectedBytes.Length == suppliedBytes.Length
+               && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                   expectedBytes,
+                   suppliedBytes);
+    }
+
+    private static bool HasOfficialBearer(HttpContext context)
+    {
         var authorization = context.Request.Headers.Authorization.ToString();
         return authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-               && authorization.Length > "Bearer ".Length;
+               && !string.IsNullOrWhiteSpace(authorization["Bearer ".Length..]);
+    }
+
+    private static bool IsOfficialPassThrough(RouteResult route) =>
+        route.Provider.Adapter == "openai-responses"
+        && OpenAiResponsesAdapter.IsOfficialCodexProvider(route.Provider);
+
+    private sealed class CodexSessionAdmissionRegistry
+    {
+        private static readonly TimeSpan Lifetime = TimeSpan.FromHours(8);
+        private const int MaximumEntries = 8;
+        private readonly object _gate = new();
+        private readonly Dictionary<string, DateTimeOffset> _validated = new(StringComparer.Ordinal);
+
+        public bool Contains(HttpContext context)
+        {
+            var digest = DigestBearer(context);
+            if (digest is null) return false;
+            var now = DateTimeOffset.UtcNow;
+            lock (_gate)
+            {
+                Prune(now);
+                return _validated.TryGetValue(digest, out var validatedAt)
+                       && now - validatedAt <= Lifetime;
+            }
+        }
+
+        public void Remember(HttpContext context)
+        {
+            var digest = DigestBearer(context);
+            if (digest is null) return;
+            var now = DateTimeOffset.UtcNow;
+            lock (_gate)
+            {
+                Prune(now);
+                if (_validated.Count >= MaximumEntries && !_validated.ContainsKey(digest))
+                {
+                    var oldest = _validated.OrderBy(pair => pair.Value).First().Key;
+                    _validated.Remove(oldest);
+                }
+                _validated[digest] = now;
+            }
+        }
+
+        private void Prune(DateTimeOffset now)
+        {
+            foreach (var key in _validated
+                         .Where(pair => now - pair.Value > Lifetime)
+                         .Select(pair => pair.Key)
+                         .ToArray())
+                _validated.Remove(key);
+        }
+
+        private static string? DigestBearer(HttpContext context)
+        {
+            var authorization = context.Request.Headers.Authorization.ToString();
+            if (!authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return null;
+            var supplied = authorization["Bearer ".Length..].Trim();
+            if (string.IsNullOrWhiteSpace(supplied)) return null;
+            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                Encoding.UTF8.GetBytes(supplied)));
+        }
     }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)

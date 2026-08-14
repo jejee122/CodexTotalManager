@@ -599,7 +599,16 @@ public sealed class DreamSkinService
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             try { process.Kill(true); } catch { }
+            try { await process.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
             return new ProcessResult(-1, await stdout, await stderr, true);
+        }
+        catch (OperationCanceledException)
+        {
+            try { process.Kill(true); } catch { }
+            try { await process.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
+            try { await stdout; } catch { }
+            try { await stderr; } catch { }
+            throw;
         }
     }
 
@@ -612,9 +621,19 @@ public sealed class DreamSkinService
             if (full.Equals(bundled, StringComparison.OrdinalIgnoreCase)
                 || full.StartsWith(bundled + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             {
-                var attributes = File.GetAttributes(full);
-                if ((attributes & FileAttributes.ReparsePoint) != 0) return false;
-                return true;
+                var bundledCurrent = full;
+                while (true)
+                {
+                    if (File.Exists(bundledCurrent) || Directory.Exists(bundledCurrent))
+                    {
+                        var attributes = File.GetAttributes(bundledCurrent);
+                        if ((attributes & FileAttributes.ReparsePoint) != 0) return false;
+                    }
+                    var trimmed = bundledCurrent.TrimEnd(Path.DirectorySeparatorChar);
+                    if (trimmed.Equals(bundled, StringComparison.OrdinalIgnoreCase)) return true;
+                    bundledCurrent = Path.GetDirectoryName(trimmed) ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(bundledCurrent)) return false;
+                }
             }
             var root = StateRoot.TrimEnd(Path.DirectorySeparatorChar);
             if (!full.Equals(root, StringComparison.OrdinalIgnoreCase)

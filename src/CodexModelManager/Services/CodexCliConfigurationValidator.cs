@@ -164,7 +164,10 @@ public sealed class CodexCliConfigurationValidator : ICodexConfigValidator
         finally
         {
             if (validationDirectory is not null)
-                cleanupSucceeded = TryDeleteValidationDirectory(validationDirectory, validationId);
+                cleanupSucceeded = await TryDeleteValidationDirectoryAsync(
+                    validationDirectory,
+                    validationId,
+                    CancellationToken.None).ConfigureAwait(false);
         }
 
         result ??= new CodexConfigValidationResult(
@@ -373,7 +376,10 @@ public sealed class CodexCliConfigurationValidator : ICodexConfigValidator
         return directory;
     }
 
-    private bool TryDeleteValidationDirectory(string validationDirectory, string validationId)
+    private async Task<bool> TryDeleteValidationDirectoryAsync(
+        string validationDirectory,
+        string validationId,
+        CancellationToken cancellationToken)
     {
         if (!IsExactValidationChild(validationDirectory, validationId)) return false;
         for (var attempt = 0; attempt < 6; attempt++)
@@ -394,7 +400,7 @@ public sealed class CodexCliConfigurationValidator : ICodexConfigValidator
                 if (attempt == 5) return false;
             }
 
-            Thread.Sleep(100 * (1 << attempt));
+            await Task.Delay(100 * (1 << attempt), cancellationToken).ConfigureAwait(false);
         }
 
         return false;

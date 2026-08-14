@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "product": "CodexTotalManager",
+  "productVersion": "3.0.0-rc.27",
+  "candidateManifestSha256": "REPLACE_WITH_64_CHARACTER_SHA256_OF_payload-manifest.json",
+  "dedicatedTestComputer": true,
+  "testComputerRunId": "REPLACE_WITH_A_UUID_CREATED_FOR_THIS_TEST_RUN",
+  "realCodexVersion": "REPLACE_WITH_TESTED_CODEX_DESKTOP_VERSION",
+  "executedAtUtc": "REPLACE_WITH_UTC_TIME_AFTER_THE_CANDIDATE_WAS_BUILT",
+  "outcome": "PASSED",
+  "checks": {
+    "officialModelMessaging": true,
+    "officialStreamingToolCalls": true,
+    "thirdPartyModelMessaging": true,
+    "thirdPartyToolCalls": true,
+    "conversationContinuity": true,
+    "accountPoolSwitch": true,
+    "billingAttribution": true,
+    "codexNotRestarted": true,
+    "skinCompatibility": true,
+    "disconnectRestoresConfiguration": true
+  }
+}

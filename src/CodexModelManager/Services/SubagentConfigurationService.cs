@@ -24,6 +24,7 @@ public sealed class SubagentConfigurationService
     private readonly string _dataPath;
     private readonly string _backupRoot;
     private readonly string _bridgeExecutablePath;
+    private readonly bool _bridgePathTracksCurrentExecutable;
     private readonly string _bridgeStatePath;
     private readonly Func<CancellationToken, Task<string?>>? _applyBlockReason;
     private readonly ICodexConfigValidator _codexConfigValidator;
@@ -54,9 +55,8 @@ public sealed class SubagentConfigurationService
         _agentsDirectory = agentsDirectory ?? Path.Combine(userProfile, ".codex", "agents");
         _dataPath = dataPath ?? Path.Combine(localData, "subagents.json");
         _backupRoot = backupRoot ?? Path.Combine(localData, "backups", "subagents");
-        _bridgeExecutablePath = Path.GetFullPath(bridgeExecutablePath
-                                                 ?? Environment.ProcessPath
-                                                 ?? throw new InvalidOperationException("无法确定总管家可执行文件路径。"));
+        _bridgePathTracksCurrentExecutable = string.IsNullOrWhiteSpace(bridgeExecutablePath);
+        _bridgeExecutablePath = ResolveBridgeExecutablePath(bridgeExecutablePath);
         _bridgeStatePath = bridgeStatePath ?? Path.Combine(localData, "external-worker-state.json");
         _applyBlockReason = applyBlockReason;
         _codexConfigValidator = codexConfigValidator
@@ -71,7 +71,7 @@ public sealed class SubagentConfigurationService
     public string AgentsDirectory => _agentsDirectory;
     public string DataPath => _dataPath;
     public string BackupRoot => _backupRoot;
-    public string BridgeExecutablePath => _bridgeExecutablePath;
+    public string BridgeExecutablePath => CurrentBridgeExecutablePath();
     public string BridgeStatePath => _bridgeStatePath;
 
     public IReadOnlyList<SubagentRoleDefinition> Roles { get; } = new[]
@@ -401,8 +401,9 @@ public sealed class SubagentConfigurationService
 
         var nativeCount = normalized.Count(item => item.WorkerKind == SubagentWorkerKind.CodexNative);
         var externalCount = normalized.Count(item => item.WorkerKind == SubagentWorkerKind.External);
+        var bridgeExecutablePath = CurrentBridgeExecutablePath();
         if (externalCount > 0
-            && (!Path.IsPathFullyQualified(_bridgeExecutablePath) || !File.Exists(_bridgeExecutablePath)))
+            && (!Path.IsPathFullyQualified(bridgeExecutablePath) || !File.Exists(bridgeExecutablePath)))
             issues.Add("总管家外部纯文本 MCP 可执行文件不存在或不是绝对路径，不能启用桥接。");
         var summary = issues.Count > 0
             ? $"发现 {issues.Count} 个问题，尚未写入任何文件。"
@@ -824,11 +825,12 @@ public sealed class SubagentConfigurationService
 
     private string BuildMcpTomlBody()
     {
-        if (!Path.IsPathFullyQualified(_bridgeExecutablePath) || !File.Exists(_bridgeExecutablePath))
+        var bridgeExecutablePath = CurrentBridgeExecutablePath();
+        if (!Path.IsPathFullyQualified(bridgeExecutablePath) || !File.Exists(bridgeExecutablePath))
             throw new InvalidOperationException("总管家外部纯文本 MCP 可执行文件不存在或路径不安全。");
         var builder = new StringBuilder();
         builder.AppendLine(ManagedTomlBlockEditor.TargetTableHeader);
-        builder.Append("command = ").AppendLine(TomlString(_bridgeExecutablePath));
+        builder.Append("command = ").AppendLine(TomlString(bridgeExecutablePath));
         builder.AppendLine("args = [\"--external-worker-mcp\"]");
         builder.AppendLine("enabled = true");
         builder.AppendLine("required = false");
@@ -837,6 +839,20 @@ public sealed class SubagentConfigurationService
         builder.AppendLine("startup_timeout_sec = 20");
         builder.Append("tool_timeout_sec = 300");
         return builder.ToString();
+    }
+
+    private string CurrentBridgeExecutablePath()
+    {
+        if (!_bridgePathTracksCurrentExecutable) return _bridgeExecutablePath;
+        var current = Environment.ProcessPath;
+        return string.IsNullOrWhiteSpace(current) ? _bridgeExecutablePath : Path.GetFullPath(current);
+    }
+
+    private static string ResolveBridgeExecutablePath(string? configuredPath)
+    {
+        var path = configuredPath ?? Environment.ProcessPath
+                   ?? throw new InvalidOperationException("无法确定总管家可执行文件路径。");
+        return Path.GetFullPath(path);
     }
 
     private void ValidateManagedAgentOwnership(

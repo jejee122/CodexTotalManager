@@ -11,7 +11,11 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
     $InstallRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CodexTotalManager'
 }
 $installFull = [IO.Path]::GetFullPath($InstallRoot)
-$localData = ([IO.Path]::GetFullPath([Environment]::GetFolderPath('LocalApplicationData'))).TrimEnd('\') + '\'
+$localDataRoot = ([IO.Path]::GetFullPath([Environment]::GetFolderPath('LocalApplicationData'))).TrimEnd('\')
+$localData = $localDataRoot + '\'
+if ($installFull.TrimEnd('\').Equals($localDataRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Repair root must be a child of LocalApplicationData, not LocalApplicationData itself: $installFull"
+}
 if (-not ($installFull + '\').StartsWith($localData, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Repair root must remain below LocalApplicationData: $installFull"
 }

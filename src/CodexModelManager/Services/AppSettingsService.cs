@@ -9,7 +9,9 @@ public sealed class AppSettingsService
 {
     private readonly string _directory;
     private readonly string _path;
+    private readonly object _saveGate = new();
     private AppSettings _settings;
+    private string _loadedFingerprint;
 
     public string? LoadWarning { get; private set; }
 
@@ -19,6 +21,7 @@ public sealed class AppSettingsService
         _path = Path.Combine(_directory, "settings.json");
         Directory.CreateDirectory(_directory);
         _settings = Load();
+        _loadedFingerprint = LocalFileTransaction.Fingerprint(_path);
     }
 
     public static string ResolveDefaultDataDirectory()
@@ -286,11 +289,17 @@ public sealed class AppSettingsService
 
     private void Save()
     {
-        EnsureWritable();
-        Directory.CreateDirectory(_directory);
-        var temp = _path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(_settings, JsonOptions));
-        File.Move(temp, _path, true);
+        lock (_saveGate)
+        {
+            EnsureWritable();
+            using var fileLock = LocalFileTransaction.Acquire(_path);
+            var currentFingerprint = LocalFileTransaction.Fingerprint(_path);
+            if (!string.Equals(currentFingerprint, _loadedFingerprint, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    "设置文件已被另一个总管家进程修改；已拒绝覆盖，请重新打开设置后再保存。");
+            LocalFileTransaction.WriteAtomic(_path, JsonSerializer.Serialize(_settings, JsonOptions));
+            _loadedFingerprint = LocalFileTransaction.Fingerprint(_path);
+        }
     }
 
     private void EnsureWritable()

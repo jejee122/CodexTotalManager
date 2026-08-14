@@ -119,7 +119,7 @@ public sealed class OpenCodexProcessService
         {
             using var process = System.Diagnostics.Process.GetProcessById(pid);
             process.Kill(true);
-            await process.WaitForExitAsync(cancellationToken);
+            await process.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
         }
         finally
         {
@@ -217,7 +217,7 @@ public sealed class OpenCodexProcessService
                 {
                     using var killer = System.Diagnostics.Process.GetProcessById(record.Value.Pid);
                     killer.Kill(true);
-                    await killer.WaitForExitAsync(cancellationToken);
+                    await killer.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
                 }
                 catch
                 {

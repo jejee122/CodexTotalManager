@@ -664,11 +664,11 @@ public partial class SubagentManagementView : UserControl
         SetBusy(true, $"正在通过 {selected.RoleId} 进行真实外部路由测试…");
         try
         {
-            var completion = await _services.ExternalWorker.DelegateAsync(new ExternalWorkerInvocation(
+            var completion = await _services.WorkerBroker.DelegateAsync(
                 selected.RoleId,
                 "这是总管家桥接测试。只返回 OK_TEXT_WORKER。不要声称访问过任何文件。",
                 null,
-                64));
+                64);
             SetBusy(false);
             await RefreshAsync();
             ResultText.Text = $"真实调用成功：角色 {completion.RoleId}；请求 {completion.ConfiguredModel}；"
@@ -792,18 +792,7 @@ public partial class SubagentManagementView : UserControl
     }
 
     private static bool IsCodexProcessRunning()
-    {
-        try
-        {
-            var currentId = Environment.ProcessId;
-            return Process.GetProcesses().Any(process => process.Id != currentId
-                && process.ProcessName.Equals("Codex", StringComparison.OrdinalIgnoreCase));
-        }
-        catch
-        {
-            return true;
-        }
-    }
+        => CodexDesktopProcessDetector.IsRunning();
 }
 
 public sealed record SubagentModelChoice(

@@ -16,6 +16,7 @@ public sealed class PoolCatalogService
     private readonly HashSet<int> _reservedPorts;
     private readonly object _gate = new();
     private PoolCatalogDocument _catalog;
+    private string _loadedFingerprint;
 
     public string? LoadWarning { get; private set; }
     public string FilePath => _path;
@@ -76,6 +77,7 @@ public sealed class PoolCatalogService
             : new HashSet<int>(reservedPorts);
         Directory.CreateDirectory(directory);
         _catalog = Load();
+        _loadedFingerprint = LocalFileTransaction.Fingerprint(_path);
         if (LoadWarning is not null)
         {
             _catalog = CreateSafeFallbackCatalog();
@@ -261,7 +263,7 @@ public sealed class PoolCatalogService
                 throw new InvalidOperationException("这个卡片不是 Codex 原生账号。");
             if (!string.Equals(pool.NativeAccountId, accountId, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("账号卡片与 OpenCodex 账号不匹配，已停止删除。");
-            if (_catalog.Active.PoolId.Equals(pool.Id, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(_catalog.Active.PoolId, pool.Id, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("正在使用的账号不能删除，请先切到其他账号。");
 
             if (pool.Id.Equals(PoolCatalogDefaults.PlusPoolId, StringComparison.OrdinalIgnoreCase))
@@ -291,9 +293,24 @@ public sealed class PoolCatalogService
                 && pool.Transport == PoolTransport.NativeCodexAccount
                 && string.IsNullOrWhiteSpace(pool.NativeAccountId))
                 throw new InvalidOperationException("原生 Codex 账号尚未绑定，不能启用。");
-            if (!enabled && _catalog.Active.PoolId.Equals(pool.Id, StringComparison.OrdinalIgnoreCase))
+            if (!enabled && string.Equals(_catalog.Active.PoolId, pool.Id, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("请先切到其他号池，再停用当前号池。");
             pool.Enabled = enabled;
+            Save();
+        }
+    }
+
+    public void RemoveCliProxyPool(string id)
+    {
+        lock (_gate)
+        {
+            EnsureWritable();
+            var pool = RequirePool(id);
+            if (pool.Transport != PoolTransport.CliProxyApi || pool.IsProtected)
+                throw new InvalidOperationException("只能删除用户创建的独立 CLIProxy 号池。");
+            if (string.Equals(_catalog.Active.PoolId, pool.Id, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("请先切到其他号池，再删除当前号池。");
+            _catalog.Pools.Remove(pool);
             Save();
         }
     }
@@ -400,7 +417,7 @@ public sealed class PoolCatalogService
                 if (plus.Enabled) { plus.Enabled = false; changed = true; }
                 const string unboundDescription = "尚未绑定真实 Codex 账号；绑定成功前保持停用，不会参与切换或自动路由。";
                 if (plus.Description != unboundDescription) { plus.Description = unboundDescription; changed = true; }
-                if (_catalog.Active.PoolId.Equals(plus.Id, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(_catalog.Active.PoolId, plus.Id, StringComparison.OrdinalIgnoreCase))
                 {
                     _catalog.Active = new ActivePoolState();
                     changed = true;
@@ -421,7 +438,8 @@ public sealed class PoolCatalogService
                 _catalog.SchemaVersion = CurrentSchemaVersion;
                 changed = true;
             }
-            if (_catalog.Pools.All(item => item.Id != _catalog.Active.PoolId))
+            if (_catalog.Pools.All(item =>
+                    !string.Equals(item.Id, _catalog.Active.PoolId, StringComparison.OrdinalIgnoreCase)))
             {
                 _catalog.Active = new ActivePoolState();
                 changed = true;
@@ -459,6 +477,12 @@ public sealed class PoolCatalogService
             throw new InvalidOperationException("当前号池状态为空对象。");
         if (_catalog.Pools.Any(pool => pool is null))
             throw new InvalidOperationException("号池列表包含空项目。");
+        if (string.IsNullOrWhiteSpace(_catalog.Active.PoolId)
+            || string.IsNullOrWhiteSpace(_catalog.Active.Model))
+            throw new InvalidOperationException("当前号池 ID 或模型为空。");
+        if (_catalog.Pools.Any(pool => string.IsNullOrWhiteSpace(pool.Id)
+                                       || string.IsNullOrWhiteSpace(pool.DisplayName)))
+            throw new InvalidOperationException("号池列表包含缺少 ID 或名称的项目。");
 
         var duplicateIds = _catalog.Pools
             .GroupBy(pool => pool.Id, StringComparer.OrdinalIgnoreCase)
@@ -572,6 +596,14 @@ public sealed class PoolCatalogService
                 throw new InvalidDataException($"不支持的号池清单版本：{snapshot.SchemaVersion}。");
             if (snapshot.Pools is null || snapshot.Pools.Count == 0)
                 throw new InvalidDataException("号池清单没有任何来源。");
+            if (snapshot.Active is null
+                || string.IsNullOrWhiteSpace(snapshot.Active.PoolId)
+                || string.IsNullOrWhiteSpace(snapshot.Active.Model))
+                throw new InvalidDataException("当前号池 ID 或模型为空。");
+            if (snapshot.Pools.Any(pool => pool is null
+                                           || string.IsNullOrWhiteSpace(pool.Id)
+                                           || string.IsNullOrWhiteSpace(pool.DisplayName)))
+                throw new InvalidDataException("号池清单包含空项目或缺少 ID/名称的项目。");
             var duplicateIds = snapshot.Pools
                 .GroupBy(pool => pool.Id, StringComparer.OrdinalIgnoreCase)
                 .Where(group => group.Count() != 1)
@@ -641,9 +673,13 @@ public sealed class PoolCatalogService
     private void Save()
     {
         EnsureWritable();
-        var temp = _path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(_catalog, JsonOptions));
-        File.Move(temp, _path, true);
+        using var fileLock = LocalFileTransaction.Acquire(_path);
+        var currentFingerprint = LocalFileTransaction.Fingerprint(_path);
+        if (!string.Equals(currentFingerprint, _loadedFingerprint, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "号池清单已被另一个总管家进程修改；已拒绝覆盖，请刷新号池后重试。");
+        LocalFileTransaction.WriteAtomic(_path, JsonSerializer.Serialize(_catalog, JsonOptions));
+        _loadedFingerprint = LocalFileTransaction.Fingerprint(_path);
     }
 
     private void EnsureWritable()
@@ -772,7 +808,7 @@ public sealed class PoolCatalogService
             {
                 Id = id,
                 DisplayName = displayName,
-                Description = "One local CLIProxy process, one OAuth account, and one verified port identity.",
+                Description = "一个本机 CLIProxy 进程只绑定一个 OAuth 账号，并使用一个经过校验的独立端口。",
                 Transport = PoolTransport.CliProxyApi,
                 Product = product,
                 Enabled = true,
@@ -786,7 +822,7 @@ public sealed class PoolCatalogService
         }
 
         if (pool.Transport != PoolTransport.CliProxyApi)
-            throw new InvalidOperationException($"Reserved Agent API pool {id} has the wrong transport.");
+            throw new InvalidOperationException($"保留的 Agent API 号池 {id} 类型不正确。");
         var changed = false;
         if (pool.Product != product) { pool.Product = product; changed = true; }
         if (!string.Equals(pool.DisplayName, displayName, StringComparison.Ordinal))
@@ -797,6 +833,12 @@ public sealed class PoolCatalogService
         if (!string.Equals(pool.RouteAlias, routeAlias, StringComparison.Ordinal))
         {
             pool.RouteAlias = routeAlias;
+            changed = true;
+        }
+        const string description = "一个本机 CLIProxy 进程只绑定一个 OAuth 账号，并使用一个经过校验的独立端口。";
+        if (!string.Equals(pool.Description, description, StringComparison.Ordinal))
+        {
+            pool.Description = description;
             changed = true;
         }
         return changed;
@@ -832,6 +874,7 @@ public sealed class PoolCatalogService
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
+        PropertyNameCaseInsensitive = true,
         Converters = { new JsonStringEnumConverter() }
     };
 }

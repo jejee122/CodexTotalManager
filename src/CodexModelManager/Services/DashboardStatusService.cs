@@ -407,6 +407,12 @@ public sealed class DashboardStatusService
             try { process.Kill(true); } catch { }
             return new ProcessResult(-1, await stdout, await stderr, true);
         }
+        catch (OperationCanceledException)
+        {
+            try { process.Kill(true); } catch { }
+            try { await Task.WhenAll(stdout, stderr); } catch { }
+            throw;
+        }
     }
 
     private sealed record ProcessResult(int ExitCode, string Output, string Error, bool TimedOut);

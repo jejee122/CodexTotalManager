@@ -24,6 +24,8 @@ public sealed class CliProxyPoolService
     private readonly PoolCatalogService? _poolCatalog;
     private readonly ConcurrentDictionary<string, Process> _ownedProcesses = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _poolGates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _reconcileGate = new(1, 1);
+    private long _lastReconcileUtcTicks;
 
     public CliProxyPoolService(
         AppSettingsService settings,
@@ -52,6 +54,8 @@ public sealed class CliProxyPoolService
         try
         {
             ValidatePool(pool);
+            if (_clientFactory is null)
+                await ReconcileOwnedInstancesAsync(cancellationToken).ConfigureAwait(false);
             if (ensureRunning && !await EnsureRunningAsync(pool, cancellationToken))
                 throw new InvalidOperationException("CLIProxyAPI 没有启动成功。");
             if (_clientFactory is null
@@ -74,24 +78,33 @@ public sealed class CliProxyPoolService
             try { models = await ReadModelsAsync(pool, cancellationToken); }
             catch { models = Array.Empty<string>(); modelDirectoryFailed = true; }
             var enabledAccountCount = accounts.Count(item => item.Enabled);
-            var accountLayoutValid = accounts.Count == 1 && enabledAccountCount == 1;
+            var accountLayoutValid = roster.Completeness == AccountRosterCompleteness.Complete
+                                     && accounts.Count == 1
+                                     && enabledAccountCount == 1;
             var ready = accountLayoutValid && models.Count > 0;
-            var statusTitle = accounts.Count switch
+            var statusTitle = roster.Completeness switch
             {
-                0 => "待授权",
-                > 1 => "账号冲突，已锁定",
-                _ when enabledAccountCount == 0 => "唯一账号已停用",
-                _ when models.Count == 0 => "待模型验证",
-                _ => "就绪"
+                AccountRosterCompleteness.ReadFailed => "账号清单读取失败，已锁定",
+                not AccountRosterCompleteness.Complete => "账号清单不完整，已锁定",
+                _ => accounts.Count switch
+                {
+                    0 => "待授权",
+                    > 1 => "账号冲突，已锁定",
+                    _ when enabledAccountCount == 0 => "唯一账号已停用",
+                    _ when models.Count == 0 => "待模型验证",
+                    _ => "就绪"
+                }
             };
-            var statusDetail = accounts.Count switch
-            {
-                0 => "这个独立出口还没有账号。每个出口只能放一个 OAuth 账号。",
-                > 1 => $"这个出口发现 {accounts.Count} 个授权文件，已停止使用，避免串号。请把每个账号放到不同的独立出口。",
-                _ when enabledAccountCount == 0 => "这个出口唯一的账号已停用，恢复后才能使用。",
-                _ => $"本机独立进程已隔离运行；唯一账号可用，{models.Count} 个模型。"
-                     + (modelDirectoryFailed ? " 模型目录读取失败，请稍后手动刷新。" : string.Empty)
-            };
+            var statusDetail = roster.Completeness == AccountRosterCompleteness.Complete
+                ? accounts.Count switch
+                {
+                    0 => "这个独立出口还没有账号。每个出口只能放一个 OAuth 账号。",
+                    > 1 => $"这个出口发现 {accounts.Count} 个授权文件，已停止使用，避免串号。请把每个账号放到不同的独立出口。",
+                    _ when enabledAccountCount == 0 => "这个出口唯一的账号已停用，恢复后才能使用。",
+                    _ => $"本机独立进程已隔离运行；唯一账号可用，{models.Count} 个模型。"
+                         + (modelDirectoryFailed ? " 模型目录读取失败，请稍后手动刷新。" : string.Empty)
+                }
+                : "授权清单含未知、缺字段或重复记录，无法证明物理授权文件只有一个，已停止使用。";
             return new PoolBackendSnapshot(
                 ready,
                 statusTitle,
@@ -139,6 +152,7 @@ public sealed class CliProxyPoolService
     {
         var binary = GetBinaryPath();
         VerifyBinary(binary);
+        await ReconcileOwnedInstancesAsync(cancellationToken, force: true).ConfigureAwait(false);
         var instanceDirectory = GetInstanceDirectory(pool);
         var authDirectory = Path.Combine(instanceDirectory, "auth");
         Directory.CreateDirectory(authDirectory);
@@ -300,6 +314,58 @@ public sealed class CliProxyPoolService
         }
     }
 
+    public async Task ReconcileOwnedInstancesAsync(
+        CancellationToken cancellationToken = default,
+        bool force = false)
+    {
+        if (_clientFactory is not null || _poolCatalog is null) return;
+        var nowTicks = DateTimeOffset.UtcNow.UtcTicks;
+        if (!force && nowTicks - Interlocked.Read(ref _lastReconcileUtcTicks) < TimeSpan.FromSeconds(30).Ticks)
+            return;
+        await _reconcileGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            nowTicks = DateTimeOffset.UtcNow.UtcTicks;
+            if (!force && nowTicks - Interlocked.Read(ref _lastReconcileUtcTicks) < TimeSpan.FromSeconds(30).Ticks)
+                return;
+            var binary = GetBinaryPath();
+            VerifyBinary(binary);
+            var catalog = _poolCatalog.GetPoolsFresh()
+                .Where(item => item.Transport == PoolTransport.CliProxyApi)
+                .ToArray();
+            var seen = new HashSet<(int Pid, long StartTicks)>();
+            foreach (var recordPath in EnumerateInstanceRecordPaths())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var trusted = TryGetTrustedRecordedProcess(recordPath, binary);
+                if (trusted is null) continue;
+                if (!seen.Add((trusted.Record.Pid, trusted.Record.ProcessStartUtcTicks)))
+                {
+                    trusted.Process.Dispose();
+                    continue;
+                }
+                var stillOwned = catalog.Any(pool => RecordMatchesCatalog(trusted.Record, pool));
+                if (stillOwned)
+                {
+                    trusted.Process.Dispose();
+                    continue;
+                }
+
+                // This is not a process-name sweep. A process is stopped only after its PID,
+                // start time, listening port, binary path/hash, config hash and controlled
+                // instance directory all match a Manager-written record.
+                await StopProcessAsync(trusted.Process).ConfigureAwait(false);
+                DeleteTrustedRecordFiles(trusted.Record);
+                _ownedProcesses.TryRemove(trusted.Record.PoolId, out _);
+            }
+            Interlocked.Exchange(ref _lastReconcileUtcTicks, nowTicks);
+        }
+        finally
+        {
+            _reconcileGate.Release();
+        }
+    }
+
     public async Task<PoolOAuthStartResult> StartCodexOAuthAsync(
         PoolDefinition pool,
         CancellationToken cancellationToken = default)
@@ -307,6 +373,9 @@ public sealed class CliProxyPoolService
         if (!await EnsureRunningAsync(pool, cancellationToken))
             throw new InvalidOperationException("CLIProxyAPI 没有准备好。");
         var existing = await ReadAccountsAsync(pool, cancellationToken);
+        if (existing.Completeness != AccountRosterCompleteness.Complete)
+            throw new InvalidOperationException(
+                "现有授权清单含未知、缺字段或重复记录，无法安全添加账号。请先清理这个独立出口。");
         if (existing.Accounts.Count > 0)
             throw new InvalidOperationException(
                 $"这个独立出口已经有 {existing.Accounts.Count} 个授权账号，不能继续添加。每个出口只能放一个账号；要加另一个账号，请新建独立出口。");
@@ -419,9 +488,18 @@ public sealed class CliProxyPoolService
         var complete = true;
         foreach (var item in array.EnumerateArray())
         {
+            if (item.ValueKind != JsonValueKind.Object)
+            {
+                complete = false;
+                continue;
+            }
             var provider = ReadString(item, "provider") ?? ReadString(item, "type") ?? string.Empty;
             if (provider.Length > 0 && !provider.Contains("codex", StringComparison.OrdinalIgnoreCase)
-                                    && !provider.Contains("openai", StringComparison.OrdinalIgnoreCase)) continue;
+                                    && !provider.Contains("openai", StringComparison.OrdinalIgnoreCase))
+            {
+                complete = false;
+                continue;
+            }
             var name = ReadString(item, "name") ?? ReadString(item, "id");
             if (string.IsNullOrWhiteSpace(name))
             {
@@ -567,6 +645,28 @@ public sealed class CliProxyPoolService
         return candidate;
     }
 
+    private string GetInstancesRoot() =>
+        Path.GetFullPath(Path.Combine(_settings.DataDirectory, "cli-proxy", "pools"));
+
+    private IEnumerable<string> EnumerateInstanceRecordPaths()
+    {
+        var root = GetInstancesRoot();
+        if (!Directory.Exists(root)) yield break;
+        foreach (var directory in Directory.EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly))
+        {
+            var info = new DirectoryInfo(directory);
+            if ((info.Attributes & FileAttributes.ReparsePoint) != 0
+                || !PoolCatalogService.IsSafeCliPoolId(info.Name)) continue;
+            var primary = Path.Combine(directory, "instance.json");
+            if (File.Exists(primary)) yield return primary;
+            var history = Path.Combine(directory, "instance-history");
+            if (!Directory.Exists(history)
+                || (File.GetAttributes(history) & FileAttributes.ReparsePoint) != 0) continue;
+            foreach (var path in Directory.EnumerateFiles(history, "*.json", SearchOption.TopDirectoryOnly))
+                yield return path;
+        }
+    }
+
     private RecordedInstance? TryGetRecordedProcess(
         PoolDefinition pool,
         string binaryPath,
@@ -576,34 +676,22 @@ public sealed class CliProxyPoolService
         try
         {
             var recordPath = GetInstanceRecordPath(pool);
-            if (!File.Exists(recordPath) || !File.Exists(configPath)) return null;
-            var record = JsonSerializer.Deserialize<CliProxyInstanceRecord>(
-                File.ReadAllText(recordPath, Encoding.UTF8),
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            if (record is null
-                || !record.PoolId.Equals(pool.Id, StringComparison.Ordinal)
-                || !record.ProviderId.Equals(pool.ProviderId, StringComparison.Ordinal)
-                || record.Port != pool.LocalPort
-                || record.Pid <= 0
-                || !record.BinarySha256.Equals(BundledSha256, StringComparison.OrdinalIgnoreCase)
-                || !record.ConfigSha256.Equals(HashFile(configPath), StringComparison.OrdinalIgnoreCase)
-                || GetPidForPort(pool.LocalPort!.Value) != record.Pid)
-                return null;
-
-            var process = Process.GetProcessById(record.Pid);
-            if (process.HasExited
-                || process.StartTime.ToUniversalTime().Ticks != record.ProcessStartUtcTicks
-                || !Path.GetFullPath(process.MainModule?.FileName ?? string.Empty)
-                    .Equals(Path.GetFullPath(binaryPath), StringComparison.OrdinalIgnoreCase))
+            var trusted = TryGetTrustedRecordedProcess(recordPath, binaryPath);
+            if (trusted is null
+                || !RecordMatchesCatalog(trusted.Record, pool)
+                || !Path.GetFullPath(configPath).Equals(
+                    Path.Combine(GetInstanceDirectoryForRecord(trusted.Record), "config.yaml"), StringComparison.OrdinalIgnoreCase)
+                || !File.Exists(configPath)
+                || !trusted.Record.ConfigSha256.Equals(HashFile(configPath), StringComparison.OrdinalIgnoreCase))
             {
-                process.Dispose();
+                trusted?.Process.Dispose();
                 return null;
             }
 
             var desiredHash = HashText(desiredConfig);
             return new RecordedInstance(
-                process,
-                record.ConfigSha256.Equals(desiredHash, StringComparison.OrdinalIgnoreCase));
+                trusted.Process,
+                trusted.Record.ConfigSha256.Equals(desiredHash, StringComparison.OrdinalIgnoreCase));
         }
         catch
         {
@@ -611,27 +699,130 @@ public sealed class CliProxyPoolService
         }
     }
 
+    private TrustedRecordedInstance? TryGetTrustedRecordedProcess(string recordPath, string binaryPath)
+    {
+        try
+        {
+            var fullRecordPath = Path.GetFullPath(recordPath);
+            var record = JsonSerializer.Deserialize<CliProxyInstanceRecord>(
+                File.ReadAllText(fullRecordPath, Encoding.UTF8),
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (record is null
+                || record.SchemaVersion != 2
+                || !PoolCatalogService.IsSafeCliPoolId(record.PoolId)
+                || !string.Equals(record.ProviderId, PoolCatalogService.ExpectedCliProviderId(record.PoolId), StringComparison.Ordinal)
+                || record.Pid <= 0
+                || record.ProcessStartUtcTicks <= 0
+                || !LocalPortPolicy.IsCliProxyPortAllowed(record.Port, _settings.ReservedLocalPorts)
+                || !record.BinarySha256.Equals(BundledSha256, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            var expectedBinaryPath = Path.GetFullPath(binaryPath);
+            if (string.IsNullOrWhiteSpace(record.BinaryPath)
+                || !Path.GetFullPath(record.BinaryPath).Equals(expectedBinaryPath, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            var instanceDirectory = GetInstanceDirectoryForRecord(record);
+            var recordDirectory = Path.GetDirectoryName(fullRecordPath);
+            var historyDirectory = Path.Combine(instanceDirectory, "instance-history");
+            if (!string.Equals(recordDirectory, instanceDirectory, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(recordDirectory, historyDirectory, StringComparison.OrdinalIgnoreCase))
+                return null;
+            if ((File.GetAttributes(instanceDirectory) & FileAttributes.ReparsePoint) != 0
+                || Directory.Exists(historyDirectory)
+                   && (File.GetAttributes(historyDirectory) & FileAttributes.ReparsePoint) != 0)
+                return null;
+
+            var configPath = GetConfigPathForRecord(record);
+            if (!File.Exists(configPath)
+                || !record.ConfigSha256.Equals(HashFile(configPath), StringComparison.OrdinalIgnoreCase)
+                || GetPidForPort(record.Port) != record.Pid)
+                return null;
+            var process = Process.GetProcessById(record.Pid);
+            var processPath = Path.GetFullPath(process.MainModule?.FileName ?? string.Empty);
+            if (process.HasExited
+                || process.StartTime.ToUniversalTime().Ticks != record.ProcessStartUtcTicks
+                || !processPath.Equals(expectedBinaryPath, StringComparison.OrdinalIgnoreCase)
+                || !record.BinarySha256.Equals(HashFile(processPath), StringComparison.OrdinalIgnoreCase))
+            {
+                process.Dispose();
+                return null;
+            }
+            return new TrustedRecordedInstance(record, process);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string GetInstanceDirectoryForRecord(CliProxyInstanceRecord record)
+    {
+        var root = GetInstancesRoot();
+        var candidate = Path.GetFullPath(Path.Combine(root, record.PoolId));
+        if (!candidate.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("CLIProxyAPI instance record escaped the controlled root.");
+        return candidate;
+    }
+
+    private string GetConfigPathForRecord(CliProxyInstanceRecord record) =>
+        string.IsNullOrWhiteSpace(record.ConfigRelativePath)
+            ? Path.Combine(GetInstanceDirectoryForRecord(record), "config.yaml")
+            : ResolveControlledRelativePath(GetInstanceDirectoryForRecord(record), record.ConfigRelativePath);
+
+    private static string ResolveControlledRelativePath(string root, string relativePath)
+    {
+        if (Path.IsPathFullyQualified(relativePath))
+            throw new InvalidOperationException("CLIProxyAPI record config path must be relative.");
+        var fullRoot = Path.GetFullPath(root);
+        var candidate = Path.GetFullPath(Path.Combine(fullRoot, relativePath));
+        if (!candidate.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("CLIProxyAPI record config path escaped the instance directory.");
+        return candidate;
+    }
+
+    private static bool RecordMatchesCatalog(CliProxyInstanceRecord record, PoolDefinition pool) =>
+        pool.Transport == PoolTransport.CliProxyApi
+        && string.Equals(record.PoolId, pool.Id, StringComparison.Ordinal)
+        && string.Equals(record.ProviderId, pool.ProviderId, StringComparison.Ordinal)
+        && record.Port == pool.LocalPort
+        && PoolCatalogService.IsExactCliEndpoint(pool)
+        && PoolCatalogService.IsSafeCliProviderBinding(pool);
+
     private void WriteInstanceRecord(
         PoolDefinition pool,
         Process process,
         string binaryPath,
         string configPath)
     {
+        var historyDirectory = Path.Combine(GetInstanceDirectory(pool), "instance-history");
+        Directory.CreateDirectory(historyDirectory);
+        var startTicks = process.StartTime.ToUniversalTime().Ticks;
+        var configHistoryName = $"{process.Id}-{startTicks}.yaml";
+        var configHistoryPath = Path.Combine(historyDirectory, configHistoryName);
+        File.Copy(configPath, configHistoryPath, overwrite: true);
         var record = new CliProxyInstanceRecord
         {
+            SchemaVersion = 2,
             PoolId = pool.Id,
             ProviderId = pool.ProviderId!,
             Port = pool.LocalPort!.Value,
             Pid = process.Id,
-            ProcessStartUtcTicks = process.StartTime.ToUniversalTime().Ticks,
+            ProcessStartUtcTicks = startTicks,
+            BinaryPath = Path.GetFullPath(binaryPath),
             BinarySha256 = HashFile(binaryPath),
             ConfigSha256 = HashFile(configPath),
+            ConfigRelativePath = Path.Combine("instance-history", configHistoryName).Replace('\\', '/'),
             StartedAt = DateTimeOffset.UtcNow
         };
         var path = GetInstanceRecordPath(pool);
         var temp = path + $".{Guid.NewGuid():N}.tmp";
         File.WriteAllText(temp, JsonSerializer.Serialize(record, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
         File.Move(temp, path, true);
+        var historyPath = Path.Combine(historyDirectory, $"{record.Pid}-{record.ProcessStartUtcTicks}.json");
+        var historyTemp = historyPath + $".{Guid.NewGuid():N}.tmp";
+        File.WriteAllText(historyTemp, JsonSerializer.Serialize(record, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
+        File.Move(historyTemp, historyPath, true);
     }
 
     private void DeleteInstanceRecord(PoolDefinition pool, int expectedPid)
@@ -641,7 +832,15 @@ public sealed class CliProxyPoolService
             var path = GetInstanceRecordPath(pool);
             if (!File.Exists(path)) return;
             var record = JsonSerializer.Deserialize<CliProxyInstanceRecord>(File.ReadAllText(path, Encoding.UTF8));
-            if (record?.Pid == expectedPid) File.Delete(path);
+            if (record?.Pid == expectedPid)
+            {
+                File.Delete(path);
+                var historyPath = Path.Combine(GetInstanceDirectory(pool), "instance-history",
+                    $"{record.Pid}-{record.ProcessStartUtcTicks}.json");
+                if (File.Exists(historyPath)) File.Delete(historyPath);
+                var configHistoryPath = GetConfigPathForRecord(record);
+                if (File.Exists(configHistoryPath)) File.Delete(configHistoryPath);
+            }
         }
         catch
         {
@@ -692,17 +891,49 @@ public sealed class CliProxyPoolService
     }
 
     private sealed record RecordedInstance(Process Process, bool ConfigurationMatches);
+    private sealed record TrustedRecordedInstance(CliProxyInstanceRecord Record, Process Process);
 
     private sealed class CliProxyInstanceRecord
     {
+        public int SchemaVersion { get; set; } = 1;
         public string PoolId { get; set; } = string.Empty;
         public string ProviderId { get; set; } = string.Empty;
         public int Port { get; set; }
         public int Pid { get; set; }
         public long ProcessStartUtcTicks { get; set; }
+        public string BinaryPath { get; set; } = string.Empty;
         public string BinarySha256 { get; set; } = string.Empty;
         public string ConfigSha256 { get; set; } = string.Empty;
+        public string ConfigRelativePath { get; set; } = string.Empty;
         public DateTimeOffset StartedAt { get; set; }
+    }
+
+    private void DeleteTrustedRecordFiles(CliProxyInstanceRecord record)
+    {
+        try
+        {
+            var directory = GetInstanceDirectoryForRecord(record);
+            foreach (var path in new[]
+                     {
+                         Path.Combine(directory, "instance.json"),
+                         Path.Combine(directory, "instance-history", $"{record.Pid}-{record.ProcessStartUtcTicks}.json"),
+                         GetConfigPathForRecord(record)
+                     })
+            {
+                if (!File.Exists(path)) continue;
+                if (path.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (record.ConfigSha256.Equals(HashFile(path), StringComparison.OrdinalIgnoreCase)) File.Delete(path);
+                    continue;
+                }
+                var candidate = JsonSerializer.Deserialize<CliProxyInstanceRecord>(File.ReadAllText(path, Encoding.UTF8));
+                if (candidate?.Pid == record.Pid
+                    && candidate.ProcessStartUtcTicks == record.ProcessStartUtcTicks) File.Delete(path);
+            }
+        }
+        catch
+        {
+        }
     }
 
     private static void RestrictDirectoryToCurrentUser(string directory)

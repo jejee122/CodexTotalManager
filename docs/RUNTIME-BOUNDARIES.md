@@ -71,3 +71,19 @@ include a source commit, build manifest, dependency manifest, test evidence,
 runtime-resource manifest, rollback package, and an explicit `DEPLOYABLE`
 decision. Replacing the currently installed Manager requires a separate user
 approval.
+
+Automated local build, security, integration, protocol and test-double evidence
+can advance a package only to `READY_FOR_EXTERNAL_BUSINESS_VALIDATION`. A
+`DEPLOYABLE` decision additionally requires a dedicated-test-computer evidence
+document whose version and manifest SHA-256 match the exact candidate package.
+All required real-Codex checks must be explicitly true; a command-line switch by
+itself is never deployment acceptance.
+
+## Account-usage retention
+
+Monthly account-usage files are durable audit and deduplication evidence, not
+ordinary disposable logs. Automatic deletion or in-place compaction is disabled
+until a generation-based compactor can prove snapshot equivalence, replay
+deduplication, cross-process atomicity, tamper detection and crash rollback. The
+required transaction and acceptance matrix are defined in
+`docs/LEDGER-RETENTION.md`.

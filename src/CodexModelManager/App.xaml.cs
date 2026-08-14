@@ -4,6 +4,8 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Windows.Threading;
 using CodexModelManager.Services;
 
 namespace CodexModelManager;
@@ -11,11 +13,13 @@ namespace CodexModelManager;
 public partial class App : Application
 {
     private Mutex? _singleInstanceMutex;
+    private int _crashHandling;
 
     protected override void OnStartup(StartupEventArgs e)
     {
         EnsureWindowsDirectoryEnvironment();
         RuntimeMode.Initialize(e.Args);
+        RegisterGlobalExceptionHandlers();
 
         if (RuntimeMode.ContainsBlockedServiceCommand(e.Args))
         {
@@ -184,39 +188,48 @@ public partial class App : Application
                 var dataIndex = Array.FindIndex(e.Args, arg => string.Equals(arg, "--data-root", StringComparison.OrdinalIgnoreCase));
                 var dataRoot = dataIndex >= 0 && dataIndex + 1 < e.Args.Length ? e.Args[dataIndex + 1] : null;
 
-                var engine = new NativeEngineService();
-                if (!engine.Start(port, dataRoot))
+                using var lifetime = new CancellationTokenSource();
+                var interruptCount = 0;
+                ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
                 {
-                    Console.WriteLine($"NATIVE_ENGINE_FAILED: {engine.StateDetail}");
-                    Shutdown(2);
-                    return;
-                }
-                Task.Delay(4000).GetAwaiter().GetResult();
-                if (!Task.Run(() => engine.IsHealthyAsync()).GetAwaiter().GetResult())
-                {
-                    var diagnostic = $"NATIVE_ENGINE_UNHEALTHY: {engine.StateDetail}; {engine.Diagnose()}";
-                    Console.WriteLine(diagnostic);
-                    var directory = DiagnosticDirectory(dataRoot);
-                    Directory.CreateDirectory(directory);
-                    File.WriteAllText(Path.Combine(directory, "native-engine.txt"), diagnostic);
-                    engine.Stop();
-                    Shutdown(3);
-                    return;
-                }
-                Console.WriteLine($"NATIVE_ENGINE_READY: port={port}; dataRoot={engine.EngineDataRoot}");
-                var lifetime = new CancellationTokenSource();
-                Console.CancelKeyPress += (_, eventArgs) =>
-                {
-                    eventArgs.Cancel = true;
-                    lifetime.Cancel();
+                    if (Interlocked.Increment(ref interruptCount) == 1)
+                    {
+                        eventArgs.Cancel = true;
+                        lifetime.Cancel();
+                        Console.WriteLine("NATIVE_ENGINE_STOPPING");
+                    }
                 };
-                while (!lifetime.IsCancellationRequested)
+                Console.CancelKeyPress += cancelHandler;
+                var engine = new NativeEngineService();
+                try
                 {
-                    Task.Delay(500, lifetime.Token).GetAwaiter().GetResult();
+                    if (!engine.Start(port, dataRoot))
+                    {
+                        Console.WriteLine($"NATIVE_ENGINE_FAILED: {engine.StateDetail}");
+                        Shutdown(2);
+                        return;
+                    }
+                    Task.Delay(4000).GetAwaiter().GetResult();
+                    if (!Task.Run(() => engine.IsHealthyAsync()).GetAwaiter().GetResult())
+                    {
+                        var diagnostic = $"NATIVE_ENGINE_UNHEALTHY: {engine.StateDetail}; {engine.Diagnose()}";
+                        Console.WriteLine(diagnostic);
+                        var directory = DiagnosticDirectory(dataRoot);
+                        Directory.CreateDirectory(directory);
+                        File.WriteAllText(Path.Combine(directory, "native-engine.txt"), diagnostic);
+                        Shutdown(3);
+                        return;
+                    }
+                    Console.WriteLine($"NATIVE_ENGINE_READY: port={port}; dataRoot={engine.EngineDataRoot}");
+                    lifetime.Token.WaitHandle.WaitOne();
+                    Shutdown(0);
                 }
-                engine.Stop();
-                Console.WriteLine("NATIVE_ENGINE_STOPPED");
-                Shutdown(0);
+                finally
+                {
+                    Console.CancelKeyPress -= cancelHandler;
+                    if (StopNativeEngineForShutdown(engine))
+                        Console.WriteLine("NATIVE_ENGINE_STOPPED");
+                }
             }
             catch (OperationCanceledException)
             {
@@ -320,8 +333,7 @@ public partial class App : Application
         }
 
         var previewMode = RuntimeMode.IsDetachedUi
-                          || e.Args.Any(arg => string.Equals(arg, "--ui-preview", StringComparison.OrdinalIgnoreCase))
-                          || AppContext.BaseDirectory.Contains("ui-preview", StringComparison.OrdinalIgnoreCase);
+                          || e.Args.Any(arg => string.Equals(arg, "--ui-preview", StringComparison.OrdinalIgnoreCase));
         _singleInstanceMutex = new Mutex(
             initiallyOwned: true,
             name: previewMode ? @"Local\CodexModelManager.Gui.Preview.v2" : @"Local\CodexModelManager.Gui.v2",
@@ -476,6 +488,7 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        UnregisterGlobalExceptionHandlers();
         if (_singleInstanceMutex is not null)
         {
             try { _singleInstanceMutex.ReleaseMutex(); } catch { }
@@ -484,6 +497,134 @@ public partial class App : Application
         }
         base.OnExit(e);
     }
+
+    private void RegisterGlobalExceptionHandlers()
+    {
+        DispatcherUnhandledException += OnDispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += OnAppDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+    }
+
+    private void UnregisterGlobalExceptionHandlers()
+    {
+        DispatcherUnhandledException -= OnDispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException -= OnAppDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException -= OnUnobservedTaskException;
+    }
+
+    private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+    {
+        WriteCrashReport("ui-thread", e.Exception, fatal: true);
+        ShowFatalErrorMessage();
+
+        // The UI may already be inconsistent. Log and stop cleanly instead of
+        // pretending that an unknown exception is safe to ignore.
+        e.Handled = true;
+        Shutdown(1);
+    }
+
+    private void OnAppDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)
+    {
+        var exception = e.ExceptionObject as Exception
+                        ?? new InvalidOperationException("进程遇到了未知的未捕获异常。");
+        WriteCrashReport("process", exception, fatal: e.IsTerminating);
+    }
+
+    private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        WriteCrashReport("background-task", e.Exception, fatal: false);
+        e.SetObserved();
+    }
+
+    private void ShowFatalErrorMessage()
+    {
+        try
+        {
+            MessageBox.Show(
+                "总管家遇到意外错误，已安全停止。错误记录已写入本地 diagnostics 文件夹，请重开软件；如果反复出现，请保留该记录用于排查。",
+                "Codex 总管家遇到错误",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+        catch
+        {
+            // The crash handler must never create a second failure.
+        }
+    }
+
+    private void WriteCrashReport(string source, Exception exception, bool fatal)
+    {
+        if (Interlocked.Exchange(ref _crashHandling, 1) != 0) return;
+        try
+        {
+            var directory = DiagnosticDirectory();
+            Directory.CreateDirectory(directory);
+            RotateCrashReports(directory, keepNewest: 19);
+            var report = new
+            {
+                schemaVersion = 1,
+                occurredAtUtc = DateTimeOffset.UtcNow,
+                source,
+                fatal,
+                processId = Environment.ProcessId,
+                exceptionType = exception.GetType().FullName,
+                message = RedactCrashText(exception.Message),
+                stackTrace = RedactCrashText(exception.StackTrace),
+                innerExceptionType = exception.InnerException?.GetType().FullName,
+                innerMessage = RedactCrashText(exception.InnerException?.Message)
+            };
+            var path = Path.Combine(directory, $"crash-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}-{Environment.ProcessId}.json");
+            LocalFileTransaction.WriteAtomic(
+                path,
+                JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch
+        {
+            // Best effort only: a fatal exception may have damaged I/O state.
+        }
+        finally
+        {
+            Volatile.Write(ref _crashHandling, 0);
+        }
+    }
+
+    internal static string? RedactCrashText(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return value;
+        var redacted = Regex.Replace(
+            value,
+            @"(?i)(authorization)(\s*[:=]\s*)(bearer\s+)?([^\s,;\}\]]+)",
+            "$1$2[REDACTED]",
+            RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(100));
+        redacted = Regex.Replace(
+            redacted,
+            @"(?i)(cookie|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|admission[-_ ]?token)(\s*[:=]\s*)([^\s,;\}\]]+)",
+            "$1$2[REDACTED]",
+            RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(100));
+        redacted = Regex.Replace(
+            redacted,
+            @"(?i)bearer\s+[A-Za-z0-9._~+/=-]+",
+            "Bearer [REDACTED]",
+            RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(100));
+        return redacted.Length <= 16_384 ? redacted : redacted[..16_384] + "…[已截断]";
+    }
+
+    private static void RotateCrashReports(string directory, int keepNewest)
+    {
+        foreach (var stale in Directory.EnumerateFiles(directory, "crash-*.json")
+                     .Select(path => new FileInfo(path))
+                     .OrderByDescending(file => file.LastWriteTimeUtc)
+                     .Skip(keepNewest))
+        {
+            try { stale.Delete(); } catch { }
+        }
+    }
+
+    internal static bool StopNativeEngineForShutdown(NativeEngineService engine) =>
+        engine.Stop(TimeSpan.FromSeconds(10));
 
     private static void EnsureWindowsDirectoryEnvironment()
     {

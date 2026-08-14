@@ -568,11 +568,39 @@ public sealed class ExtensionService
 
     private static async Task PumpAsync(TextReader reader, string channel, Action<string>? onOutput)
     {
-        while (await reader.ReadLineAsync() is { } line)
+        var buffer = new char[4096];
+        var pending = new StringBuilder();
+        while (true)
         {
-            try { onOutput?.Invoke($"[{channel}] {line}"); }
-            catch { }
+            var count = await reader.ReadAsync(buffer);
+            if (count == 0) break;
+            for (var index = 0; index < count; index++)
+            {
+                var value = buffer[index];
+                if (value is '\r' or '\n')
+                {
+                    if (pending.Length > 0)
+                    {
+                        EmitOutput(channel, pending.ToString(), onOutput);
+                        pending.Clear();
+                    }
+                    continue;
+                }
+                pending.Append(value);
+                if (pending.Length >= 4096)
+                {
+                    EmitOutput(channel, pending.ToString(), onOutput);
+                    pending.Clear();
+                }
+            }
         }
+        if (pending.Length > 0) EmitOutput(channel, pending.ToString(), onOutput);
+    }
+
+    private static void EmitOutput(string channel, string value, Action<string>? onOutput)
+    {
+        try { onOutput?.Invoke($"[{channel}] {value}"); }
+        catch { }
     }
 
     private static void TryKillProcessTree(Process process)
@@ -599,7 +627,8 @@ public sealed class ExtensionService
                 throw new InvalidDataException("信任记录版本不受支持。 ");
             return new Dictionary<string, string>(document.Trusted, StringComparer.OrdinalIgnoreCase);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or JsonException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException
+                                   or JsonException or ArgumentException)
         {
             warning = $"插件信任记录无法读取，全部插件已按禁用处理：{ex.Message}";
             return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);

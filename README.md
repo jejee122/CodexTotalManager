@@ -4,14 +4,14 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows)
 ![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet)
-![Release](https://img.shields.io/badge/release-3.0.0--rc.26-orange)
+![Release](https://img.shields.io/badge/release-3.0.0--rc.27-orange)
 ![Status](https://img.shields.io/badge/status-external_validation_pending-yellow)
 
 Codex 总管家不是另一个聊天客户端，也不会替换 Codex。它是一个运行在本机的控制面：
 默认与 Codex 断开；只有用户点击“一键连接 Codex”并确认后，才把本机网关和模型目录写入 Codex 配置。
 断开时只删除总管家自己拥有的内容。
 
-当前版本为 **3.0.0-rc.26 候选版**。隔离构建、安全测试、假上游端到端请求和
+当前版本为 **3.0.0-rc.27 候选版**。隔离构建、安全测试、假上游端到端请求和
 10 万条账本压力矩阵已经通过；真实 Codex、真实 OAuth 账号池和皮肤仍需在专用测试电脑完成最终验收，
 因此现在不能称为生产稳定版。
 
@@ -105,7 +105,8 @@ flowchart LR
 - **所有权标记**：配置块、模型目录和缓存失效文件只有仍带总管家标记时才会删除；
 - **冲突停手**：用户已有 `openai_base_url`、`model_catalog_json` 或显式选择其他 Provider 时拒绝覆盖；
 - **原子写入**：配置和目录先写临时文件，再一次性替换，失败不留下半个文件；
-- **本机限定**：Native Engine 和网关仅监听 `127.0.0.1`；管理接口必须携带本机 Admission Token；
+- **本机限定**：Native Engine 和网关仅监听 `127.0.0.1`；管理接口和独立调用必须携带本机 Admission Token；
+- **Codex 会话准入**：Codex 自己的 ChatGPT Bearer 只能先访问 OpenAI 官方透传；只有一次官方上游请求成功后，同一会话才可访问第三方路由。随便填写的 Bearer 会被拒绝；内存只保存令牌的 SHA-256，最多 8 条、8 小时，引擎退出即清空；
 - **凭据隔离**：敏感值使用 Windows CurrentUser DPAPI，源码和日志不得保存明文；
 - **不自动重启 Codex**：模型目录未刷新时只提示用户手动重新打开，不代替用户操作真实 Codex。
 
@@ -129,7 +130,7 @@ v2rayN 不是 Native Engine 的启动前置条件。没有启用代理的 Provid
 
 1. 从 GitHub Releases 下载与版本对应的 Windows `win-x64` 候选包；
 2. 核对 Release 页面公布的 SHA-256；
-3. 解压后启动“Codex 总管家”；
+3. 解压后使用包内 `install-local-release.ps1` 校验并安装；不要绕过清单直接运行 EXE；
 4. 先添加模型来源或独立账号出口；
 5. 确认主页的 Native Engine 和 `/readyz` 正常；
 6. 需要 Codex 使用时，再点击“一键连接 Codex”；
@@ -154,30 +155,60 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-local-release.
 ```powershell
 dotnet build CodexTotalManager.sln --no-restore -c Debug
 dotnet test tests\CodexModelManager.SecurityTests\CodexModelManager.SecurityTests.csproj --no-build -c Debug
-.\build.ps1 -Publish -Version 3.0.0-rc.26
+.\build.ps1 -Publish -Version 3.0.0-rc.27 `
+  -CliProxyApiArtifactPath 'C:\path\to\verified\cli-proxy-api.exe'
 ```
 
 生成永久隔离、不能连接真实 Codex 的测试包：
 
 ```powershell
-.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.26
+.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.27 `
+  -CliProxyApiArtifactPath 'C:\path\to\verified\cli-proxy-api.exe'
 ```
+
+`-Publish` 会自动运行安全测试和集成自检；不需要另加 `-Test`。脚本会把
+`-CliProxyApiArtifactPath` 仅在集成自检进程期间传入测试，并在结束后恢复原环境变量。
+该文件必须匹配源码锁定的版本和 SHA-256，否则构建会在发布前失败关闭。
 
 ## 测试边界
 
 当前 rc.26 已验证：
 
 - Debug 全解决方案编译：0 错误、0 警告；
-- 36 项安全测试，其中包含通用插件的禁用默认值、路径边界、整包指纹、确认期间换包拦截、参数传递、环境变量隔离和崩溃隔离；
+- 61 项安全测试，其中包含本机准入、官方会话验证、流式工具调用、正式发布证据门槛、跨进程配置防覆盖，以及通用插件的禁用默认值、路径边界、整包指纹、确认期间换包拦截、参数传递、环境变量隔离和崩溃隔离；
 - 隔离单元/集成矩阵；
 - 10 万条账本冷启动和追加压力测试；
-- 589 文件候选包清单校验，以及安装回路“只验包、不安装”测试；
+- 591 文件候选包清单校验，以及安装回路“只验包、不安装”测试；
 - 本机假 Responses/Chat 上游的两轮连续对话；
 - `/healthz` 存活与 `/readyz` 就绪分离；
 - 第三方 `provider/model` 原生目录、连接/断开往返和旧 `cmm_native` 安全迁移。
 
 这些结果不能代替真实 Codex、真实 OAuth、真实皮肤版本和真实扣费账号的业务验收。
 测试替身成功也不等于 OpenAI 官方服务已经认可这一候选版。
+
+### 正式发布门槛
+
+本机构建、安全测试和隔离集成测试全部通过，最多只能把候选包标记为
+`READY_FOR_EXTERNAL_BUSINESS_VALIDATION`，不能直接写成 `DEPLOYABLE`。
+正式晋级还必须在专用测试电脑上完成真实 Codex 验收，并把证据绑定到这份候选包的
+`payload-manifest.json` SHA-256。必测项目包括官方/第三方消息、两类工具调用、对话连续性、
+账号池切换、真实扣费归属、Codex 不被重启、皮肤兼容和断开后配置精确恢复。
+
+证据格式见 [docs/REAL-CODEX-ACCEPTANCE.example.json](docs/REAL-CODEX-ACCEPTANCE.example.json)。
+缺少任意一项，`scripts/emit-evidence.ps1 -MarkDeployable` 都会失败关闭并保持候选状态；
+单独传一个开关不能再伪造“正式可部署”。
+
+### 账本长期保存
+
+当前按 UTC 月份分文件，但旧月份不会自动删除。旧文件不只是普通日志，还保存历史总数、
+账号归属、防重复证据和崩溃恢复依据；直接删掉或只留一个汇总会造成历史缩水或重复计费。
+安全压缩必须做到压缩前后总数完全一致、旧事件重导仍能识别为重复、任意阶段崩溃都能回滚，
+并通过第二个进程重新打开验证。完整门槛见 [docs/LEDGER-RETENTION.md](docs/LEDGER-RETENTION.md)。
+这些测试完成以前，总管家选择“多占一点磁盘，也不自动删错账”。
+
+从旧 `usage.jsonl` 升级到总管家自己的 `request-log.jsonl` 时，旧账原样保留，新日志在升级点建立
+一次性基线；只归账基线之后新追加的请求。这样不会把两个格式不同的历史日志硬猜成同一请求，
+也不会把历史用量再算一遍。旧游标会改名保留为本地迁移证据，不会写入安装包或 GitHub。
 
 ## 与其他工具的区别
 

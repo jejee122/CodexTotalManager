@@ -848,7 +848,7 @@ public partial class MainWindow : Window
             ? "展示最近 53 周；当前没有可标记日期"
             : $"展示最近 53 周 · 当前日志覆盖 {snapshot.FirstSeen:yyyy-MM-dd} 至 {snapshot.LastSeen:yyyy-MM-dd}";
         TokenSourceText.Text = snapshot.SourceAvailable
-            ? $"来源：~\\.opencodex\\usage.jsonl · {snapshot.Message} 输入 {UsageFormatting.Number(snapshot.InputTokens)} / 输出 {UsageFormatting.Number(snapshot.OutputTokens)}。"
+            ? $"来源：总管家本机 request-log.jsonl · {snapshot.Message} 输入 {UsageFormatting.Number(snapshot.InputTokens)} / 输出 {UsageFormatting.Number(snapshot.OutputTokens)}。"
             : snapshot.Message;
         TokenSourceText.Foreground = new SolidColorBrush(snapshot.SourceAvailable
             ? Color.FromRgb(156, 181, 184)
@@ -940,28 +940,32 @@ public partial class MainWindow : Window
                 Arguments = $"-NoProfile -ExecutionPolicy RemoteSigned -File \"{launcherPath}\"",
                 WorkingDirectory = Path.GetDirectoryName(launcherPath)!,
                 UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
+                CreateNoWindow = true
             };
 
             using var process = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("无法启动学习系统启动器。");
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errorTask = process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync();
-            var output = await outputTask;
-            var error = await errorTask;
+            using var launchTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                await process.WaitForExitAsync(launchTimeout.Token);
+            }
+            catch (OperationCanceledException) when (launchTimeout.IsCancellationRequested)
+            {
+                try
+                {
+                    if (!process.HasExited) process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // The launcher may have exited between the timeout and cleanup.
+                }
+                try { await process.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
+                throw new TimeoutException("学习系统启动器 30 秒内没有退出，已停止它及其子进程，避免按钮永久转圈。");
+            }
 
             if (process.ExitCode != 0)
-            {
-                var detail = string.Join(" ", $"{output}\n{error}"
-                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                    .TakeLast(2));
-                throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail)
-                    ? "学习系统启动器返回失败。"
-                    : detail);
-            }
+                throw new InvalidOperationException($"学习系统启动器返回失败（退出码 {process.ExitCode}）。");
 
             FooterMessage.Text = "知耕考研已经在浏览器中打开。";
         }
@@ -1367,8 +1371,26 @@ public partial class MainWindow : Window
             SetBusy(false);
             RefreshCodexConnectionUi();
             if (RuntimeMode.IsDetachedUi) DisableDetachedActionButtons();
-            FooterMessage.Text = FriendlyError(ex);
-            MessageBox.Show(FriendlyError(ex), "连接切换没有完成", MessageBoxButton.OK, MessageBoxImage.Warning);
+            var actual = realCodexConfig.ReadGatewaySnapshot();
+            var requestedStateCommitted = disconnecting
+                ? !actual.IsManagedConnected && actual.CanToggle
+                : actual.IsManagedConnected && actual.CanToggle;
+            if (requestedStateCommitted)
+            {
+                FooterMessage.Text = disconnecting
+                    ? "Codex 已断开；后续状态刷新失败，请稍后刷新主页。"
+                    : "Codex 已连接；后续状态刷新失败，请稍后刷新主页。";
+                MessageBox.Show(
+                    $"连接状态已经写入成功，但后续刷新没有完成：{FriendlyError(ex)}\n\n请不要重复点击切换；稍后刷新主页即可。",
+                    disconnecting ? "已断开，刷新失败" : "已连接，刷新失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+            else
+            {
+                FooterMessage.Text = FriendlyError(ex);
+                MessageBox.Show(FriendlyError(ex), "连接切换没有完成", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
     }
 

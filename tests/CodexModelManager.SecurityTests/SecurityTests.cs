@@ -1,15 +1,153 @@
 using System.Text;
 using System.Text.Json;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
 using CodexModelManager.Models;
 using CodexModelManager.Services;
 using CodexOpenCodexNative.Config;
+using CodexOpenCodexNative.Adapters;
 using CodexOpenCodexNative.Host;
+using CodexOpenCodexNative.Logging;
 using CodexOpenCodexNative.Models;
-using CodexOpenCodexNative.OAuth;
 using CodexOpenCodexNative.Providers;
+using CodexOpenCodexNative.Responses;
 using Xunit;
 
 namespace CodexModelManager.SecurityTests;
+
+public sealed class ReleaseAcceptanceGateTests
+{
+    [Fact]
+    public void AppCrashFallback_RedactsCredentials_AndPreviewRequiresExplicitMode()
+    {
+        var repo = FindRepositoryRoot();
+        var appSource = File.ReadAllText(
+            Path.Combine(repo, @"src\CodexModelManager\App.xaml.cs"), Encoding.UTF8);
+
+        Assert.Contains("DispatcherUnhandledException +=", appSource, StringComparison.Ordinal);
+        Assert.Contains("AppDomain.CurrentDomain.UnhandledException +=", appSource, StringComparison.Ordinal);
+        Assert.Contains("TaskScheduler.UnobservedTaskException +=", appSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("BaseDirectory.Contains(\"ui-preview\"", appSource, StringComparison.Ordinal);
+
+        var redacted = App.RedactCrashText(
+            "Authorization: Bearer session-secret Cookie=private-cookie api_key=sk-private admissionToken:local-secret");
+        Assert.DoesNotContain("session-secret", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("private-cookie", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("sk-private", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("local-secret", redacted, StringComparison.Ordinal);
+        Assert.Contains("[REDACTED]", redacted, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NativeEngineShutdownPath_WaitsForEngineCleanup()
+    {
+        var stopped = false;
+        var engine = new NativeEngineService { StoppedForTest = () => stopped = true };
+        var root = Path.Combine(Path.GetTempPath(), "cmm-native-shutdown-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            listener.Stop();
+            Assert.True(engine.Start(port, root));
+            Assert.True(App.StopNativeEngineForShutdown(engine));
+            Assert.True(stopped);
+            Assert.Equal(NativeEngineState.Stopped, engine.State);
+        }
+        finally
+        {
+            engine.Stop();
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void ExternalAcceptanceScripts_ParseOnWindowsPowerShellGrammar()
+    {
+        var repo = FindRepositoryRoot();
+        foreach (var relativePath in new[]
+                 {
+                     @"scripts\validate-external-acceptance.ps1",
+                     @"scripts\emit-evidence.ps1"
+                 })
+        {
+            var path = Path.Combine(repo, relativePath);
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            startInfo.ArgumentList.Add("-NoLogo");
+            startInfo.ArgumentList.Add("-NoProfile");
+            startInfo.ArgumentList.Add("-Command");
+            var quotedPath = path.Replace("'", "''", StringComparison.Ordinal);
+            startInfo.ArgumentList.Add(
+                "$tokens=$null;$errors=$null;"
+                + $"[void][System.Management.Automation.Language.Parser]::ParseFile('{quotedPath}',[ref]$tokens,[ref]$errors);"
+                + "if($errors.Count){$errors|ForEach-Object Message;exit 1}");
+            using var process = System.Diagnostics.Process.Start(startInfo)
+                                ?? throw new InvalidOperationException("Windows PowerShell did not start.");
+            var output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+            Assert.True(process.WaitForExit(10_000) && process.ExitCode == 0,
+                $"{relativePath} is not compatible with Windows PowerShell grammar: {output}");
+        }
+    }
+
+    [Fact]
+    public void DeployableDecision_RequiresHashBoundRealCodexEvidence()
+    {
+        var repo = FindRepositoryRoot();
+        var script = File.ReadAllText(Path.Combine(repo, @"scripts\emit-evidence.ps1"), Encoding.UTF8);
+        var validator = File.ReadAllText(
+            Path.Combine(repo, @"scripts\validate-external-acceptance.ps1"), Encoding.UTF8);
+
+        Assert.Contains("ExternalAcceptanceEvidencePath", script, StringComparison.Ordinal);
+        Assert.Contains("PayloadManifestPath", script, StringComparison.Ordinal);
+        Assert.Contains("$externalAcceptancePassed", script, StringComparison.Ordinal);
+        Assert.Contains("candidateManifestSha256", validator, StringComparison.Ordinal);
+        Assert.Contains("dedicatedTestComputer", validator, StringComparison.Ordinal);
+        foreach (var check in new[]
+                 {
+                     "officialModelMessaging", "officialStreamingToolCalls",
+                     "thirdPartyModelMessaging", "thirdPartyToolCalls",
+                     "conversationContinuity", "accountPoolSwitch", "billingAttribution",
+                     "codexNotRestarted", "skinCompatibility", "disconnectRestoresConfiguration"
+                 })
+            Assert.Contains(check, validator, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LedgerRetention_RemainsFailClosedUntilCrashSafeCompactionExists()
+    {
+        var repo = FindRepositoryRoot();
+        var policy = File.ReadAllText(Path.Combine(repo, @"docs\LEDGER-RETENTION.md"), Encoding.UTF8);
+        var service = File.ReadAllText(
+            Path.Combine(repo, @"src\CodexModelManager\Services\AccountUsageLedgerService.cs"), Encoding.UTF8);
+
+        Assert.Contains("No runtime path automatically deletes", policy, StringComparison.Ordinal);
+        Assert.Contains("idempotent duplicate", policy, StringComparison.Ordinal);
+        Assert.Contains("crash after every transaction stage", policy, StringComparison.Ordinal);
+        Assert.DoesNotContain("CompactOldLedger", service, StringComparison.Ordinal);
+        Assert.DoesNotContain("DeleteExpiredLedger", service, StringComparison.Ordinal);
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "CodexTotalManager.sln")))
+                return directory.FullName;
+            directory = directory.Parent;
+        }
+        throw new DirectoryNotFoundException("CodexTotalManager repository root was not found.");
+    }
+}
 
 public sealed class ExtensionSecurityTests
 {
@@ -288,7 +426,7 @@ public sealed class RuntimeModeIsolationTests
         {
             Assert.Equal(Path.Combine(root, "runtime"), services.Settings.DataDirectory);
             Assert.Equal(
-                Path.Combine(root, "native-home", "usage.jsonl"),
+                Path.Combine(root, "runtime", "native-proxy", "request-log.jsonl"),
                 services.AccountUsageLedger.SourcePath);
             Assert.False(services.AccountUsageLedger.SourceMustBeAvailable);
             Assert.Empty(services.Dashboard.DiscoveredServerAliases);
@@ -301,8 +439,6 @@ public sealed class RuntimeModeIsolationTests
             Assert.False(desktop.Connected);
             var switchResult = await services.CodexDesktop.EnsureCurrentChatUsesAliasAsync("gpt-test");
             Assert.Equal(CodexAliasSwitchStatus.Unavailable, switchResult.Status);
-            var restart = await services.CodexDesktop.RestartCodexWithDreamSkinAsync();
-            Assert.False(restart.Success);
             var skin = await services.DreamSkin.ApplyInstalledThemeAsync("test-theme", allowRestart: true);
             Assert.Equal(DreamSkinOperationStatus.Failed, skin.Status);
         }
@@ -707,56 +843,113 @@ public sealed class V2rayProcessScopeTests
     }
 }
 
-public class OAuthTokenStoreTests
+public sealed class RequestLogSummaryTests
 {
     [Fact]
-    public void Save_ProducesEncryptedFile_NoPlaintextTokens()
+    public void Summarize_OfficialPassThrough2xxCountsAsCompleted()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "cmm-oauth-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
+        var root = Path.Combine(Path.GetTempPath(), "cmm-request-log-" + Guid.NewGuid().ToString("N"));
         try
         {
-            var store = new OAuthTokenStore(dir);
-            store.Save("chatgpt", new OAuthCredentials
+            var log = new RequestLogService(root);
+            log.Record(new RequestLogEntry
             {
-                Access = "test-access-token-secret-123",
-                Refresh = "rt-refresh-token-secret-456",
-                AccountId = "acct-1"
+                Provider = "openai",
+                Status = "passed-through",
+                HttpStatus = 200
             });
 
-            var raw = File.ReadAllText(Path.Combine(dir, "oauth-tokens.json"));
-            Assert.DoesNotContain("test-access-token-secret-123", raw);
-            Assert.DoesNotContain("rt-refresh-token-secret-456", raw);
+            var summary = log.Summarize();
+            Assert.Equal(1, summary.TotalRequests);
+            Assert.Equal(1, summary.CompletedRequests);
+            Assert.Equal(1, summary.ByProvider["openai"].CompletedRequests);
         }
         finally
         {
-            Directory.Delete(dir, true);
+            if (Directory.Exists(root)) Directory.Delete(root, true);
         }
     }
 
     [Fact]
-    public void Save_ThenLoad_RoundTripsToken()
+    public void Summarize_FailedPassThroughDoesNotCountAsCompleted()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "cmm-oauth-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
+        var root = Path.Combine(Path.GetTempPath(), "cmm-request-log-" + Guid.NewGuid().ToString("N"));
         try
         {
-            var store = new OAuthTokenStore(dir);
-            store.Save("chatgpt", new OAuthCredentials { Access = "tok-a", Refresh = "tok-r" });
-            var loaded = store.Load("chatgpt");
-            Assert.NotNull(loaded);
-            Assert.Equal("tok-a", loaded.Access);
-            Assert.Equal("tok-r", loaded.Refresh);
+            var log = new RequestLogService(root);
+            log.Record(new RequestLogEntry
+            {
+                Provider = "openai",
+                Status = "passed-through",
+                HttpStatus = 502
+            });
+
+            var summary = log.Summarize();
+            Assert.Equal(1, summary.TotalRequests);
+            Assert.Equal(0, summary.CompletedRequests);
+            Assert.Equal(0, summary.ByProvider["openai"].CompletedRequests);
         }
         finally
         {
-            Directory.Delete(dir, true);
+            if (Directory.Exists(root)) Directory.Delete(root, true);
         }
     }
 }
 
 public class NativeProxyConfigStoreTests
 {
+    [Fact]
+    public void Load_AcceptsLegacyCamelCaseAndSaveUsesUniqueTemporaryFile()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-cfg-case-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "config.json"), """
+                {"listenPort":10123,"admissionToken":"legacy-token","autoSwitchThreshold":71,"failoverThreshold":4,"providers":[],"combos":[]}
+                """);
+            var store = new NativeProxyConfigStore(dir);
+            var loaded = store.Load();
+            Assert.Equal(10123, loaded.ListenPort);
+            Assert.Equal("legacy-token", loaded.AdmissionToken);
+            Assert.Equal(71, loaded.AutoSwitchThreshold);
+            Assert.Equal(4, loaded.FailoverThreshold);
+
+            store.Save(loaded);
+            Assert.Empty(Directory.GetFiles(dir, "config.json.*.tmp"));
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Save_RejectsStaleSnapshotInsteadOfOverwritingNewerConfig()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-cfg-stale-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var first = new NativeProxyConfigStore(dir);
+            first.Save(new NativeProxyConfig { ListenPort = 10100, AdmissionToken = "admission" });
+            var stale = first.Load();
+            var second = new NativeProxyConfigStore(dir);
+            second.Update(config => config.AutoSwitchThreshold = 70);
+            stale.FailoverThreshold = 4;
+
+            var error = Assert.Throws<InvalidOperationException>(() => first.Save(stale));
+            Assert.Contains("另一个进程更新", error.Message, StringComparison.Ordinal);
+            var current = first.Load();
+            Assert.Equal(70, current.AutoSwitchThreshold);
+            Assert.Equal(0, current.FailoverThreshold);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
     [Fact]
     public void Save_EncryptsApiKeyAndAdmissionToken()
     {
@@ -887,6 +1080,380 @@ public class NativeProxyAdmissionTests
             Directory.Delete(dir, true);
         }
     }
+
+    [Fact]
+    public async Task CodexBearer_IsRestrictedToOfficialPassThrough_WhileAdmissionTokenCanUseThirdParty()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cmm-admission-routing-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        NativeProxyHost? host = null;
+        try
+        {
+            var port = GetUnusedLoopbackPort();
+            var captured = new List<(string Host, string? Authorization)>();
+            using var upstream = new HttpClient(new AdmissionRoutingHandler(request =>
+            {
+                lock (captured)
+                    captured.Add((request.RequestUri?.Host ?? string.Empty,
+                        request.Headers.Authorization?.ToString()));
+                var body = request.RequestUri?.Host.Equals("chatgpt.com", StringComparison.OrdinalIgnoreCase) == true
+                    ? "{\"id\":\"resp_official\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}"
+                    : "{\"id\":\"resp_third_party\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}";
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(body, Encoding.UTF8, "application/json")
+                };
+            }));
+            var store = new NativeProxyConfigStore(dir);
+            store.Save(new NativeProxyConfig
+            {
+                ListenPort = port,
+                AdmissionToken = "local-admission-secret",
+                DefaultProvider = "openai",
+                Providers =
+                [
+                    new ProviderDefinition
+                    {
+                        Id = "third-party",
+                        Name = "Third party",
+                        Adapter = "openai-responses",
+                        BaseUrl = "https://models.example.test/v1",
+                        ApiKey = "third-party-key",
+                        DefaultModel = "model-a",
+                        Models = ["model-a"]
+                    }
+                ]
+            });
+            host = new NativeProxyHost(store, upstream: upstream, dataRootOverride: dir);
+            await host.Application.StartAsync();
+            using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+
+            using var official = new HttpRequestMessage(HttpMethod.Post, "/v1/responses")
+            {
+                Content = new StringContent("{\"model\":\"gpt-5.6-sol\",\"input\":\"hello\",\"stream\":false}",
+                    Encoding.UTF8, "application/json")
+            };
+            official.Headers.Authorization = new AuthenticationHeaderValue("Bearer", "real-codex-session");
+            using var officialResponse = await client.SendAsync(official);
+            Assert.Equal(HttpStatusCode.OK, officialResponse.StatusCode);
+
+            using var forbidden = new HttpRequestMessage(HttpMethod.Post, "/v1/responses")
+            {
+                Content = new StringContent("{\"model\":\"third-party/model-a\",\"input\":\"hello\",\"stream\":false}",
+                    Encoding.UTF8, "application/json")
+            };
+            forbidden.Headers.Authorization = new AuthenticationHeaderValue("Bearer", "arbitrary-unvalidated-session");
+            using var forbiddenResponse = await client.SendAsync(forbidden);
+            Assert.Equal(HttpStatusCode.Forbidden, forbiddenResponse.StatusCode);
+
+            using var officialWarmup = new HttpRequestMessage(HttpMethod.Post, "/v1/responses")
+            {
+                Content = new StringContent("{\"model\":\"gpt-5.6-sol\",\"input\":\"validate session\",\"stream\":false}",
+                    Encoding.UTF8, "application/json")
+            };
+            officialWarmup.Headers.Authorization = new AuthenticationHeaderValue("Bearer", "second-real-codex-session");
+            using var officialWarmupResponse = await client.SendAsync(officialWarmup);
+            Assert.Equal(HttpStatusCode.OK, officialWarmupResponse.StatusCode);
+
+            using var validatedSession = new HttpRequestMessage(HttpMethod.Post, "/v1/responses")
+            {
+                Content = new StringContent("{\"model\":\"third-party/model-a\",\"input\":\"hello\",\"stream\":false}",
+                    Encoding.UTF8, "application/json")
+            };
+            validatedSession.Headers.Authorization = new AuthenticationHeaderValue("Bearer", "second-real-codex-session");
+            using var validatedSessionResponse = await client.SendAsync(validatedSession);
+            Assert.Equal(HttpStatusCode.OK, validatedSessionResponse.StatusCode);
+
+            using var admitted = new HttpRequestMessage(HttpMethod.Post, "/v1/responses")
+            {
+                Content = new StringContent("{\"model\":\"third-party/model-a\",\"input\":\"hello\",\"stream\":false}",
+                    Encoding.UTF8, "application/json")
+            };
+            admitted.Headers.TryAddWithoutValidation("X-CMM-Admission", "Bearer local-admission-secret");
+            using var admittedResponse = await client.SendAsync(admitted);
+            Assert.Equal(HttpStatusCode.OK, admittedResponse.StatusCode);
+
+            lock (captured)
+            {
+                Assert.Equal(4, captured.Count);
+                Assert.Contains(captured, item => item.Host.Equals("chatgpt.com", StringComparison.OrdinalIgnoreCase)
+                                                   && item.Authorization == "Bearer real-codex-session");
+                Assert.Contains(captured, item => item.Host.Equals("models.example.test", StringComparison.OrdinalIgnoreCase)
+                                                   && item.Authorization == "Bearer third-party-key");
+            }
+        }
+        finally
+        {
+            if (host is not null) await host.StopAsync();
+            Directory.Delete(dir, true);
+        }
+    }
+
+    private static int GetUnusedLoopbackPort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try { return ((IPEndPoint)listener.LocalEndpoint).Port; }
+        finally { listener.Stop(); }
+    }
+
+    private sealed class AdmissionRoutingHandler(
+        Func<HttpRequestMessage, HttpResponseMessage> factory) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) => Task.FromResult(factory(request));
+    }
+}
+
+public class NativeProxyStreamingCompatibilityTests
+{
+    [Fact]
+    public async Task OfficialCodexResponsesStream_IsReturnedByteForByteWithoutLocalEventRepackaging()
+    {
+        const string upstream = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_official_exact\"}}\n\n"
+                                + "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_exact\",\"delta\":\"{}\"}\n\n";
+        using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(upstream, Encoding.UTF8, "text/event-stream")
+        }));
+        var adapter = new OpenAiResponsesAdapter(client);
+        var provider = new ProviderDefinition
+        {
+            Id = "openai",
+            Adapter = "openai-responses",
+            BaseUrl = "https://chatgpt.com/backend-api/codex",
+            DefaultModel = "gpt-test",
+            Models = ["gpt-test"]
+        };
+        var request = new OcxParsedRequest
+        {
+            Stream = true,
+            RawBody = "{\"model\":\"gpt-test\",\"input\":\"hello\",\"stream\":true}",
+            ForwardHeaders = new Dictionary<string, string> { ["Authorization"] = "Bearer real-codex-session" }
+        };
+
+        await using var result = await adapter.FetchAsync(provider, request, "gpt-test", CancellationToken.None);
+
+        Assert.True(result.Streaming);
+        Assert.NotNull(result.RawStream);
+        Assert.Null(result.Events);
+        using var reader = new StreamReader(result.RawStream!, Encoding.UTF8, leaveOpen: true);
+        Assert.Equal(upstream, await reader.ReadToEndAsync());
+    }
+
+    [Fact]
+    public async Task ThirdPartyResponsesStream_PreservesFunctionCallEvents()
+    {
+        const string upstream = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"\"}}\n\n"
+                                + "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\"}\n\n"
+                                + "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"\\\"Beijing\\\"}\"}\n\n"
+                                + "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":\"{\\\"city\\\":\\\"Beijing\\\"}\"}\n\n"
+                                + "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Beijing\\\"}\"}],\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n"
+                                + "data: [DONE]\n\n";
+        using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(upstream, Encoding.UTF8, "text/event-stream")
+        }));
+        var adapter = new OpenAiResponsesAdapter(client);
+        var provider = new ProviderDefinition
+        {
+            Id = "private",
+            Adapter = "openai-responses",
+            BaseUrl = "https://models.example.test/v1",
+            ApiKey = "provider-only-key",
+            DefaultModel = "model-a",
+            Models = ["model-a"]
+        };
+
+        await using var result = await adapter.FetchAsync(
+            provider,
+            new OcxParsedRequest { Stream = true, Messages = [new OcxMessage { Role = "user", Content = "hello" }] },
+            "model-a",
+            CancellationToken.None);
+        var events = await CollectAsync(result.Events!);
+
+        Assert.Contains(events, value => value.Type == "function_call"
+                                         && value.CallId == "call_1"
+                                         && value.FunctionName == "weather"
+                                         && value.ToolCallIndex == 0);
+        var done = Assert.Single(events, value => value.Type == "function_call_done");
+        Assert.Equal("call_1", done.CallId);
+        Assert.Equal("{\"city\":\"Beijing\"}", done.Arguments);
+        Assert.Equal("done", events.Last().Type);
+    }
+
+    [Fact]
+    public async Task ChatStream_PreservesMultipleToolCallIdsIndexesAndArguments()
+    {
+        const string upstream = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"alpha\",\"arguments\":\"{\"}},{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"beta\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n"
+                                + "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}},{\"index\":1,\"function\":{\"arguments\":\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
+                                + "data: [DONE]\n\n";
+        using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(upstream, Encoding.UTF8, "text/event-stream")
+        }));
+        var adapter = new OpenAiChatAdapter(client);
+        var provider = new ProviderDefinition { Id = "chat", BaseUrl = "https://chat.example.test/v1", ApiKey = "key" };
+
+        await using var result = await adapter.FetchAsync(
+            provider,
+            new OcxParsedRequest { Stream = true, Messages = [new OcxMessage { Role = "user", Content = "hello" }] },
+            "m",
+            CancellationToken.None);
+        var events = await CollectAsync(result.Events!);
+        var completed = events.Where(value => value.Type == "function_call_done").OrderBy(value => value.ToolCallIndex).ToArray();
+
+        Assert.Equal(2, completed.Length);
+        Assert.Equal(("call_a", "alpha", "{}", 0), (completed[0].CallId, completed[0].FunctionName, completed[0].Arguments, completed[0].ToolCallIndex));
+        Assert.Equal(("call_b", "beta", "{}", 1), (completed[1].CallId, completed[1].FunctionName, completed[1].Arguments, completed[1].ToolCallIndex));
+
+        var bridge = new ResponsesBridge("m");
+        var bridgedFrames = new StringBuilder();
+        await foreach (var frame in bridge.StreamAsync(ToAsync(events), CancellationToken.None))
+            bridgedFrames.Append(frame);
+        Assert.Contains("\"call_id\":\"call_a\"", bridgedFrames.ToString(), StringComparison.Ordinal);
+        Assert.Contains("\"call_id\":\"call_b\"", bridgedFrames.ToString(), StringComparison.Ordinal);
+        Assert.Equal(2, bridge.GetContinuationMessages().Sum(message => message.ToolCalls?.Count ?? 0));
+    }
+
+    [Fact]
+    public async Task AnthropicToolUse_IsParsedAndBridgedInBothDirections()
+    {
+        const string upstream = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n"
+                                + "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather\",\"input\":{}}}\n\n"
+                                + "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Beijing\\\"}\"}}\n\n"
+                                + "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+                                + "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n"
+                                + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(upstream, Encoding.UTF8, "text/event-stream")
+        }));
+        var adapter = new AnthropicAdapter(client);
+        var provider = new ProviderDefinition { Id = "claude", BaseUrl = "https://claude.example.test", ApiKey = "key" };
+
+        await using var result = await adapter.FetchAsync(
+            provider,
+            new OcxParsedRequest { Stream = true, Messages = [new OcxMessage { Role = "user", Content = "hello" }] },
+            "claude-test",
+            CancellationToken.None);
+        var events = await CollectAsync(result.Events!);
+        var toolDone = Assert.Single(events, value => value.Type == "function_call_done");
+        Assert.Equal(("toolu_1", "weather", "{\"city\":\"Beijing\"}"),
+            (toolDone.CallId, toolDone.FunctionName, toolDone.Arguments));
+        Assert.Contains(events, value => value.Type == "finish" && value.FinishReason == "tool_calls");
+
+        var bridge = new AnthropicOutboundBridge();
+        var frames = new StringBuilder();
+        await foreach (var frame in bridge.StreamAsync(ToAsync(events), "claude-test", CancellationToken.None))
+            frames.Append(frame);
+        Assert.Contains("\"type\":\"tool_use\"", frames.ToString(), StringComparison.Ordinal);
+        Assert.Contains("\"type\":\"input_json_delta\"", frames.ToString(), StringComparison.Ordinal);
+        Assert.Contains("\"stop_reason\":\"tool_use\"", frames.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnthropicNonStreamingToolUse_IsNotCollapsedIntoEmptyText()
+    {
+        const string upstream = "{\"id\":\"msg_upstream\",\"type\":\"message\",\"role\":\"assistant\","
+                                + "\"content\":[{\"type\":\"text\",\"text\":\"I will check.\"},{\"type\":\"tool_use\",\"id\":\"toolu_weather\",\"name\":\"weather\",\"input\":{\"city\":\"Beijing\"}}],"
+                                + "\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}";
+        using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(upstream, Encoding.UTF8, "application/json")
+        }));
+        var adapter = new AnthropicAdapter(client);
+        var provider = new ProviderDefinition { Id = "claude", BaseUrl = "https://claude.example.test", ApiKey = "key" };
+
+        await using var result = await adapter.FetchAsync(
+            provider,
+            new OcxParsedRequest { Stream = false, Messages = [new OcxMessage { Role = "user", Content = "hello" }] },
+            "claude-test",
+            CancellationToken.None);
+
+        Assert.Equal("tool_calls", result.FinishReason);
+        Assert.Equal("I will check.", result.Message?.Content);
+        var call = Assert.Single(result.Message?.ToolCalls ?? []);
+        Assert.Equal(("toolu_weather", "weather", "{\"city\":\"Beijing\"}"),
+            (call.Id, call.Function?.Name, call.Function?.Arguments));
+        Assert.Equal((5L, 3L, 8L),
+            (result.Usage?.PromptTokens, result.Usage?.CompletionTokens, result.Usage?.TotalTokens));
+
+        var anthropic = NativeProxyHost.BuildAnthropicNonStreamingResponse(
+            "claude-test", result.Message!, result.FinishReason, 5, 3).ToJsonString();
+        Assert.Contains("\"type\":\"tool_use\"", anthropic, StringComparison.Ordinal);
+        Assert.Contains("\"stop_reason\":\"tool_use\"", anthropic, StringComparison.Ordinal);
+
+        var responses = NativeProxyHost.BuildResponsesNonStreamingResponse(
+            "claude-test", result.Message, result.Usage, result.FinishReason).ToJsonString();
+        Assert.Contains("\"type\":\"function_call\"", responses, StringComparison.Ordinal);
+        Assert.Contains("\"call_id\":\"toolu_weather\"", responses, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GoogleNonStreamingFunctionCall_AndLengthStop_AreNormalized()
+    {
+        const string upstream = "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"weather\",\"args\":{\"city\":\"Beijing\"}}}]},\"finishReason\":\"STOP\"}],"
+                                + "\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2,\"totalTokenCount\":6}}";
+        using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(upstream, Encoding.UTF8, "application/json")
+        }));
+        var adapter = new GoogleAdapter(client);
+        var provider = new ProviderDefinition { Id = "gemini", BaseUrl = "https://google.example.test", ApiKey = "key" };
+
+        await using var result = await adapter.FetchAsync(
+            provider,
+            new OcxParsedRequest { Stream = false, Messages = [new OcxMessage { Role = "user", Content = "hello" }] },
+            "gemini-test",
+            CancellationToken.None);
+
+        Assert.Equal("tool_calls", result.FinishReason);
+        var call = Assert.Single(result.Message?.ToolCalls ?? []);
+        Assert.Equal("weather", call.Function?.Name);
+        Assert.Equal("{\"city\":\"Beijing\"}", call.Function?.Arguments);
+    }
+
+    [Fact]
+    public async Task ResponsesBridge_LengthFinish_IsIncompleteRatherThanSuccessful()
+    {
+        var bridge = new ResponsesBridge("model-a");
+        var frames = new StringBuilder();
+        await foreach (var frame in bridge.StreamAsync(ToAsync(
+                           [
+                               new AdapterEvent { Type = "text", Text = "partial", Role = "assistant" },
+                               new AdapterEvent { Type = "finish", FinishReason = "length" }
+                           ]), CancellationToken.None))
+            frames.Append(frame);
+
+        Assert.Equal("incomplete", bridge.Status);
+        Assert.Contains("response.incomplete", frames.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("response.completed", frames.ToString(), StringComparison.Ordinal);
+    }
+
+    private static async Task<List<AdapterEvent>> CollectAsync(IAsyncEnumerable<AdapterEvent> source)
+    {
+        var values = new List<AdapterEvent>();
+        await foreach (var value in source) values.Add(value);
+        return values;
+    }
+
+    private static async IAsyncEnumerable<AdapterEvent> ToAsync(IEnumerable<AdapterEvent> values)
+    {
+        foreach (var value in values)
+        {
+            yield return value;
+            await Task.Yield();
+        }
+    }
+
+    private sealed class StaticHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> factory) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) => Task.FromResult(factory(request));
+    }
 }
 
 public class RouteResolverTests
@@ -1011,10 +1578,10 @@ public class WorkerBudgetLedgerTests
             // 用 1000 token → 成本 0.001 美元 → 正好打满预算
             var cost = await ledger.DeductAsync(role, 1000, 0);
             Assert.Equal(1.0m, cost);
-            Assert.Equal(1.0m, ledger.GetSpent("cmm_test"));
+            Assert.Equal(1.0m, await ledger.GetSpentAsync("cmm_test"));
 
             // 预算耗尽 → 拒绝
-            var block = ledger.CheckBeforeCall(role);
+            var block = await ledger.CheckBeforeCallAsync(role);
             Assert.NotNull(block);
             Assert.Contains("已耗尽", block);
         }
@@ -1043,12 +1610,12 @@ public class WorkerBudgetLedgerTests
             var c2 = await ledger.DeductAsync(role, 100000, 0);  // 0.2 美元
             Assert.Equal(0.2m, c1);
             Assert.Equal(0.2m, c2);
-            Assert.Equal(0.4m, ledger.GetSpent("cmm_test2"));
+            Assert.Equal(0.4m, await ledger.GetSpentAsync("cmm_test2"));
 
-            var remaining = ledger.GetRemaining(role);
+            var remaining = await ledger.GetRemainingAsync(role);
             Assert.NotNull(remaining);
             Assert.Equal(9.6m, remaining);
-            Assert.Null(ledger.CheckBeforeCall(role));
+            Assert.Null(await ledger.CheckBeforeCallAsync(role));
         }
         finally
         {
@@ -1057,7 +1624,7 @@ public class WorkerBudgetLedgerTests
     }
 
     [Fact]
-    public void CheckBeforeCall_RoleWithoutPricing_Rejects()
+    public async Task CheckBeforeCall_RoleWithoutPricing_Rejects()
     {
         var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
         try
@@ -1065,7 +1632,7 @@ public class WorkerBudgetLedgerTests
             var ledger = new WorkerBudgetLedger(path);
             var role = new SubagentRoleDefinition(
                 "cmm_noprice", "无价", "t", "gpt-5.6-sol", "low", "read-only", true, "dev");
-            var block = ledger.CheckBeforeCall(role);
+            var block = await ledger.CheckBeforeCallAsync(role);
             Assert.NotNull(block);
             Assert.Contains("未配置价格", block);
         }
@@ -1098,6 +1665,201 @@ public class WorkerBudgetLedgerTests
         finally
         {
             File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentInstances_CannotBothReserveTheSameRemainingBudget()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var role = CreateRole("cmm_concurrent", price: 1_000_000m, limit: 1m);
+            var first = new WorkerBudgetLedger(path);
+            var second = new WorkerBudgetLedger(path);
+
+            var attempts = await Task.WhenAll(
+                TryReserveAsync(first, role, 1),
+                TryReserveAsync(second, role, 1));
+
+            Assert.Equal(1, attempts.Count(value => value));
+            Assert.Single(await first.PendingReservationsAsync());
+            Assert.Equal(1m, await first.GetSpentAsync(role.Id));
+        }
+        finally
+        {
+            DeleteBudgetFiles(path);
+        }
+    }
+
+    [Fact]
+    public async Task ExpiredReservation_IsReclaimedAcrossInstances()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var expiredAt = DateTimeOffset.UtcNow.AddHours(-25);
+            File.WriteAllText(path, JsonSerializer.Serialize(new
+            {
+                schemaVersion = 2,
+                roles = Array.Empty<object>(),
+                pendingReservations = new[]
+                {
+                    new
+                    {
+                        id = "expired-reservation",
+                        roleId = "cmm_ttl",
+                        currency = "USD",
+                        reservedCost = 1m,
+                        createdAt = expiredAt
+                    }
+                }
+            }));
+
+            var ledger = new WorkerBudgetLedger(path);
+            Assert.Empty(await ledger.PendingReservationsAsync());
+            Assert.Equal(0m, await ledger.GetSpentAsync("cmm_ttl"));
+
+            var role = CreateRole("cmm_ttl", price: 1_000_000m, limit: 1m);
+            var reservation = await ledger.ReserveAsync(role, 1);
+            Assert.Equal(1m, reservation.ReservedCost);
+        }
+        finally
+        {
+            DeleteBudgetFiles(path);
+        }
+    }
+
+    [Fact]
+    public async Task ManualRelease_RequiresMatchingRoleAndOnlyReleasesRequestedReservation()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cmm-budget-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var role = CreateRole("cmm_release", price: 1_000_000m, limit: 2m);
+            var ledger = new WorkerBudgetLedger(path);
+            var first = await ledger.ReserveAsync(role, 1);
+            var second = await ledger.ReserveAsync(role, 1);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                ledger.ReleaseReservationAsync(first.Id, "wrong-role"));
+            Assert.Equal(2, (await ledger.PendingReservationsAsync()).Count);
+
+            await ledger.ReleaseReservationAsync(first.Id, role.Id);
+            var remaining = Assert.Single(await ledger.PendingReservationsAsync());
+            Assert.Equal(second.Id, remaining.Id);
+            Assert.Equal(1m, await ledger.GetSpentAsync(role.Id));
+        }
+        finally
+        {
+            DeleteBudgetFiles(path);
+        }
+    }
+
+    private static SubagentRoleDefinition CreateRole(string id, decimal price, decimal limit) =>
+        new(id, id, "test", "model", "low", "read-only", true, "dev",
+            PricePerMillionTokens: price,
+            Currency: "USD",
+            BudgetLimit: limit,
+            MaxTimeoutSeconds: 60);
+
+    private static async Task<bool> TryReserveAsync(
+        WorkerBudgetLedger ledger,
+        SubagentRoleDefinition role,
+        long maximumTokens)
+    {
+        try
+        {
+            await ledger.ReserveAsync(role, maximumTokens);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static void DeleteBudgetFiles(string path)
+    {
+        File.Delete(path);
+        File.Delete(path + ".lock");
+    }
+}
+
+public class LocalConfigurationTransactionTests
+{
+    [Fact]
+    public async Task SecretStore_ConcurrentInstancesMergeDifferentSecretsWithoutLostUpdate()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cmm-secrets-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            var first = new SecretStore(root);
+            var second = new SecretStore(root);
+            await Task.WhenAll(
+                Task.Run(() => first.Save("provider-a", "secret-a")),
+                Task.Run(() => second.Save("provider-b", "secret-b")));
+
+            var reloaded = new SecretStore(root);
+            Assert.Equal("secret-a", reloaded.Read("provider-a"));
+            Assert.Equal("secret-b", reloaded.Read("provider-b"));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void AppSettings_StaleInstanceRefusesToOverwriteNewerSettings()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cmm-settings-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            var first = new AppSettingsService(root);
+            var second = new AppSettingsService(root);
+            first.SetBackupRetention(17, 45, true);
+
+            var error = Assert.Throws<InvalidOperationException>(() =>
+                second.SetProviderName("provider-b", "Provider B"));
+            Assert.Contains("另一个总管家进程", error.Message, StringComparison.Ordinal);
+
+            var reloaded = new AppSettingsService(root);
+            Assert.Equal(17, reloaded.BackupRetentionCount);
+            Assert.Equal(45, reloaded.BackupRetentionDays);
+            Assert.True(reloaded.BackupAutoCleanup);
+            Assert.False(reloaded.TryGetProviderName("provider-b", out _));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void PoolCatalog_StaleInstanceRefusesToOverwriteNewerCatalog()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cmm-pools-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            var first = new PoolCatalogService(root);
+            var second = new PoolCatalogService(root);
+            var added = first.AddCliProxyPool(AccountProduct.CodexPlus);
+
+            var error = Assert.Throws<InvalidOperationException>(() =>
+                second.AddCliProxyPool(AccountProduct.CodexPro));
+            Assert.Contains("另一个总管家进程", error.Message, StringComparison.Ordinal);
+
+            var reloaded = new PoolCatalogService(root);
+            Assert.NotNull(reloaded.Find(added.Id));
+            Assert.Single(reloaded.GetPools(), pool => pool.Id == added.Id);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
         }
     }
 }

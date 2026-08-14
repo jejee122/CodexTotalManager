@@ -37,9 +37,7 @@ public partial class PoolManagementView : UserControl
         _liveUsageTimer.Tick += LiveUsageTimer_Tick;
         Loaded += (_, _) =>
         {
-            if (!RuntimeMode.IsDetachedUi
-                && _services?.CodexConfig.IsManagedNativeProviderSelected() == true)
-                _liveUsageTimer.Start();
+            SynchronizeLiveUsageTimer();
         };
         Unloaded += (_, _) => _liveUsageTimer.Stop();
         PoolsList.ItemsSource = _pools;
@@ -53,6 +51,7 @@ public partial class PoolManagementView : UserControl
     {
         if (RuntimeMode.IsDetachedUi) return;
         if (_services is null) return;
+        SynchronizeLiveUsageTimer();
         if (!_services.CodexConfig.IsManagedNativeProviderSelected())
         {
             await ReloadDisconnectedAsync(cancellationToken);
@@ -98,6 +97,7 @@ public partial class PoolManagementView : UserControl
     public async Task ReloadAsync(RuntimeTruthSnapshot runtimeTruth, CancellationToken cancellationToken = default)
     {
         if (_services is null) return;
+        SynchronizeLiveUsageTimer();
         var viewsTask = _services.AccountPools.ReadViewsAsync(cancellationToken);
         var gatewayTask = ReadGatewaySafelyAsync(cancellationToken);
         var routingAuditTask = _services.AccountPools.ReadNativeRoutingAuditAsync(cancellationToken);
@@ -150,6 +150,11 @@ public partial class PoolManagementView : UserControl
     private async void LiveUsageTimer_Tick(object? sender, EventArgs e)
     {
         if (_services is null || _liveUsageRefreshRunning) return;
+        if (!_services.CodexConfig.IsManagedNativeProviderSelected())
+        {
+            _liveUsageTimer.Stop();
+            return;
+        }
         _liveUsageRefreshRunning = true;
         try
         {
@@ -163,6 +168,21 @@ public partial class PoolManagementView : UserControl
         finally
         {
             _liveUsageRefreshRunning = false;
+        }
+    }
+
+    private void SynchronizeLiveUsageTimer()
+    {
+        var shouldRun = IsLoaded
+                        && !RuntimeMode.IsDetachedUi
+                        && _services?.CodexConfig.IsManagedNativeProviderSelected() == true;
+        if (shouldRun)
+        {
+            if (!_liveUsageTimer.IsEnabled) _liveUsageTimer.Start();
+        }
+        else if (_liveUsageTimer.IsEnabled)
+        {
+            _liveUsageTimer.Stop();
         }
     }
 
