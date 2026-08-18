@@ -9,7 +9,9 @@ public sealed class AppSettingsService
 {
     private readonly string _directory;
     private readonly string _path;
+    private readonly object _saveGate = new();
     private AppSettings _settings;
+    private string _loadedFingerprint;
 
     public string? LoadWarning { get; private set; }
 
@@ -19,6 +21,7 @@ public sealed class AppSettingsService
         _path = Path.Combine(_directory, "settings.json");
         Directory.CreateDirectory(_directory);
         _settings = Load();
+        _loadedFingerprint = LocalFileTransaction.Fingerprint(_path);
     }
 
     public static string ResolveDefaultDataDirectory()
@@ -60,7 +63,7 @@ public sealed class AppSettingsService
             EnsureWritable();
             var uri = ValidateV2rayProxyUri(value);
             if (uri.Port == NativeEnginePort || uri.Port == UnifiedGatewayPort)
-                throw new InvalidOperationException("v2rayN cannot share a port with the Native Engine or unified gateway.");
+                throw new InvalidOperationException("v2rayN 不能和总管家本机引擎或统一网关共用端口。");
             _settings.V2rayProxyUrl = uri.AbsoluteUri.TrimEnd('/');
             Save();
         }
@@ -86,7 +89,7 @@ public sealed class AppSettingsService
         ValidateLocalServicePort(unifiedGatewayPort, nameof(unifiedGatewayPort));
         if (nativeEnginePort == unifiedGatewayPort || nativeEnginePort == V2rayProxyPort
             || unifiedGatewayPort == V2rayProxyPort)
-            throw new InvalidOperationException("Native Engine, unified gateway, and v2rayN must use different ports.");
+            throw new InvalidOperationException("总管家本机引擎、统一网关和 v2rayN 必须使用不同端口。");
         _settings.NativeEnginePort = nativeEnginePort;
         _settings.UnifiedGatewayPort = unifiedGatewayPort;
         Save();
@@ -95,15 +98,17 @@ public sealed class AppSettingsService
     public void SetV2rayConfiguration(string executablePath, string proxyUrl)
     {
         EnsureWritable();
-        if (string.IsNullOrWhiteSpace(executablePath))
-            throw new ArgumentException("Select v2rayN.exe.", nameof(executablePath));
-        var fullPath = Path.GetFullPath(executablePath);
-        if (!File.Exists(fullPath)
-            || !Path.GetFileName(fullPath).Equals("v2rayN.exe", StringComparison.OrdinalIgnoreCase))
-            throw new FileNotFoundException("The selected file is not v2rayN.exe.", fullPath);
+        var fullPath = string.Empty;
+        if (!string.IsNullOrWhiteSpace(executablePath))
+        {
+            fullPath = Path.GetFullPath(executablePath);
+            if (!File.Exists(fullPath)
+                || !Path.GetFileName(fullPath).Equals("v2rayN.exe", StringComparison.OrdinalIgnoreCase))
+                throw new FileNotFoundException("选择的文件不是真实存在的 v2rayN.exe。", fullPath);
+        }
         var uri = ValidateV2rayProxyUri(proxyUrl);
         if (uri.Port == NativeEnginePort || uri.Port == UnifiedGatewayPort)
-            throw new InvalidOperationException("v2rayN cannot share a port with the Native Engine or unified gateway.");
+            throw new InvalidOperationException("v2rayN 不能和总管家本机引擎或统一网关共用端口。");
         _settings.V2rayPath = fullPath;
         _settings.V2rayProxyUrl = uri.AbsoluteUri.TrimEnd('/');
         Save();
@@ -118,17 +123,19 @@ public sealed class AppSettingsService
         EnsureWritable();
         ValidateLocalServicePort(nativeEnginePort, nameof(nativeEnginePort));
         ValidateLocalServicePort(unifiedGatewayPort, nameof(unifiedGatewayPort));
-        if (string.IsNullOrWhiteSpace(executablePath))
-            throw new ArgumentException("Select v2rayN.exe.", nameof(executablePath));
-        var fullPath = Path.GetFullPath(executablePath);
-        if (!File.Exists(fullPath)
-            || !Path.GetFileName(fullPath).Equals("v2rayN.exe", StringComparison.OrdinalIgnoreCase))
-            throw new FileNotFoundException("The selected file is not v2rayN.exe.", fullPath);
+        var fullPath = string.Empty;
+        if (!string.IsNullOrWhiteSpace(executablePath))
+        {
+            fullPath = Path.GetFullPath(executablePath);
+            if (!File.Exists(fullPath)
+                || !Path.GetFileName(fullPath).Equals("v2rayN.exe", StringComparison.OrdinalIgnoreCase))
+                throw new FileNotFoundException("选择的文件不是真实存在的 v2rayN.exe。", fullPath);
+        }
         var uri = ValidateV2rayProxyUri(proxyUrl);
         if (nativeEnginePort == unifiedGatewayPort
             || nativeEnginePort == uri.Port
             || unifiedGatewayPort == uri.Port)
-            throw new InvalidOperationException("Native Engine, unified gateway, and v2rayN must use three different ports.");
+            throw new InvalidOperationException("总管家本机引擎、统一网关和 v2rayN 必须使用三个不同端口。");
         _settings.V2rayPath = fullPath;
         _settings.V2rayProxyUrl = uri.AbsoluteUri.TrimEnd('/');
         _settings.NativeEnginePort = nativeEnginePort;
@@ -139,6 +146,8 @@ public sealed class AppSettingsService
     public int BackupRetentionCount => Math.Clamp(_settings.BackupRetentionCount, 1, 200);
     public int BackupRetentionDays => Math.Clamp(_settings.BackupRetentionDays, 1, 3650);
     public bool BackupAutoCleanup => _settings.BackupAutoCleanup;
+    public bool MinimizeToTray => _settings.MinimizeToTray;
+    public bool ProductSetupCompleted => _settings.ProductSetupCompleted;
     public bool ServerMonitoringEnabled => _settings.ServerMonitoringEnabled
                                             && !string.IsNullOrWhiteSpace(_settings.ServerSshConfigPath)
                                             && !string.IsNullOrWhiteSpace(_settings.ServerSshConfigSha256)
@@ -157,6 +166,14 @@ public sealed class AppSettingsService
         _settings.BackupRetentionCount = count;
         _settings.BackupRetentionDays = days;
         _settings.BackupAutoCleanup = autoCleanup;
+        Save();
+    }
+
+    public void SetProductShellPreferences(bool minimizeToTray, bool markSetupCompleted = false)
+    {
+        EnsureWritable();
+        _settings.MinimizeToTray = minimizeToTray;
+        if (markSetupCompleted) _settings.ProductSetupCompleted = true;
         Save();
     }
 
@@ -264,7 +281,7 @@ public sealed class AppSettingsService
     private static int ValidateLocalServicePort(int port, string name)
     {
         if (!LocalPortPolicy.IsUserPort(port))
-            throw new InvalidOperationException($"{name} must be between 1024 and 65535.");
+            throw new InvalidOperationException($"{name} 必须在 1024 到 65535 之间。");
         return port;
     }
 
@@ -273,8 +290,34 @@ public sealed class AppSettingsService
         if (!File.Exists(_path)) return AppSettings.Default();
         try
         {
-            return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(_path), JsonOptions)
-                   ?? AppSettings.Default();
+            var json = File.ReadAllText(_path);
+            using (var document = JsonDocument.Parse(json))
+            {
+                if (document.RootElement.ValueKind != JsonValueKind.Object)
+                    throw new JsonException("设置文件根节点必须是对象。");
+                var rootNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var property in document.RootElement.EnumerateObject())
+                {
+                    if (!rootNames.Add(property.Name))
+                        throw new JsonException("设置文件包含大小写重复的字段。");
+                }
+            }
+
+            var loaded = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions)
+                         ?? throw new JsonException("设置文件为空。");
+            if (loaded.ProviderNames is null || loaded.ServerAliases is null
+                || loaded.V2rayPath is null || string.IsNullOrWhiteSpace(loaded.V2rayProxyUrl))
+                throw new JsonException("设置文件包含空字段。");
+
+            var providerNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in loaded.ProviderNames)
+            {
+                if (string.IsNullOrWhiteSpace(pair.Key) || string.IsNullOrWhiteSpace(pair.Value)
+                    || !providerNames.TryAdd(pair.Key, pair.Value))
+                    throw new JsonException("模型来源名称表包含空值或大小写重复的编号。");
+            }
+            loaded.ProviderNames = providerNames;
+            return loaded;
         }
         catch
         {
@@ -286,11 +329,17 @@ public sealed class AppSettingsService
 
     private void Save()
     {
-        EnsureWritable();
-        Directory.CreateDirectory(_directory);
-        var temp = _path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(_settings, JsonOptions));
-        File.Move(temp, _path, true);
+        lock (_saveGate)
+        {
+            EnsureWritable();
+            using var fileLock = LocalFileTransaction.Acquire(_path);
+            var currentFingerprint = LocalFileTransaction.Fingerprint(_path);
+            if (!string.Equals(currentFingerprint, _loadedFingerprint, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    "设置文件已被另一个总管家进程修改；已拒绝覆盖，请重新打开设置后再保存。");
+            LocalFileTransaction.WriteAtomic(_path, JsonSerializer.Serialize(_settings, JsonOptions));
+            _loadedFingerprint = LocalFileTransaction.Fingerprint(_path);
+        }
     }
 
     private void EnsureWritable()
@@ -317,6 +366,7 @@ public sealed class AppSettingsService
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
+        PropertyNameCaseInsensitive = true,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
@@ -330,6 +380,8 @@ public sealed class AppSettingsService
         public int BackupRetentionCount { get; set; } = 20;
         public int BackupRetentionDays { get; set; } = 90;
         public bool BackupAutoCleanup { get; set; }
+        public bool MinimizeToTray { get; set; }
+        public bool ProductSetupCompleted { get; set; }
         public bool ServerMonitoringEnabled { get; set; }
         public string? ServerSshConfigPath { get; set; }
         public string? ServerSshConfigSha256 { get; set; }
@@ -337,27 +389,13 @@ public sealed class AppSettingsService
 
         public static AppSettings Default() => new()
         {
-            V2rayPath = ResolveDefaultV2rayPath(),
+            // v2rayN is optional. Never guess a host-specific executable path:
+            // a guessed path can accidentally control an unrelated installation
+            // or carry one machine's layout into another machine's settings.
+            V2rayPath = string.Empty,
             V2rayProxyUrl = "socks5://127.0.0.1:10808",
             NativeEnginePort = LocalPortPolicy.DefaultNativeEnginePort,
             UnifiedGatewayPort = LocalPortPolicy.DefaultUnifiedGatewayPort
         };
-
-        private static string ResolveDefaultV2rayPath()
-        {
-            if (RuntimeMode.IsDetachedUi) return string.Empty;
-            var candidates = new[]
-            {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Desktop", "新建文件夹", "v2rayN", "v2rayN-windows-64", "v2rayN.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Desktop", "v2rayN", "v2rayN-windows-64", "v2rayN.exe"),
-                @"C:\v2rayN\v2rayN-windows-64\v2rayN.exe",
-                @"D:\v2rayN\v2rayN-windows-64\v2rayN.exe"
-            };
-            foreach (var candidate in candidates)
-            {
-                if (File.Exists(candidate)) return candidate;
-            }
-            return candidates[0];
-        }
     }
 }

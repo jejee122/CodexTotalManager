@@ -8,7 +8,7 @@
     <RootNamespace>CodexOpenCodexNative</RootNamespace>
     <AssemblyName>CodexOpenCodexNative</AssemblyName>
     <Version>0.1.0</Version>
-    <Description>OpenCodex 2.7.41 全 C# 重写（原生代理内核），由总管家托管。</Description>
+    <Description>Codex 总管家本机代理内核。</Description>
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />

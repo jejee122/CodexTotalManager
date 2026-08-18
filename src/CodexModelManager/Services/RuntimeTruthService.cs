@@ -35,8 +35,13 @@ public sealed class DefaultRuntimeTruthSource : IRuntimeTruthSource
     {
         var active = _poolCatalog.GetActive();
         var pool = _poolCatalog.Find(active.PoolId);
-        var native = pool?.Transport is PoolTransport.OfficialCodex or PoolTransport.NativeCodexAccount;
-        var expectedTaskModel = native ? active.Model : pool?.RouteAlias;
+        var expectedTaskModel = pool?.Transport switch
+        {
+            PoolTransport.OfficialCodex or PoolTransport.NativeCodexAccount => active.Model,
+            PoolTransport.CliProxyApi when !string.IsNullOrWhiteSpace(pool.ProviderId) =>
+                $"{pool.ProviderId}/{active.Model}",
+            _ => pool?.RouteAlias
+        };
         var accountId = !string.IsNullOrWhiteSpace(pool?.NativeAccountId)
             ? pool.NativeAccountId
             : pool?.ProviderId;
@@ -343,7 +348,7 @@ public sealed class RuntimeTruthService
             Evidence(RuntimeTruthEvidenceSource.CodexDesktop, task.Value?.Connected == true, observedAt,
                 task.Error ?? task.Value?.Message ?? "没有读取到 Codex 当前任务"),
             Evidence(RuntimeTruthEvidenceSource.OpenCodexRoute, route.Value is not null, observedAt,
-                route.Error ?? (route.Value is null ? "没有读取到 OpenCodex 当前号池目标" : $"号池目标 {route.Value.Targets.Count} 个")),
+                route.Error ?? (route.Value is null ? "没有读取到总管家本机引擎的当前号池目标" : $"号池目标 {route.Value.Targets.Count} 个")),
             Evidence(RuntimeTruthEvidenceSource.OpenCodexLog, execution.Value is not null, observedAt,
                 execution.Error ?? (execution.Value is null ? "没有读取到最近实际执行" : $"实际尝试 {execution.Value.Attempts.Count} 次"))
         };

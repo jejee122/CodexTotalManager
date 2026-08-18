@@ -22,8 +22,8 @@ public partial class MainWindow
             LocalServiceSummaryDetail.Text = string.Join(" · ", statuses.Select(item => $"{item.Name}：{item.PlainStatus}"));
             LocalServiceNextStep.Text = statuses.All(item => item.Running)
                 ? "不用操作。只有遇到连接问题时再展开对应卡片。"
-                : statuses.Any(item => item.Id == "opencodex" && !item.Running)
-                    ? "建议先启动 OpenCodex；官方 Codex 直连仍可作为保底。"
+                : statuses.Any(item => item.Id == "native-engine" && !item.Running)
+            ? "建议先启动总管家本机引擎；官方 Codex 直连仍可作为保底。"
                     : statuses.Any(item => item.Id == "v2rayn" && !item.Running)
                         ? "需要国外模型时再启动 v2rayN；不使用时可以保持现状。"
                         : "Dream Skin 当前未实时运行；这只影响皮肤，不影响模型和聊天。";
@@ -66,9 +66,9 @@ public partial class MainWindow
         {
             switch (serviceId)
             {
-                case "opencodex":
+                case "native-engine":
                     if (!await _services.Process.EnsureNativeEngineOnlyAsync())
-                        throw new InvalidOperationException("OpenCodex 启动后没有通过健康检查。");
+                    throw new InvalidOperationException("总管家本机引擎启动后没有通过健康检查。");
                     break;
                 case "v2rayn":
                     if (!await _services.LocalServices.StartV2rayAsync())
@@ -124,7 +124,14 @@ public partial class MainWindow
                 V2rayProxyUrlTextBox.Text.Trim(),
                 nativePort,
                 gatewayPort);
-            V2raySettingsResultText.Text = "已一次性保存全部设置；没有启动或重启任何程序。核心端口有改动时，请先关闭 Codex 和总管家，再重新打开。";
+            // The pool allocator lives for the lifetime of this window. Keep
+            // its reserved-port set in sync immediately so a user cannot save
+            // new core ports and then allocate a CLI pool onto one of them
+            // before reopening the application.
+            _services.PoolCatalog.UpdateReservedPorts(_services.Settings.ReservedLocalPorts);
+            V2raySettingsResultText.Text = string.IsNullOrWhiteSpace(V2rayPathTextBox.Text)
+                ? "核心端口和代理地址已保存；v2rayN 未配置，不影响不需要代理的模型。没有启动或重启任何程序。核心端口有改动时，请先关闭 Codex 和总管家，再重新打开。"
+                : "已一次性保存全部设置；没有启动或重启任何程序。核心端口有改动时，请先关闭 Codex 和总管家，再重新打开。";
             await Task.CompletedTask;
         }
         catch (Exception ex)
@@ -138,7 +145,7 @@ public partial class MainWindow
         if (_busy || sender is not Button { Tag: string serviceId }) return;
         var consequence = serviceId switch
         {
-            "opencodex" => "外部 API 模型会暂时不可用；Codex 官方直连模型仍可使用。",
+            "native-engine" => "外部 API 模型会暂时不可用；Codex 官方直连模型仍可使用。",
             "v2rayn" => "国外模型和其他依赖 v2rayN 的程序会暂时断网。",
             "dreamskin" => "只暂停皮肤并恢复官方外观；模型、账号和聊天不会改变。",
             _ => "服务会停止。"
@@ -154,12 +161,12 @@ public partial class MainWindow
         {
             switch (serviceId)
             {
-                case "opencodex":
+                case "native-engine":
                     _services.Backups.Create();
                     if (!await _services.Process.StopOpenCodexAsync())
-                        throw new InvalidOperationException("OpenCodex 没有确认停止。");
+                    throw new InvalidOperationException("总管家本机引擎没有确认停止。");
                     if ((await _services.OpenCodex.GetRuntimeStatusAsync()).Healthy)
-                        throw new InvalidOperationException("OpenCodex 停止后健康端点仍然在线。");
+                    throw new InvalidOperationException("总管家本机引擎停止后健康端点仍然在线。");
                     break;
                 case "v2rayn":
                     if (!await _services.LocalServices.StopV2rayAsync())
@@ -192,10 +199,10 @@ public partial class MainWindow
         {
             switch (serviceId)
             {
-                case "opencodex":
+                case "native-engine":
                     _services.Backups.Create();
                     if (!await _services.Process.RestartNativeEngineOnlyAsync())
-                        throw new InvalidOperationException("OpenCodex 重启后没有通过健康检查。");
+                    throw new InvalidOperationException("总管家本机引擎重启后没有通过健康检查。");
                     break;
                 case "v2rayn":
                     if (!await _services.LocalServices.RestartV2rayAsync())
@@ -291,7 +298,7 @@ public partial class MainWindow
         {
             switch (item.Type)
             {
-                case "OpenCodex 配置":
+            case "总管家本机引擎配置":
                     await RestoreOpenCodexBackupAsync(item.Path);
                     break;
                 case "Codex 配置":
@@ -452,7 +459,7 @@ public partial class MainWindow
 
     private static string ServiceName(string id) => id switch
     {
-        "opencodex" => "OpenCodex",
+        "native-engine" => "总管家本机引擎",
         "v2rayn" => "v2rayN",
         "dreamskin" => "Dream Skin",
         _ => id

@@ -26,7 +26,7 @@ public sealed class ConfigBackupService
 
     public string Create()
     {
-        if (!File.Exists(_source)) throw new FileNotFoundException("找不到 OpenCodex 配置。", _source);
+        if (!File.Exists(_source)) throw new FileNotFoundException("找不到总管家本机引擎配置。", _source);
         Directory.CreateDirectory(_directory);
         var path = Path.Combine(_directory, $"config-{DateTime.Now:yyyyMMdd-HHmmss-fff}.json");
         File.Copy(_source, path, false);
@@ -35,8 +35,8 @@ public sealed class ConfigBackupService
 
     public string CreateAccountDeletionBackup(string poolCatalogPath)
     {
-        if (!File.Exists(_source)) throw new FileNotFoundException("找不到 OpenCodex 配置。", _source);
-        if (!File.Exists(poolCatalogPath)) throw new FileNotFoundException("找不到大管家号池清单。", poolCatalogPath);
+        if (!File.Exists(_source)) throw new FileNotFoundException("找不到总管家本机引擎配置。", _source);
+        if (!File.Exists(poolCatalogPath)) throw new FileNotFoundException("找不到总管家号池清单。", poolCatalogPath);
 
         var sourceDirectory = Path.GetDirectoryName(_source)!;
         var oauthStore = Path.Combine(sourceDirectory, "oauth-tokens.json");

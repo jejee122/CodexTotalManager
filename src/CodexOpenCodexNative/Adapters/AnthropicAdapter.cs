@@ -12,7 +12,7 @@ public sealed class AnthropicAdapter : IProviderAdapter
 
     public AnthropicAdapter(HttpClient? http = null)
     {
-        _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
+        _http = http ?? AdapterHttpTransport.Shared;
     }
 
     public string AdapterId => "anthropic";
@@ -44,7 +44,8 @@ public sealed class AnthropicAdapter : IProviderAdapter
                 Streaming = false,
                 ContentType = "application/json",
                 JsonBody = BuildErrorBody((int)response.StatusCode, errorBody),
-                StatusCode = (int)response.StatusCode
+                StatusCode = (int)response.StatusCode,
+                Owner = response
             };
         }
 
@@ -55,17 +56,70 @@ public sealed class AnthropicAdapter : IProviderAdapter
             {
                 Streaming = true,
                 ContentType = "text/event-stream",
-                Events = ParseSseStream(stream, cancellationToken)
+                Events = ParseSseStream(stream, cancellationToken),
+                Owner = response
             };
         }
 
         var jsonBody = await response.Content.ReadAsStringAsync(cancellationToken);
+        var normalized = ParseNonStreamingResponse(jsonBody);
         return new AdapterResponse
         {
             Streaming = false,
             ContentType = "application/json",
-            JsonBody = jsonBody
+            JsonBody = jsonBody,
+            Message = normalized.Message,
+            FinishReason = normalized.FinishReason,
+            Usage = normalized.Usage,
+            Owner = response
         };
+    }
+
+    internal static AnthropicNormalizedResponse ParseNonStreamingResponse(string jsonBody)
+    {
+        using var document = JsonDocument.Parse(jsonBody);
+        var root = document.RootElement;
+        var message = new OcxMessage { Role = "assistant" };
+        var text = new StringBuilder();
+        var calls = new List<OcxToolCall>();
+        if (root.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var block in content.EnumerateArray())
+            {
+                var type = ReadString(block, "type");
+                if (type == "text")
+                {
+                    text.Append(ReadString(block, "text"));
+                    continue;
+                }
+                if (type != "tool_use") continue;
+                calls.Add(new OcxToolCall
+                {
+                    Id = ReadString(block, "id"),
+                    Function = new OcxToolCallFunction
+                    {
+                        Name = ReadString(block, "name"),
+                        Arguments = block.TryGetProperty("input", out var input)
+                            ? input.GetRawText()
+                            : "{}"
+                    }
+                });
+            }
+        }
+        message.Content = text.ToString();
+        if (calls.Count > 0) message.ToolCalls = calls;
+        var usage = new OcxUsage();
+        if (root.TryGetProperty("usage", out var usageNode))
+        {
+            usage.PromptTokens = ReadLong(usageNode, "input_tokens");
+            usage.CompletionTokens = ReadLong(usageNode, "output_tokens");
+            usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens;
+        }
+        var stopReason = ReadString(root, "stop_reason");
+        return new AnthropicNormalizedResponse(
+            message,
+            stopReason == "tool_use" ? "tool_calls" : stopReason == "max_tokens" ? "length" : "stop",
+            usage);
     }
 
     public static string BuildRequestJson(OcxParsedRequest request, string modelId)
@@ -77,7 +131,7 @@ public sealed class AnthropicAdapter : IProviderAdapter
             ["stream"] = request.Stream
         };
 
-        var system = new JsonArray();
+        var system = new List<string>();
         var messages = new JsonArray();
         foreach (var message in request.Messages)
         {
@@ -86,28 +140,42 @@ public sealed class AnthropicAdapter : IProviderAdapter
                 case "system":
                 case "developer":
                 {
-                    system.Add(message.Content?.ToString() ?? string.Empty);
+                    var text = OcxMessageContent.ExtractText(message.Content).Trim();
+                    if (text.Length > 0) system.Add(text);
                     break;
                 }
                 case "tool":
                 {
-                    var result = new JsonArray
+                    var result = new JsonObject
                     {
-                        new JsonObject
-                        {
-                            ["type"] = "tool_result",
-                            ["tool_use_id"] = message.ToolCallId ?? string.Empty,
-                            ["content"] = message.Content?.ToString() ?? string.Empty
-                        }
+                        ["type"] = "tool_result",
+                        ["tool_use_id"] = message.ToolCallId ?? string.Empty,
+                        ["content"] = OcxMessageContent.ExtractText(message.Content)
                     };
-                    messages.Add(new JsonObject { ["role"] = "user", ["content"] = result });
+                    if (messages.Count > 0
+                        && messages[^1] is JsonObject previous
+                        && previous["role"]?.GetValue<string>() == "user"
+                        && previous["content"] is JsonArray previousBlocks
+                        && previousBlocks.All(block => block?["type"]?.GetValue<string>() == "tool_result"))
+                    {
+                        previousBlocks.Add(result);
+                    }
+                    else
+                    {
+                        messages.Add(new JsonObject
+                        {
+                            ["role"] = "user",
+                            ["content"] = new JsonArray(result)
+                        });
+                    }
                     break;
                 }
                 case "assistant" when message.ToolCalls is { Count: > 0 }:
                 {
                     var blocks = new JsonArray();
-                    if (message.Content is { } content && !string.IsNullOrWhiteSpace(content.ToString()))
-                        blocks.Add(new JsonObject { ["type"] = "text", ["text"] = content.ToString() });
+                    var assistantText = OcxMessageContent.ExtractText(message.Content);
+                    if (!string.IsNullOrWhiteSpace(assistantText))
+                        blocks.Add(new JsonObject { ["type"] = "text", ["text"] = assistantText });
                     foreach (var call in message.ToolCalls)
                     {
                         blocks.Add(new JsonObject
@@ -126,15 +194,19 @@ public sealed class AnthropicAdapter : IProviderAdapter
                     messages.Add(new JsonObject
                     {
                         ["role"] = message.Role,
-                        ["content"] = message.Content?.ToString() ?? string.Empty
+                        ["content"] = OcxMessageContent.ExtractText(message.Content)
                     });
                     break;
                 }
             }
         }
 
+        // Anthropic accepts one system string or an array of typed content
+        // blocks. A raw JSON string array is not a valid Messages request.
+        // Joining preserves the order of OpenAI system/developer messages and
+        // avoids sending a shape that the real Anthropic endpoint rejects.
         if (system.Count > 0)
-            root["system"] = system.Count == 1 ? system[0] : system;
+            root["system"] = string.Join("\n\n", system);
         root["messages"] = messages;
 
         if (request.Tools is { Count: > 0 })
@@ -155,7 +227,58 @@ public sealed class AnthropicAdapter : IProviderAdapter
                 root["tools"] = tools;
         }
 
+        if (BuildToolChoice(request.ToolChoice, request.ParallelToolCalls) is { } toolChoice)
+            root["tool_choice"] = toolChoice;
+        if (request.Temperature is not null)
+            root["temperature"] = request.Temperature;
+
         return root.ToJsonString();
+    }
+
+    private static JsonObject? BuildToolChoice(JsonElement? choice, bool? parallelToolCalls)
+    {
+        if (choice is not { ValueKind: not JsonValueKind.Undefined and not JsonValueKind.Null }
+            && parallelToolCalls is null)
+            return null;
+
+        var result = new JsonObject { ["type"] = "auto" };
+        if (choice is { } selected)
+        {
+            if (selected.ValueKind == JsonValueKind.String)
+            {
+                result["type"] = selected.GetString()?.ToLowerInvariant() switch
+                {
+                    "required" => "any",
+                    "none" => "none",
+                    _ => "auto"
+                };
+            }
+            else if (selected.ValueKind == JsonValueKind.Object)
+            {
+                var type = ReadString(selected, "type")?.ToLowerInvariant();
+                if (type == "function")
+                {
+                    var name = ReadString(selected, "name");
+                    if (string.IsNullOrWhiteSpace(name)
+                        && selected.TryGetProperty("function", out var function))
+                        name = ReadString(function, "name");
+                    result["type"] = "tool";
+                    result["name"] = name ?? string.Empty;
+                }
+                else
+                {
+                    result["type"] = type switch
+                    {
+                        "required" => "any",
+                        "none" => "none",
+                        _ => "auto"
+                    };
+                }
+            }
+        }
+        if (parallelToolCalls == false)
+            result["disable_parallel_tool_use"] = true;
+        return result;
     }
 
     private static JsonNode ParseArguments(string? arguments)
@@ -178,6 +301,8 @@ public sealed class AnthropicAdapter : IProviderAdapter
         using var reader = new StreamReader(raw, Encoding.UTF8);
         var currentEvent = string.Empty;
         var usage = new OcxUsage();
+        var toolCalls = new Dictionary<int, PendingAnthropicToolCall>();
+        string? stopReason = null;
 
         while (await reader.ReadLineAsync(cancellationToken) is { } line)
         {
@@ -201,30 +326,108 @@ public sealed class AnthropicAdapter : IProviderAdapter
 
             switch (currentEvent)
             {
+                case "message_start":
+                {
+                    if (root.TryGetProperty("message", out var message)
+                        && message.TryGetProperty("usage", out var startUsage))
+                    {
+                        usage.PromptTokens = ReadLong(startUsage, "input_tokens");
+                        usage.CompletionTokens = ReadLong(startUsage, "output_tokens");
+                        usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens;
+                    }
+                    break;
+                }
+                case "content_block_start":
+                {
+                    var index = ReadInt(root, "index");
+                    if (!root.TryGetProperty("content_block", out var block)
+                        || !string.Equals(ReadString(block, "type"), "tool_use", StringComparison.Ordinal))
+                        break;
+                    var pending = new PendingAnthropicToolCall(
+                        index,
+                        ReadString(block, "id"),
+                        ReadString(block, "name"));
+                    toolCalls[index] = pending;
+                    yield return new AdapterEvent
+                    {
+                        Type = "function_call",
+                        CallId = pending.CallId,
+                        FunctionName = pending.Name,
+                        ToolCallIndex = pending.Index
+                    };
+                    break;
+                }
                 case "content_block_delta":
                 {
-                    if (root.TryGetProperty("delta", out var delta)
-                        && delta.TryGetProperty("type", out var deltaType)
-                        && deltaType.GetString() == "text_delta"
-                        && delta.TryGetProperty("text", out var text))
+                    if (!root.TryGetProperty("delta", out var delta)) break;
+                    var deltaType = ReadString(delta, "type");
+                    if (deltaType == "text_delta" && delta.TryGetProperty("text", out var text))
                     {
                         yield return new AdapterEvent { Type = "text", Text = text.GetString() ?? string.Empty, Role = "assistant" };
                     }
+                    else if (deltaType == "input_json_delta")
+                    {
+                        var index = ReadInt(root, "index");
+                        if (!toolCalls.TryGetValue(index, out var pending)) break;
+                        var arguments = ReadString(delta, "partial_json") ?? string.Empty;
+                        pending.Arguments.Append(arguments);
+                        yield return new AdapterEvent
+                        {
+                            Type = "function_call",
+                            Arguments = arguments,
+                            ToolCallIndex = pending.Index
+                        };
+                    }
+                    break;
+                }
+                case "content_block_stop":
+                {
+                    var index = ReadInt(root, "index");
+                    if (!toolCalls.TryGetValue(index, out var pending) || pending.Done) break;
+                    pending.Done = true;
+                    yield return new AdapterEvent
+                    {
+                        Type = "function_call_done",
+                        CallId = pending.CallId,
+                        FunctionName = pending.Name,
+                        Arguments = pending.Arguments.ToString(),
+                        ToolCallIndex = pending.Index
+                    };
                     break;
                 }
                 case "message_delta":
                 {
+                    if (root.TryGetProperty("delta", out var messageDelta))
+                        stopReason = ReadString(messageDelta, "stop_reason") ?? stopReason;
                     if (root.TryGetProperty("usage", out var usageNode))
                     {
-                        usage.CompletionTokens = ReadLong(usageNode, "output_tokens");
-                        usage.PromptTokens = ReadLong(usageNode, "input_tokens");
+                        var output = ReadLong(usageNode, "output_tokens");
+                        var input = ReadLong(usageNode, "input_tokens");
+                        if (output > 0) usage.CompletionTokens = output;
+                        if (input > 0) usage.PromptTokens = input;
                         usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens;
                     }
                     break;
                 }
                 case "message_stop":
                 {
-                    yield return new AdapterEvent { Type = "done", Usage = usage };
+                    foreach (var pending in toolCalls.Values.Where(call => !call.Done).OrderBy(call => call.Index))
+                    {
+                        yield return new AdapterEvent
+                        {
+                            Type = "function_call_done",
+                            CallId = pending.CallId,
+                            FunctionName = pending.Name,
+                            Arguments = pending.Arguments.ToString(),
+                            ToolCallIndex = pending.Index
+                        };
+                    }
+                    yield return new AdapterEvent { Type = "usage", Usage = usage };
+                    yield return new AdapterEvent
+                    {
+                        Type = "finish",
+                        FinishReason = stopReason == "max_tokens" ? "max_tokens" : stopReason == "tool_use" ? "tool_calls" : "stop"
+                    };
                     yield break;
                 }
                 case "error":
@@ -258,4 +461,26 @@ public sealed class AnthropicAdapter : IProviderAdapter
 
     private static long ReadLong(JsonElement root, string name) =>
         root.TryGetProperty(name, out var value) && value.TryGetInt64(out var number) ? number : 0;
+
+    private static int ReadInt(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.TryGetInt32(out var number) ? number : 0;
+
+    private static string? ReadString(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private sealed class PendingAnthropicToolCall(int index, string? callId, string? name)
+    {
+        public int Index { get; } = index;
+        public string? CallId { get; } = callId;
+        public string? Name { get; } = name;
+        public StringBuilder Arguments { get; } = new();
+        public bool Done { get; set; }
+    }
+
+    internal sealed record AnthropicNormalizedResponse(
+        OcxMessage Message,
+        string FinishReason,
+        OcxUsage Usage);
 }

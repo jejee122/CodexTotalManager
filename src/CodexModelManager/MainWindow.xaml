@@ -687,6 +687,8 @@
                             Click="ServersNavButton_Click" Content="⌁  服务器"/>
                     <Button x:Name="ExtensionsNavButton" Style="{StaticResource NavButton}"
                             Click="ExtensionsNavButton_Click" Content="▧  自定义插件"/>
+                    <Button x:Name="SoftwareNavButton" Style="{StaticResource NavButton}"
+                            Click="SoftwareNavButton_Click" Content="⚙  软件中心"/>
                     <Button x:Name="StudyNavButton" Style="{StaticResource NavButton}"
                             Click="StudyNavButton_Click" Content="↗  考研学习"
                             ToolTip="启动并打开知耕考研学习系统"/>
@@ -820,7 +822,7 @@
                                             <TextBlock Text="本机连接" Foreground="{StaticResource Muted}" FontSize="11"/>
                                             <TextBlock x:Name="HomeLocalServiceText" Text="正在检查…" FontSize="18" FontWeight="SemiBold"
                                                        Margin="0,7,0,0" TextWrapping="Wrap"/>
-                                            <TextBlock x:Name="HomeLocalServiceDetail" Text="OpenCodex 和 v2rayN" Foreground="{StaticResource Muted}"
+                    <TextBlock x:Name="HomeLocalServiceDetail" Text="总管家本机引擎和 v2rayN" Foreground="{StaticResource Muted}"
                                                        FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
                                         </StackPanel>
                                     </Grid>
@@ -1023,7 +1025,7 @@
                                 CornerRadius="4" Padding="17" Margin="0,0,6,16">
                             <StackPanel>
                                 <TextBlock Text="数据口径" Foreground="#F1E7CB" FontWeight="SemiBold" FontSize="14"/>
-                                <TextBlock x:Name="TokenSourceText" Text="正在读取 ~/.opencodex/usage.jsonl"
+                                <TextBlock x:Name="TokenSourceText" Text="正在读取总管家本机请求日志"
                                            Foreground="#9CB5B8" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
                                 <TextBlock Text="这里统计调用产生的输入与输出 Token；套餐剩余百分比仍以中转站各账号卡片返回的官方额度为准。"
                                            Foreground="#78999D" FontSize="12" Margin="0,5,0,0" TextWrapping="Wrap"/>
@@ -1234,10 +1236,20 @@
                                         HorizontalAlignment="Left" Padding="12,7" Margin="0,0,0,18"
                                         Click="BackToModelsButton_Click"/>
                                 <TextBlock x:Name="ProviderFormTitle" Text="添加模型来源" FontSize="18" FontWeight="Bold"/>
-                                <TextBlock Text="只连接模型接口，不登录服务器，也不会修改服务器。"
-                                           Foreground="{StaticResource Muted}" FontSize="13" Margin="0,6,0,22"/>
+                                 <TextBlock Text="只连接模型接口，不登录服务器，也不会修改服务器。"
+                                            Foreground="{StaticResource Muted}" FontSize="13" Margin="0,6,0,22"/>
 
-                                <TextBlock Style="{StaticResource LabelText}" Text="给它起个名字"/>
+                                 <TextBlock Style="{StaticResource LabelText}" Text="常用模型来源"/>
+                                 <ComboBox x:Name="ProviderPresetBox" Height="44" Padding="10,7" FontSize="14"
+                                           Foreground="{StaticResource Ink}" Background="{StaticResource SurfaceStrong}"
+                                           BorderBrush="{StaticResource Line}" BorderThickness="1"
+                                           SelectionChanged="ProviderPresetBox_SelectionChanged"/>
+                                 <TextBlock x:Name="ProviderPresetHint"
+                                            Text="选择模板只会填写公开地址和协议，API Key 仍由你自己填写。"
+                                            Foreground="{StaticResource Muted}" FontSize="12" Margin="0,6,0,18"
+                                            TextWrapping="Wrap"/>
+
+                                 <TextBlock Style="{StaticResource LabelText}" Text="给它起个名字"/>
                                 <TextBox x:Name="ProviderNameBox" Style="{StaticResource InputBox}"/>
                                 <TextBlock Text="例如：我的中转站" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,6,0,18"/>
 
@@ -1258,11 +1270,13 @@
                                           Foreground="{StaticResource Ink}" Background="{StaticResource SurfaceStrong}"
                                           BorderBrush="{StaticResource Line}" BorderThickness="1"
                                           SelectedIndex="0">
-                                    <ComboBoxItem Content="OpenAI 兼容接口（推荐）" Tag="openai-chat"/>
-                                    <ComboBoxItem Content="OpenAI Responses 接口" Tag="openai-responses"/>
-                                </ComboBox>
-                                <TextBlock Text="大多数中转站选第一项。只有服务商明确写了 Responses 才选第二项。"
-                                           Foreground="{StaticResource Muted}" FontSize="12" Margin="0,6,0,18" TextWrapping="Wrap"/>
+                                     <ComboBoxItem Content="OpenAI 兼容接口（推荐）" Tag="openai-chat"/>
+                                     <ComboBoxItem Content="OpenAI Responses 接口" Tag="openai-responses"/>
+                                     <ComboBoxItem Content="Anthropic Messages 接口" Tag="anthropic"/>
+                                     <ComboBoxItem Content="Google Gemini 原生接口" Tag="google"/>
+                                 </ComboBox>
+                                 <TextBlock Text="使用上面的内置模板会自动选对。自建中转站通常选 OpenAI 兼容接口。"
+                                            Foreground="{StaticResource Muted}" FontSize="12" Margin="0,6,0,18" TextWrapping="Wrap"/>
 
                                 <TextBlock Style="{StaticResource LabelText}" Text="上下文长度"/>
                                 <TextBox x:Name="ProviderContextBox" Style="{StaticResource InputBox}" Text="128000"/>
@@ -1314,7 +1328,7 @@
                                                                 </Grid.ColumnDefinitions>
                                                                 <TextBlock Text="{Binding Label}" FontWeight="SemiBold" FontSize="12"/>
                                                                 <TextBlock Grid.Column="1" Text="{Binding SummaryText}" FontSize="12" Margin="18,0,0,0"/>
-                                                                <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="{Binding UsedPercent}"
+                                                                <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="{Binding VisualUsedPercent}"
                                                                              Width="400" Height="7" Margin="0,5,0,0" HorizontalAlignment="Left"
                                                                              Foreground="{StaticResource Jade}" Background="#38142D34"/>
                                                                 <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding ResetText}" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,4,0,0"/>
@@ -1730,6 +1744,117 @@
                 </ScrollViewer>
 
                 <views:ExtensionManagementView x:Name="ExtensionsPage" Visibility="Collapsed"/>
+
+                <ScrollViewer x:Name="SoftwarePage" Visibility="Collapsed"
+                              VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Margin="30,26,24,38">
+                        <Border x:Name="FirstRunGuidePanel" Style="{StaticResource HeroGlassCard}">
+                            <StackPanel>
+                                <TextBlock Text="第一次使用总管家" Style="{StaticResource CloudTitleText}" FontSize="21"/>
+                                <TextBlock Text="先确认三件事：默认不连接 Codex；账号和密钥只保存在本机；候选版更新必须由你手动确认。"
+                                           Foreground="#D5E5E1" FontSize="13" Margin="0,9,0,0" TextWrapping="Wrap"/>
+                                <TextBlock Text="1. 先在中转站添加来源并测试。&#x0a;2. 需要时才在首页点击一键连接 Codex。&#x0a;3. 出错先到本页复制诊断摘要，不要粘贴真实 Cookie、Token 或 API Key。"
+                                           Foreground="#AFC9C6" FontSize="12" Margin="0,13,0,14" TextWrapping="Wrap"/>
+                                <Button x:Name="CompleteFirstRunButton" Style="{StaticResource PrimaryButton}"
+                                        Content="我知道了，完成首次设置" HorizontalAlignment="Left"
+                                        Click="CompleteFirstRunButton_Click"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Grid Margin="0,0,0,2">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Border Grid.Column="0" Style="{StaticResource PageCard}">
+                                <StackPanel>
+                                    <TextBlock Text="关于总管家" FontSize="19" FontWeight="Bold"/>
+                                    <TextBlock x:Name="ProductVersionText" Text="版本读取中" Foreground="#79DDBA"
+                                               FontFamily="{StaticResource CodeFont}" FontSize="14" Margin="0,8,0,0"/>
+                                    <TextBlock x:Name="ProductChannelText" Text="正在确认发布状态" Foreground="{StaticResource Muted}"
+                                               FontSize="12" Margin="0,7,0,0" TextWrapping="Wrap"/>
+                                    <TextBlock Text="它是 Codex 的本机控制面，不是聊天客户端，也不会替换 Codex。"
+                                               Foreground="#C5D8D5" FontSize="12" Margin="0,13,0,0" TextWrapping="Wrap"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="打开 GitHub 项目主页"
+                                            HorizontalAlignment="Left" Margin="0,15,0,0" Click="OpenProjectHomeButton_Click"/>
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="1" Style="{StaticResource PageCard}">
+                                <StackPanel>
+                                    <TextBlock Text="隐私与许可证" FontSize="19" FontWeight="Bold"/>
+                                    <TextBlock Text="总管家不会把聊天、账号、Cookie、Token、API Key、SSH 配置或服务器身份上传到 GitHub。Provider 请求只发给你明确添加的上游。"
+                                               Foreground="#C5D8D5" FontSize="12" Margin="0,9,0,0" TextWrapping="Wrap"/>
+                                    <TextBlock Text="总管家源码采用 MIT 许可证。CLIProxyAPI、Dream Skin 等第三方资源继续遵守各自许可证；发布包必须保留对应来源、版本和许可证说明。"
+                                               Foreground="#E5C78A" FontSize="12" Margin="0,11,0,0" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+
+                        <Border Style="{StaticResource PageCard}">
+                            <StackPanel>
+                                <TextBlock Text="Windows 使用习惯" FontSize="19" FontWeight="Bold"/>
+                                <TextBlock Text="这些设置只管理总管家自己，不会启动、关闭或重启 Codex。"
+                                           Foreground="{StaticResource Muted}" FontSize="12" Margin="0,7,0,14"/>
+                                <CheckBox x:Name="ProductStartWithWindowsBox" Content="登录 Windows 后自动打开总管家"
+                                          Foreground="#EAF5F1" FontSize="13" Margin="0,0,0,10"/>
+                                <CheckBox x:Name="ProductMinimizeToTrayBox" Content="最小化或点关闭时收进系统托盘"
+                                          Foreground="#EAF5F1" FontSize="13" Margin="0,0,0,14"/>
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="SaveDesktopPreferencesButton" Style="{StaticResource PrimaryButton}"
+                                            Content="保存软件设置" Click="SaveDesktopPreferencesButton_Click"/>
+                                    <Button Style="{StaticResource DangerButton}" Content="完全退出总管家"
+                                            Margin="10,0,0,0" Click="ExitProductButton_Click"/>
+                                </StackPanel>
+                                <TextBlock x:Name="ProductDesktopStatusText" Text="正在读取 Windows 设置…"
+                                           Foreground="#AFC9C6" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource PageCard}">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="软件更新" FontSize="19" FontWeight="Bold"/>
+                                    <TextBlock Text="只检查 jejee122/CodexTotalManager 的公开 GitHub Release。不会静默下载、静默安装，也不会拿源码分支冒充正式更新。"
+                                               Foreground="{StaticResource Muted}" FontSize="12" Margin="0,7,18,0" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="ProductUpdateStatusText" Text="尚未检查更新。"
+                                               Foreground="#AFC9C6" FontSize="12" Margin="0,10,18,0" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                    <Button x:Name="CheckProductUpdateButton" Style="{StaticResource PrimaryButton}"
+                                            Content="手动检查更新" Click="CheckProductUpdateButton_Click"/>
+                                    <Button x:Name="OpenProductReleaseButton" Style="{StaticResource SecondaryButton}"
+                                            Content="打开 Release 页面" IsEnabled="False" Margin="0,8,0,0"
+                                            Click="OpenProductReleaseButton_Click"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <Border Style="{StaticResource PageCard}">
+                            <StackPanel>
+                                <TextBlock Text="诊断、日志和用户数据" FontSize="19" FontWeight="Bold"/>
+                                <TextBlock Text="复制出去的是脱敏摘要；详细崩溃记录和用户数据只在本机目录中。清理前先确认是否还需要账本和备份。"
+                                           Foreground="{StaticResource Muted}" FontSize="12" Margin="0,7,0,12" TextWrapping="Wrap"/>
+                                <TextBox x:Name="DiagnosticSummaryBox" Style="{StaticResource InputBox}" IsReadOnly="True"
+                                         MinHeight="190" AcceptsReturn="True" TextWrapping="Wrap"
+                                         VerticalContentAlignment="Top" FontFamily="{StaticResource CodeFont}" FontSize="11"/>
+                                <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                    <Button Style="{StaticResource PrimaryButton}" Content="复制脱敏诊断摘要"
+                                            Click="CopyDiagnosticSummaryButton_Click"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="打开诊断日志"
+                                            Margin="9,0,0,0" Click="OpenDiagnosticFolderButton_Click"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="打开用户数据目录"
+                                            Margin="9,0,0,0" Click="OpenProductDataFolderButton_Click"/>
+                                </StackPanel>
+                                <TextBlock x:Name="ProductDiagnosticStatusText" Text="摘要不会读取聊天正文或密钥内容。"
+                                           Foreground="#AFC9C6" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
 
                 <ScrollViewer x:Name="ServersPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="30,26,24,38">

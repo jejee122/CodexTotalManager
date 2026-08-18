@@ -31,6 +31,7 @@ public sealed class OpenCodexClient
 
     private readonly HttpClient _http;
     private readonly int _expectedPort;
+    private readonly string? _requestLogPath;
     public string ManagementUrl => $"http://127.0.0.1:{_expectedPort}/";
 
     private static HttpClient CreateDefaultClient(
@@ -65,18 +66,22 @@ public sealed class OpenCodexClient
     private readonly Dictionary<string, ProviderHealthState> _providerHealth =
         new(StringComparer.OrdinalIgnoreCase);
 
-    public OpenCodexClient() : this(CreateDefaultClient()) { }
+    public OpenCodexClient() : this(CreateDefaultClient(), null) { }
 
-    public OpenCodexClient(string nativeEngineDataRoot) : this(CreateDefaultClient(nativeEngineDataRoot)) { }
+    public OpenCodexClient(string nativeEngineDataRoot)
+        : this(CreateDefaultClient(nativeEngineDataRoot), nativeEngineDataRoot) { }
 
     public OpenCodexClient(string nativeEngineDataRoot, int nativeEnginePort)
-        : this(CreateDefaultClient(nativeEngineDataRoot, nativeEnginePort)) { }
+        : this(CreateDefaultClient(nativeEngineDataRoot, nativeEnginePort), nativeEngineDataRoot) { }
 
-    public OpenCodexClient(HttpClient http)
+    public OpenCodexClient(HttpClient http, string? nativeEngineDataRoot = null)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
         _http.BaseAddress ??= new Uri("http://127.0.0.1:10100");
         _expectedPort = _http.BaseAddress.Port;
+        _requestLogPath = string.IsNullOrWhiteSpace(nativeEngineDataRoot)
+            ? null
+            : Path.Combine(Path.GetFullPath(nativeEngineDataRoot), "request-log.jsonl");
     }
 
     private sealed class NativeAdmissionHandler(string dataRoot) : DelegatingHandler
@@ -457,16 +462,18 @@ public sealed class OpenCodexClient
                             ?? ReadString(item, "resolvedModel")
                             ?? ReadString(item, "model")
                             ?? "unknown";
-                var status = ReadInt(item, "status");
-                var usage = item.TryGetProperty("usage", out var usageElement)
+                var status = ReadHttpStatus(item);
+                var usage = TryGetPropertyIgnoreCase(item, "usage", out var usageElement)
                             && usageElement.ValueKind == JsonValueKind.Object
                     ? usageElement
                     : default;
-                var input = ReadLong(usage, "inputTokens") ?? 0;
-                var output = ReadLong(usage, "outputTokens") ?? 0;
+                var input = ReadLongAny(usage, "inputTokens", "promptTokens", "input_tokens", "prompt_tokens")
+                            ?? ReadLongAny(item, "inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0;
+                var output = ReadLongAny(usage, "outputTokens", "completionTokens", "output_tokens", "completion_tokens")
+                             ?? ReadLongAny(item, "outputTokens", "completionTokens", "output_tokens", "completion_tokens") ?? 0;
                 var total = ReadLong(usage, "totalTokens") ?? ReadLong(item, "totalTokens") ?? input + output;
                 var cost = ReadEstimatedCost(item);
-                var timestamp = ReadDateTimeOffset(item, "timestamp");
+                var timestamp = ReadLogTimestamp(item);
                 AddUsage(providers, provider, null, status, input, output, total, cost, timestamp);
                 AddUsage(models, LocalUsageSnapshot.Key(provider, model), model, status, input, output, total, cost, timestamp, provider);
             }
@@ -486,16 +493,16 @@ public sealed class OpenCodexClient
         DateTimeOffset switchedAt,
         CancellationToken cancellationToken = default)
     {
-        var sourcePath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".opencodex",
-            "usage.jsonl");
+        var sourcePath = ResolveRequestLogPath();
         if (!File.Exists(sourcePath))
-            return NativeRoutingAudit.Unavailable(switchedAt, "本机还没有 OpenCodex 请求日志。 ");
+            return NativeRoutingAudit.Unavailable(switchedAt, "本机还没有总管家请求日志。 ");
 
         try
         {
-            var lines = new List<string>();
+            var audit = new NativeRoutingAuditAccumulator(
+                switchedAt,
+                ReadNativeProviderLabels(accounts),
+                sourcePath);
             await using var stream = new FileStream(
                 sourcePath,
                 FileMode.Open,
@@ -507,14 +514,10 @@ public sealed class OpenCodexClient
             while (await reader.ReadLineAsync(cancellationToken) is { } line)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!string.IsNullOrWhiteSpace(line)) lines.Add(line);
+                audit.Accept(line);
             }
 
-            return AnalyzeNativeRoutingAudit(
-                lines,
-                switchedAt,
-                ReadNativeProviderLabels(accounts),
-                sourcePath);
+            return audit.Build();
         }
         catch (Exception ex)
         {
@@ -526,14 +529,11 @@ public sealed class OpenCodexClient
         IReadOnlyList<CodexAccountView> accounts,
         CancellationToken cancellationToken = default)
     {
-        var sourcePath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".opencodex",
-            "usage.jsonl");
+        var sourcePath = ResolveRequestLogPath();
         var empty = new Dictionary<string, LiveTokenUsageView>(StringComparer.OrdinalIgnoreCase)
         {
-            ["pro"] = LiveTokenUsageView.Empty("pro", "Codex Pro", "OpenCodex 本机完整日志"),
-            ["plus"] = LiveTokenUsageView.Empty("plus", "Codex Plus", "OpenCodex 本机完整日志")
+            ["pro"] = LiveTokenUsageView.Empty("pro", "Codex Pro", "总管家本机完整日志"),
+            ["plus"] = LiveTokenUsageView.Empty("plus", "Codex Plus", "总管家本机完整日志")
         };
         if (!File.Exists(sourcePath)) return empty;
 
@@ -567,7 +567,7 @@ public sealed class OpenCodexClient
                     if (string.IsNullOrWhiteSpace(provider)
                         || provider.Equals("unknown", StringComparison.OrdinalIgnoreCase)
                         || provider.Equals("combo", StringComparison.OrdinalIgnoreCase)) continue;
-                    var status = ReadInt(route, "status") ?? ReadInt(item, "status");
+                    var status = ReadHttpStatus(route) ?? ReadHttpStatus(item);
                     if (status is not (>= 200 and < 300)) continue;
 
                     string key;
@@ -589,14 +589,16 @@ public sealed class OpenCodexClient
                         accumulator = new LiveUsageAccumulator(key, displayName);
                         accumulators[key] = accumulator;
                     }
-                    var usage = item.TryGetProperty("usage", out var usageElement)
+                    var usage = TryGetPropertyIgnoreCase(item, "usage", out var usageElement)
                                 && usageElement.ValueKind == JsonValueKind.Object
                         ? usageElement
                         : default;
-                    var input = ReadLong(usage, "inputTokens") ?? 0;
-                    var output = ReadLong(usage, "outputTokens") ?? 0;
+                    var input = ReadLongAny(usage, "inputTokens", "promptTokens", "input_tokens", "prompt_tokens")
+                                ?? ReadLongAny(item, "inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0;
+                    var output = ReadLongAny(usage, "outputTokens", "completionTokens", "output_tokens", "completion_tokens")
+                                 ?? ReadLongAny(item, "outputTokens", "completionTokens", "output_tokens", "completion_tokens") ?? 0;
                     var total = ReadLong(usage, "totalTokens") ?? ReadLong(item, "totalTokens") ?? input + output;
-                    accumulator.Add(input, output, total, ReadDateTimeOffset(item, "timestamp"));
+                    accumulator.Add(input, output, total, ReadLogTimestamp(item));
                 }
                 catch (JsonException)
                 {
@@ -606,7 +608,7 @@ public sealed class OpenCodexClient
 
             return accumulators.ToDictionary(
                 pair => pair.Key,
-                pair => pair.Value.ToView("OpenCodex 本机完整日志", true),
+                pair => pair.Value.ToView("总管家本机完整日志", true),
                 StringComparer.OrdinalIgnoreCase);
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
@@ -621,47 +623,67 @@ public sealed class OpenCodexClient
         IReadOnlyDictionary<string, string> providerLabels,
         string sourcePath = "usage.jsonl")
     {
-        string? lastBillingAccount = null;
-        string? lastBillingProvider = null;
-        DateTimeOffset? lastBillingAt = null;
-        DateTimeOffset? proLastRequestAt = null;
-        var proSuccessfulRequestsSinceSwitch = 0;
-        var nativeSuccessCount = 0;
+        var audit = new NativeRoutingAuditAccumulator(switchedAt, providerLabels, sourcePath);
+        foreach (var line in lines) audit.Accept(line);
+        return audit.Build();
+    }
 
-        foreach (var line in lines)
+    private sealed class NativeRoutingAuditAccumulator
+    {
+        private readonly DateTimeOffset _switchedAt;
+        private readonly IReadOnlyDictionary<string, string> _providerLabels;
+        private readonly string _sourcePath;
+        private string? _lastBillingAccount;
+        private string? _lastBillingProvider;
+        private DateTimeOffset? _lastBillingAt;
+        private DateTimeOffset? _proLastRequestAt;
+        private int _proSuccessfulRequestsSinceSwitch;
+        private int _nativeSuccessCount;
+
+        public NativeRoutingAuditAccumulator(
+            DateTimeOffset switchedAt,
+            IReadOnlyDictionary<string, string> providerLabels,
+            string sourcePath)
         {
-            if (string.IsNullOrWhiteSpace(line)) continue;
+            _switchedAt = switchedAt;
+            _providerLabels = providerLabels;
+            _sourcePath = sourcePath;
+        }
+
+        public void Accept(string? line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return;
             try
             {
                 using var json = JsonDocument.Parse(line);
                 var item = json.RootElement;
-                if (item.ValueKind != JsonValueKind.Object) continue;
+                if (item.ValueKind != JsonValueKind.Object) return;
                 var route = ResolveUsageRoute(item);
                 var provider = ReadString(route, "provider") ?? ReadString(item, "provider");
                 if (string.IsNullOrWhiteSpace(provider)
-                    || !TryResolveNativeAccountLabel(provider, providerLabels, out var accountLabel)) continue;
-                var status = ReadInt(route, "status") ?? ReadInt(item, "status");
-                if (status is not (>= 200 and < 300)) continue;
+                    || !TryResolveNativeAccountLabel(provider, _providerLabels, out var accountLabel)) return;
+                var status = ReadHttpStatus(route) ?? ReadHttpStatus(item);
+                if (status is not (>= 200 and < 300)) return;
                 var model = ReadString(route, "resolvedModel")
                             ?? ReadString(route, "model")
                             ?? ReadString(item, "resolvedModel")
                             ?? ReadString(item, "model");
                 if (string.IsNullOrWhiteSpace(model) || model.Equals("unknown", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                var timestamp = ReadDateTimeOffset(item, "timestamp");
-                if (timestamp is null) continue;
+                    return;
+                var timestamp = ReadLogTimestamp(item);
+                if (timestamp is null) return;
 
-                nativeSuccessCount++;
-                if (lastBillingAt is null || timestamp > lastBillingAt)
+                _nativeSuccessCount++;
+                if (_lastBillingAt is null || timestamp > _lastBillingAt)
                 {
-                    lastBillingAt = timestamp;
-                    lastBillingAccount = accountLabel;
-                    lastBillingProvider = provider;
+                    _lastBillingAt = timestamp;
+                    _lastBillingAccount = accountLabel;
+                    _lastBillingProvider = provider;
                 }
 
-                if (!provider.Equals("openai", StringComparison.OrdinalIgnoreCase)) continue;
-                if (proLastRequestAt is null || timestamp > proLastRequestAt) proLastRequestAt = timestamp;
-                if (timestamp >= switchedAt) proSuccessfulRequestsSinceSwitch++;
+                if (!provider.Equals("openai", StringComparison.OrdinalIgnoreCase)) return;
+                if (_proLastRequestAt is null || timestamp > _proLastRequestAt) _proLastRequestAt = timestamp;
+                if (timestamp >= _switchedAt) _proSuccessfulRequestsSinceSwitch++;
             }
             catch (JsonException)
             {
@@ -669,18 +691,18 @@ public sealed class OpenCodexClient
             }
         }
 
-        return new NativeRoutingAudit(
-            lastBillingAccount,
-            lastBillingProvider,
-            lastBillingAt,
-            proLastRequestAt,
-            proSuccessfulRequestsSinceSwitch,
-            switchedAt,
-            nativeSuccessCount,
+        public NativeRoutingAudit Build() => new(
+            _lastBillingAccount,
+            _lastBillingProvider,
+            _lastBillingAt,
+            _proLastRequestAt,
+            _proSuccessfulRequestsSinceSwitch,
+            _switchedAt,
+            _nativeSuccessCount,
             true,
-            nativeSuccessCount == 0
+            _nativeSuccessCount == 0
                 ? "日志中还没有可确认扣费账号的成功模型请求。"
-                : $"已从 {Path.GetFileName(sourcePath)} 核对 {nativeSuccessCount:N0} 条成功原生请求。 ");
+                : $"已从 {Path.GetFileName(_sourcePath)} 核对 {_nativeSuccessCount:N0} 条成功原生请求。 ");
     }
 
     private static IReadOnlyDictionary<string, string> ReadNativeProviderLabels(
@@ -749,12 +771,9 @@ public sealed class OpenCodexClient
         int days = 365,
         CancellationToken cancellationToken = default)
     {
-        var sourcePath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".opencodex",
-            "usage.jsonl");
+        var sourcePath = ResolveRequestLogPath();
         if (!File.Exists(sourcePath))
-            return UsageTimelineSnapshot.Empty(sourcePath, "本机还没有 OpenCodex 历史日志；产生请求后会自动出现。 ");
+            return UsageTimelineSnapshot.Empty(sourcePath, "本机还没有总管家历史日志；产生请求后会自动出现。 ");
 
         try
         {
@@ -785,18 +804,20 @@ public sealed class OpenCodexClient
                     using var json = JsonDocument.Parse(line);
                     var item = json.RootElement;
                     if (item.ValueKind != JsonValueKind.Object) continue;
-                    var timestamp = ReadDateTimeOffset(item, "timestamp");
+                    var timestamp = ReadLogTimestamp(item);
                     if (timestamp is null) continue;
 
-                    var usage = item.TryGetProperty("usage", out var usageElement)
+                    var usage = TryGetPropertyIgnoreCase(item, "usage", out var usageElement)
                                 && usageElement.ValueKind == JsonValueKind.Object
                         ? usageElement
                         : default;
-                    var input = ReadLong(usage, "inputTokens") ?? 0;
-                    var output = ReadLong(usage, "outputTokens") ?? 0;
+                    var input = ReadLongAny(usage, "inputTokens", "promptTokens", "input_tokens", "prompt_tokens")
+                                ?? ReadLongAny(item, "inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0;
+                    var output = ReadLongAny(usage, "outputTokens", "completionTokens", "output_tokens", "completion_tokens")
+                                 ?? ReadLongAny(item, "outputTokens", "completionTokens", "output_tokens", "completion_tokens") ?? 0;
                     var total = ReadLong(usage, "totalTokens") ?? ReadLong(item, "totalTokens") ?? input + output;
                     var cost = ReadEstimatedCost(item);
-                    var status = ReadInt(item, "status");
+                    var status = ReadHttpStatus(item);
                     logCount++;
                     inputTotal += input;
                     outputTotal += output;
@@ -831,7 +852,7 @@ public sealed class OpenCodexClient
                 lastSeen,
                 sourcePath,
                 true,
-                logCount == 0 ? "日志文件存在，但还没有可统计的请求。" : "已读取本机 OpenCodex 完整历史日志。");
+                logCount == 0 ? "日志文件存在，但还没有可统计的请求。" : "已读取总管家本机完整历史日志。");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -862,11 +883,11 @@ public sealed class OpenCodexClient
 
     private static JsonElement ResolveUsageRoute(JsonElement item)
     {
-        if (!item.TryGetProperty("attempts", out var attempts) || attempts.ValueKind != JsonValueKind.Array)
+        if (!TryGetPropertyIgnoreCase(item, "attempts", out var attempts) || attempts.ValueKind != JsonValueKind.Array)
             return item;
         var rows = attempts.EnumerateArray().ToArray();
         for (var index = rows.Length - 1; index >= 0; index--)
-            if (ReadInt(rows[index], "status") is >= 200 and < 300) return rows[index];
+            if (ReadHttpStatus(rows[index]) is >= 200 and < 300) return rows[index];
         return rows.Length > 0 ? rows[^1] : item;
     }
 
@@ -942,11 +963,11 @@ public sealed class OpenCodexClient
         }
         catch (HttpRequestException ex)
         {
-            throw new OpenCodexAccountApiUnavailableException("OpenCodex 账号登录接口无法连接。", ex);
+            throw new OpenCodexAccountApiUnavailableException("总管家本机引擎的账号登录接口无法连接。", ex);
         }
         catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new OpenCodexAccountApiUnavailableException("OpenCodex 账号登录接口响应超时。", ex);
+            throw new OpenCodexAccountApiUnavailableException("总管家本机引擎的账号登录接口响应超时。", ex);
         }
 
         using (response)
@@ -954,12 +975,12 @@ public sealed class OpenCodexClient
             if (response.StatusCode is System.Net.HttpStatusCode.NotFound
                 or System.Net.HttpStatusCode.MethodNotAllowed
                 or System.Net.HttpStatusCode.NotImplemented)
-                throw new OpenCodexAccountApiUnavailableException("当前 OpenCodex 版本没有提供账号登录接口。");
+            throw new OpenCodexAccountApiUnavailableException("当前总管家本机引擎没有提供账号登录接口。");
             await EnsureSuccessAsync(response, cancellationToken);
             using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
             var flowId = ReadString(json.RootElement, "flowId");
             if (string.IsNullOrWhiteSpace(flowId))
-                throw new InvalidOperationException("OpenCodex 没有返回登录流程编号。");
+            throw new InvalidOperationException("总管家本机引擎没有返回登录流程编号。");
             return new CodexAccountLoginStartResult(flowId, ReadString(json.RootElement, "url"));
         }
     }
@@ -1179,6 +1200,10 @@ public sealed class OpenCodexClient
             RememberProviderHealth(provider, ok, message, clock.ElapsedMilliseconds);
             return new OperationResult(ok, message);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             RememberProviderHealth(provider, false, ex.Message, clock.ElapsedMilliseconds);
@@ -1232,7 +1257,7 @@ public sealed class OpenCodexClient
         if (json.RootElement.ValueKind != JsonValueKind.Array) return null;
         var rows = json.RootElement.EnumerateArray().ToArray();
         var objectRows = rows
-            .Select((row, index) => (Row: row, Index: index, Timestamp: ReadDateTimeOffset(row, "timestamp")))
+            .Select((row, index) => (Row: row, Index: index, Timestamp: ReadLogTimestamp(row)))
             .Where(candidate => candidate.Row.ValueKind == JsonValueKind.Object)
             .ToArray();
         if (objectRows.Length == 0) return null;
@@ -1251,7 +1276,7 @@ public sealed class OpenCodexClient
         var requested = RuntimeTruthSanitizer.Redact(
                             ReadString(item, "requestedModel") ?? ReadString(item, "model"))
                         ?? "未知";
-        var rawAttempts = item.TryGetProperty("attempts", out var attempts)
+        var rawAttempts = TryGetPropertyIgnoreCase(item, "attempts", out var attempts)
                           && attempts.ValueKind == JsonValueKind.Array
             ? attempts.EnumerateArray().Where(attempt => attempt.ValueKind == JsonValueKind.Object).ToArray()
             : Array.Empty<JsonElement>();
@@ -1263,7 +1288,7 @@ public sealed class OpenCodexClient
             : RuntimeAttemptSelectionEvidence.None;
         for (var index = rawAttempts.Length - 1; selectedIndex < 0 && index >= 0; index--)
         {
-            if (ReadInt(rawAttempts[index], "status") is >= 200 and < 300)
+            if (ReadHttpStatus(rawAttempts[index]) is >= 200 and < 300)
             {
                 selectedIndex = index;
                 selectionEvidence = rawAttempts.Length == 1
@@ -1305,8 +1330,8 @@ public sealed class OpenCodexClient
                             ?? ReadString(item, "resolvedModel")
                             ?? ReadString(item, "model"))
                         ?? "未知模型";
-            var status = ReadInt(attempt, "status")
-                         ?? (rawAttempts.Length == 1 ? ReadInt(item, "status") : null);
+            var status = ReadHttpStatus(attempt)
+                         ?? (rawAttempts.Length == 1 ? ReadHttpStatus(item) : null);
             var errorCode = RuntimeTruthSanitizer.Redact(ReadErrorCode(attempt) ?? ReadErrorCode(item));
             var errorMessage = RuntimeTruthSanitizer.Redact(ReadErrorMessage(attempt) ?? ReadErrorMessage(item));
             var tokenUsage = ReadTokenUsage(attempt, "attempt.usage");
@@ -1332,7 +1357,7 @@ public sealed class OpenCodexClient
         }
 
         var actual = parsedAttempts[selectedIndex];
-        var topStatus = ReadInt(item, "status") ?? actual.HttpStatus;
+        var topStatus = ReadHttpStatus(item) ?? actual.HttpStatus;
         var outcomeStatus = topStatus ?? actual.HttpStatus;
         var topErrorCode = RuntimeTruthSanitizer.Redact(ReadErrorCode(item) ?? actual.ErrorCode);
         var topErrorMessage = RuntimeTruthSanitizer.Redact(ReadErrorMessage(item) ?? actual.ErrorMessage);
@@ -1350,7 +1375,7 @@ public sealed class OpenCodexClient
             requested,
             topStatus,
             ReadLong(item, "durationMs") ?? actual.DurationMs,
-            ReadDateTimeOffset(item, "timestamp"),
+            ReadLogTimestamp(item),
             outcome,
             topErrorCode,
             topErrorMessage,
@@ -1523,7 +1548,7 @@ public sealed class OpenCodexClient
         if (root.ValueKind == JsonValueKind.Object
             && root.TryGetProperty("value", out var value)
             && value.ValueKind == JsonValueKind.Array) return value;
-        throw new InvalidOperationException("OpenCodex 返回了无法识别的数据。");
+            throw new InvalidOperationException("总管家本机引擎返回了无法识别的数据。");
     }
 
     private static async Task ObserveAndDisposeAsync(Task<HttpResponseMessage> task)
@@ -1544,24 +1569,34 @@ public sealed class OpenCodexClient
         try
         {
             using var json = JsonDocument.Parse(body);
-            return ReadString(json.RootElement, "error") ?? $"请求失败：{body}";
+            var root = json.RootElement;
+            var direct = ReadString(root, "message") ?? ReadString(root, "error");
+            if (!string.IsNullOrWhiteSpace(direct)) return direct;
+            if (root.ValueKind == JsonValueKind.Object
+                && root.TryGetProperty("error", out var error)
+                && error.ValueKind == JsonValueKind.Object)
+            {
+                var message = ReadString(error, "message") ?? ReadString(error, "detail");
+                if (!string.IsNullOrWhiteSpace(message)) return message;
+            }
+            return $"请求失败：{body}";
         }
         catch
         {
-            return string.IsNullOrWhiteSpace(body) ? "请求失败，请检查 OpenCodex。" : body;
+        return string.IsNullOrWhiteSpace(body) ? "请求失败，请检查总管家本机引擎。" : body;
         }
     }
 
     private static string? ReadString(JsonElement item, string name) =>
         item.ValueKind == JsonValueKind.Object
-        && item.TryGetProperty(name, out var value)
+        && TryGetPropertyIgnoreCase(item, name, out var value)
         && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
 
     private static string? ReadIdentifier(JsonElement item, string name)
     {
-        if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty(name, out var value)) return null;
+        if (item.ValueKind != JsonValueKind.Object || !TryGetPropertyIgnoreCase(item, name, out var value)) return null;
         return value.ValueKind switch
         {
             JsonValueKind.String => value.GetString(),
@@ -1573,7 +1608,7 @@ public sealed class OpenCodexClient
     private static AttemptTokenUsageFact? ReadTokenUsage(JsonElement item, string sourcePath)
     {
         var usage = item.ValueKind == JsonValueKind.Object
-                    && item.TryGetProperty("usage", out var usageElement)
+                    && TryGetPropertyIgnoreCase(item, "usage", out var usageElement)
                     && usageElement.ValueKind == JsonValueKind.Object
             ? usageElement
             : item;
@@ -1667,34 +1702,37 @@ public sealed class OpenCodexClient
 
     private static bool ReadBool(JsonElement item, string name) =>
         item.ValueKind == JsonValueKind.Object
-        && item.TryGetProperty(name, out var value)
+        && TryGetPropertyIgnoreCase(item, name, out var value)
         && (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False)
         && value.GetBoolean();
 
     private static long? ReadLong(JsonElement item, string name) =>
         item.ValueKind == JsonValueKind.Object
-        && item.TryGetProperty(name, out var value)
+        && TryGetPropertyIgnoreCase(item, name, out var value)
+        && value.ValueKind == JsonValueKind.Number
         && value.TryGetInt64(out var number)
             ? number
             : null;
 
     private static int? ReadInt(JsonElement item, string name) =>
         item.ValueKind == JsonValueKind.Object
-        && item.TryGetProperty(name, out var value)
+        && TryGetPropertyIgnoreCase(item, name, out var value)
+        && value.ValueKind == JsonValueKind.Number
         && value.TryGetInt32(out var number)
             ? number
             : null;
 
     private static double? ReadDouble(JsonElement item, string name) =>
         item.ValueKind == JsonValueKind.Object
-        && item.TryGetProperty(name, out var value)
+        && TryGetPropertyIgnoreCase(item, name, out var value)
+        && value.ValueKind == JsonValueKind.Number
         && value.TryGetDouble(out var number)
             ? number
             : null;
 
     private static DateTimeOffset? ReadDateTimeOffset(JsonElement item, string name)
     {
-        if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty(name, out var value)) return null;
+        if (item.ValueKind != JsonValueKind.Object || !TryGetPropertyIgnoreCase(item, name, out var value)) return null;
         if (value.ValueKind == JsonValueKind.String && DateTimeOffset.TryParse(value.GetString(), out var parsed))
             return parsed.ToUniversalTime();
         if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var number))
@@ -1703,6 +1741,32 @@ public sealed class OpenCodexClient
             catch { return null; }
         }
         return null;
+    }
+
+    private string ResolveRequestLogPath() => _requestLogPath ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "CodexTotalManager", "runtime-v3", "native-proxy", "request-log.jsonl");
+
+    private static int? ReadHttpStatus(JsonElement item) =>
+        ReadInt(item, "status") ?? ReadInt(item, "httpStatus");
+
+    private static DateTimeOffset? ReadLogTimestamp(JsonElement item) =>
+        ReadDateTimeOffset(item, "timestamp") ?? ReadDateTimeOffset(item, "startedAt");
+
+    private static bool TryGetPropertyIgnoreCase(JsonElement item, string name, out JsonElement value)
+    {
+        if (item.ValueKind == JsonValueKind.Object)
+        {
+            if (item.TryGetProperty(name, out value)) return true;
+            foreach (var property in item.EnumerateObject())
+            {
+                if (!property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) continue;
+                value = property.Value;
+                return true;
+            }
+        }
+        value = default;
+        return false;
     }
 
     private sealed record ProviderHealthState(

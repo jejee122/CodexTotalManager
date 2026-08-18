@@ -29,10 +29,19 @@ public partial class ExtensionManagementView : UserControl
         Refresh();
     }
 
-    public void Refresh()
+    public async void Refresh()
     {
         if (_extensions is null) return;
-        var result = _extensions.Discover();
+        ExtensionDiscoveryResult result;
+        try
+        {
+            result = await Task.Run(_extensions.Discover);
+        }
+        catch (Exception ex)
+        {
+            ShowError("插件刷新失败", ex);
+            return;
+        }
         var previous = _cards.ToDictionary(card => card.Id, StringComparer.OrdinalIgnoreCase);
         var refreshed = new List<ExtensionCardView>();
         foreach (var package in result.Packages)
@@ -69,25 +78,26 @@ public partial class ExtensionManagementView : UserControl
 
     private void RefreshExtensionsButton_Click(object sender, RoutedEventArgs e)
     {
-        try { Refresh(); }
-        catch (Exception ex) { ShowError("插件刷新失败", ex); }
+        Refresh();
     }
 
     private async void ToggleExtensionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_extensions is null || sender is not Button { Tag: string id }) return;
+        if (_extensions is null || sender is not Button { Tag: string id } button) return;
         var card = _cards.FirstOrDefault(item => item.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
         if (card is null) return;
+        button.IsEnabled = false;
         try
         {
             if (card.IsTrusted)
             {
                 if (card.IsRunning) await _extensions.StopAsync(id);
-                _extensions.Disable(id);
+                await Task.Run(() => _extensions.Disable(id));
             }
             else
             {
-                var package = _extensions.Discover().Packages.Single(item =>
+                var discovery = await Task.Run(_extensions.Discover);
+                var package = discovery.Packages.Single(item =>
                     item.Manifest.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
                 var capabilities = package.Manifest.Capabilities.Count == 0
                     ? "未声明额外能力"
@@ -103,7 +113,9 @@ public partial class ExtensionManagementView : UserControl
                     MessageBoxImage.Warning,
                     MessageBoxResult.No);
                 if (answer != MessageBoxResult.Yes) return;
-                _extensions.Enable(id, package.Fingerprint);
+                // Enable re-reads and re-hashes the complete package to close the confirmation
+                // race. Keep that potentially large operation away from the WPF UI thread.
+                await Task.Run(() => _extensions.Enable(id, package.Fingerprint));
             }
             Refresh();
         }
@@ -111,6 +123,10 @@ public partial class ExtensionManagementView : UserControl
         {
             ShowError("插件状态没有改变", ex);
             Refresh();
+        }
+        finally
+        {
+            button.IsEnabled = true;
         }
     }
 

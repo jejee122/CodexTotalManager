@@ -5,7 +5,7 @@ public static class SelfTest
     public static async Task<(bool Success, string Message)> RunAsync(AppServices services)
     {
         var runtime = await services.OpenCodex.GetRuntimeStatusAsync();
-        if (!runtime.Healthy) return (false, $"SELF_TEST_FAILED: OpenCodex 未运行；{runtime.LastError}");
+        if (!runtime.Healthy) return (false, $"SELF_TEST_FAILED: 总管家本机引擎未运行；{runtime.LastError}");
         var models = await services.OpenCodex.GetModelsAsync(services.Settings);
         if (!models.Any(model => model.Provider == "openai" && model.Id == "gpt-5.6-sol"))
             return (false, "SELF_TEST_FAILED: 找不到官方 gpt-5.6-sol");
@@ -47,7 +47,7 @@ public static class SelfTest
             return (false, "SELF_TEST_FAILED: 当前 Codex 账号线路仍开启故障串池");
         if (nativePoolActive && !activeAccount.IsMain
             && !string.Equals(accountData.Settings.ActiveAccountId, activeAccount.Id, StringComparison.OrdinalIgnoreCase))
-            return (false, "SELF_TEST_FAILED: OpenCodex 当前扣费账号与总管家选择不一致");
+            return (false, "SELF_TEST_FAILED: 总管家本机引擎当前扣费账号与总管家选择不一致");
         if (!await services.Dashboard.IsV2rayReadyAsync())
             return (false, "SELF_TEST_FAILED: v2rayN 本机连接没有准备好");
         var localServices = await services.LocalServices.GetStatusesAsync();
@@ -71,6 +71,6 @@ public static class SelfTest
             return (false, $"SELF_TEST_FAILED: 当前号池期望 {expectedDefault}，但当前任务是 {desktop.CurrentModel ?? "未选择模型"}");
         var activeText = active is null ? "尚未创建 cmm/main" : $"{active.Value.Provider}/{active.Value.Model}";
         var routeText = recentRoute.HasData ? $"{recentRoute.ActualProvider}/{recentRoute.ActualModel}" : "暂无请求";
-        return (true, $"SELF_TEST_OK: OpenCodex PID={runtime.ProcessId}，模型={models.Count}个，当前账号={activePool.DisplayName}，扣费账号={(activeAccount.IsMain ? "Pro主账号" : activeAccount.PlanText)}，账号模式={accountData.Settings.Mode}，兼容入口={activeText}，Codex当前任务={desktop.CurrentModel ?? "未选择"}，Codex默认={configuredDefault}，最近实际路由={routeText}，Token日志={usageTimeline.LogCount}条/{Models.UsageFormatting.Number(usageTimeline.TotalTokens)}，入口={pools.Count}个，本机服务={localServices.Count}项，备份={backups.Count}项，记忆保护=正常");
+        return (true, $"SELF_TEST_OK: 总管家本机引擎 PID={runtime.ProcessId}，模型={models.Count}个，当前账号={activePool.DisplayName}，扣费账号={(activeAccount.IsMain ? "Pro主账号" : activeAccount.PlanText)}，账号模式={accountData.Settings.Mode}，兼容入口={activeText}，Codex当前任务={desktop.CurrentModel ?? "未选择"}，Codex默认={configuredDefault}，最近实际路由={routeText}，Token日志={usageTimeline.LogCount}条/{Models.UsageFormatting.Number(usageTimeline.TotalTokens)}，入口={pools.Count}个，本机服务={localServices.Count}项，备份={backups.Count}项，记忆保护=正常");
     }
 }

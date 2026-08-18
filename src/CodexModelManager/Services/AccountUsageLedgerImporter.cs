@@ -14,6 +14,8 @@ public sealed class AccountUsageLedgerImporter : IAsyncDisposable
     private readonly object _lifecycleGate = new();
     private CancellationTokenSource? _lifetime;
     private Task? _loop;
+    private bool _runRequested;
+    private bool _disposed;
     private long _refreshCount;
     private DateTimeOffset? _lastQuotaFetchAt;
     private DateTimeOffset? _lastTokenSuccessAt;
@@ -50,11 +52,36 @@ public sealed class AccountUsageLedgerImporter : IAsyncDisposable
     {
         lock (_lifecycleGate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _runRequested = true;
             if (_loop is { IsCompleted: false }) return;
-            _lifetime?.Dispose();
-            _lifetime = new CancellationTokenSource();
-            var token = _lifetime.Token;
-            _loop = Task.Run(() => RunAsync(token));
+            StartLoopLocked();
+        }
+    }
+
+    private void StartLoopLocked()
+    {
+        _lifetime?.Dispose();
+        var lifetime = new CancellationTokenSource();
+        _lifetime = lifetime;
+        var loop = Task.Run(() => RunAsync(lifetime.Token));
+        _loop = loop;
+        _ = loop.ContinueWith(
+            _ => CompleteLoop(loop, lifetime),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void CompleteLoop(Task completedLoop, CancellationTokenSource completedLifetime)
+    {
+        lock (_lifecycleGate)
+        {
+            if (!ReferenceEquals(_loop, completedLoop)) return;
+            _loop = null;
+            if (ReferenceEquals(_lifetime, completedLifetime)) _lifetime = null;
+            completedLifetime.Dispose();
+            if (_runRequested && !_disposed) StartLoopLocked();
         }
     }
 
@@ -359,6 +386,7 @@ public sealed class AccountUsageLedgerImporter : IAsyncDisposable
         Task? loop;
         lock (_lifecycleGate)
         {
+            _runRequested = false;
             lifetime = _lifetime;
             loop = _loop;
             if (lifetime is null || loop is null) return true;
@@ -402,6 +430,11 @@ public sealed class AccountUsageLedgerImporter : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        lock (_lifecycleGate)
+        {
+            _disposed = true;
+            _runRequested = false;
+        }
         if (!await StopAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false))
             throw new TimeoutException("The account usage importer did not reach a durable stop boundary within five seconds.");
         _refreshGate.Dispose();

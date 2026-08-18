@@ -6,21 +6,27 @@ using Microsoft.AspNetCore.Http;
 
 namespace NativeProxySmoke;
 
-public sealed class FakeUpstream
+public sealed class FakeUpstream : IAsyncDisposable
 {
     private readonly WebApplication _app;
     private readonly object _requestGate = new();
     private string _lastChatRequest = "{}";
 
-    public FakeUpstream(string[]? args = null)
+    public FakeUpstream(int port, string[]? args = null)
     {
         var builder = WebApplication.CreateBuilder(args ?? Array.Empty<string>());
-        builder.WebHost.UseUrls("http://127.0.0.1:18889");
+        builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
         _app = builder.Build();
         MapRoutes();
     }
 
-    public void Run() => _app.Run();
+    public Task StartAsync(CancellationToken cancellationToken = default) =>
+        _app.StartAsync(cancellationToken);
+
+    public Task StopAsync(CancellationToken cancellationToken = default) =>
+        _app.StopAsync(cancellationToken);
+
+    public ValueTask DisposeAsync() => _app.DisposeAsync();
 
     private void MapRoutes()
     {

@@ -30,6 +30,7 @@ public sealed class AppServices
     public WorkerBudgetLedger WorkerBudget { get; init; } = null!;
     public NativeEngineService NativeEngine { get; init; } = null!;
     public ExtensionService Extensions { get; init; } = null!;
+    public ProductMaintenanceService ProductMaintenance { get; init; } = null!;
 
     public static AppServices Create(string? dataDirectory = null)
     {
@@ -57,9 +58,11 @@ public sealed class AppServices
         var accountUsageLedger = RuntimeMode.IsDetachedUi
             ? new AccountUsageLedgerService(
                 settings.DataDirectory,
-                sourcePath: SandboxOpenCodexUsagePath(),
+                sourcePath: Path.Combine(nativeEngineDataRoot, "request-log.jsonl"),
                 sourceDisabled: true)
-            : new AccountUsageLedgerService(settings.DataDirectory);
+            : new AccountUsageLedgerService(
+                settings.DataDirectory,
+                sourcePath: Path.Combine(nativeEngineDataRoot, "request-log.jsonl"));
         var runtimeTruth = new RuntimeTruthService(
             new DefaultRuntimeTruthSource(poolCatalog, codexConfig, desktop, client),
             accountUsageLedger: accountUsageLedger);
@@ -151,7 +154,8 @@ public sealed class AppServices
             WorkerBroker = workerBroker,
             WorkerBudget = workerBudget,
             NativeEngine = CreateNativeEngineService(settings.DataDirectory),
-            Extensions = new ExtensionService(settings.DataDirectory)
+            Extensions = new ExtensionService(settings.DataDirectory),
+            ProductMaintenance = new ProductMaintenanceService(settings.DataDirectory)
         };
     }
 
@@ -167,18 +171,7 @@ public sealed class AppServices
     }
 
     private static bool IsCodexProcessRunning()
-    {
-        try
-        {
-            var currentId = Environment.ProcessId;
-            return System.Diagnostics.Process.GetProcesses().Any(process => process.Id != currentId
-                && process.ProcessName.Equals("Codex", StringComparison.OrdinalIgnoreCase));
-        }
-        catch
-        {
-            return true;
-        }
-    }
+        => CodexDesktopProcessDetector.IsRunning();
 
     public static string? SandboxConfigPath()
     {
@@ -202,14 +195,6 @@ public sealed class AppServices
     {
         var home = Environment.GetEnvironmentVariable("CMM_SANDBOX_OPENCODEX_HOME");
         return string.IsNullOrWhiteSpace(home) ? null : Path.Combine(home, "config.json");
-    }
-
-    private static string SandboxOpenCodexUsagePath()
-    {
-        var home = Environment.GetEnvironmentVariable("CMM_SANDBOX_OPENCODEX_HOME");
-        if (string.IsNullOrWhiteSpace(home))
-            throw new InvalidOperationException("独立模式缺少假 OpenCodex 数据目录，已拒绝创建 Token 账本。");
-        return Path.Combine(home, "usage.jsonl");
     }
 
     public static string? SandboxAppDataDirectory()

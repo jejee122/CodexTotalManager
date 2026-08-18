@@ -47,7 +47,7 @@ public static class LocalPortPolicy
         }
 
         throw new InvalidOperationException(
-            $"No free local CLIProxy port is available in {CliProxyPortStart}-{CliProxyPortEnd}.");
+            $"{CliProxyPortStart}-{CliProxyPortEnd} 范围内没有可用的本机 CLIProxy 端口。");
     }
 
     public static bool IsListening(int port) => GetListeningPorts().Contains(port);

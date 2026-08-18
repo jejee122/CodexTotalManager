@@ -23,8 +23,12 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
 $publishFull = [IO.Path]::GetFullPath($PublishDirectory).TrimEnd('\')
 
 function Resolve-PayloadPath([string]$RelativePath) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) { throw '清单包含空路径。' }
     $relative = $RelativePath.Replace('/', '\')
     if ([IO.Path]::IsPathRooted($relative)) { throw "清单包含绝对路径：$relative" }
+    if ($relative.IndexOf(':', [StringComparison]::Ordinal) -ge 0) {
+        throw "清单路径包含不安全的驱动器或备用数据流语法：$relative"
+    }
     $path = [IO.Path]::GetFullPath((Join-Path $publishFull $relative))
     if (-not $path.StartsWith($publishFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw "清单路径越过候选包目录：$relative"
@@ -48,6 +52,78 @@ function Write-JsonAtomically([object]$Value, [string]$Path, [int]$Depth = 6) {
         Move-Item -LiteralPath $temporary -Destination $Path -Force
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Assert-NoReparsePointBelow([string]$BasePath, [string]$TargetPath, [string]$Label) {
+    $baseFull = [IO.Path]::GetFullPath($BasePath).TrimEnd('\')
+    $targetFull = [IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
+    if (-not ($targetFull + '\').StartsWith($baseFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label is outside its trusted base directory: $targetFull"
+    }
+    $relative = $targetFull.Substring($baseFull.Length).TrimStart('\')
+    $cursor = $baseFull
+    foreach ($part in @($relative -split '\\' | Where-Object { $_ })) {
+        $cursor = Join-Path $cursor $part
+        if (-not (Test-Path -LiteralPath $cursor)) { break }
+        $item = Get-Item -LiteralPath $cursor -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label contains a symbolic link, junction, or other reparse point: $cursor"
+        }
+    }
+}
+
+function Assert-TreeHasNoReparsePoints([string]$RootPath, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $RootPath)) { return }
+    $rootItem = Get-Item -LiteralPath $RootPath -Force
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label is a symbolic link, junction, or other reparse point: $RootPath"
+    }
+    $reparse = @(Get-ChildItem -LiteralPath $RootPath -Force -Recurse -ErrorAction Stop |
+        Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 } |
+        Select-Object -First 1)
+    if ($reparse.Count -gt 0) {
+        throw "$Label contains a symbolic link, junction, or other reparse point: $($reparse[0].FullName)"
+    }
+}
+
+function New-ManagerShortcut(
+    [string]$Path,
+    [string]$TargetPath,
+    [string]$Arguments,
+    [string]$WorkingDirectory,
+    [string]$IconLocation) {
+    $directory = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($Path)
+    $shortcut.TargetPath = $TargetPath
+    $shortcut.Arguments = $Arguments
+    $shortcut.WorkingDirectory = $WorkingDirectory
+    $shortcut.IconLocation = $IconLocation
+    $shortcut.Description = 'Codex 总管家'
+    $shortcut.Save()
+}
+
+function Read-RegistrySnapshot([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $record = Get-ItemProperty -LiteralPath $Path
+    $snapshot = [ordered]@{}
+    foreach ($property in @($record.PSObject.Properties | Where-Object {
+        $_.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$'
+    })) {
+        $snapshot[$property.Name] = $property.Value
+    }
+    return $snapshot
+}
+
+function Restore-RegistrySnapshot([string]$Path, [object]$Snapshot) {
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
+    if ($null -eq $Snapshot) { return }
+    New-Item -Path $Path -Force | Out-Null
+    foreach ($entry in $Snapshot.GetEnumerator()) {
+        $kind = if ($entry.Value -is [int]) { 'DWord' } else { 'String' }
+        New-ItemProperty -Path $Path -Name ([string]$entry.Key) -Value $entry.Value -PropertyType $kind -Force | Out-Null
     }
 }
 
@@ -75,6 +151,14 @@ function Assert-SupportedCodexIsolation([object]$Manifest) {
     throw "候选包声明了不受支持的 Codex 隔离模式：$mode"
 }
 
+if (-not (Test-Path -LiteralPath $publishFull -PathType Container)) {
+    throw "候选包目录不存在：$publishFull"
+}
+$publishPathRoot = [IO.Path]::GetPathRoot($publishFull).TrimEnd('\')
+if ($publishFull.Equals($publishPathRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "候选包目录不能是磁盘根目录：$publishFull"
+}
+Assert-TreeHasNoReparsePoints $publishFull '候选包目录'
 $manifestPath = Join-Path $publishFull 'payload-manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw '候选包缺少 payload-manifest.json。' }
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -102,12 +186,28 @@ if (-not $manifest.verification.buildPassed -or
 if ([bool]$manifest.gitDirty) {
     throw '这个候选包来自有未提交改动的源码，不能可靠复现，禁止安装。'
 }
-if ($manifest.releaseDecision -ne 'DEPLOYABLE') {
-    if (-not $IsolatedTestMachine) {
-        throw '这个包仍是候选版，只能在明确标记的独立测试电脑安装；正式电脑必须使用 DEPLOYABLE 包。'
-    }
+$approvalPath = Join-Path $publishFull 'DEPLOYABLE.json'
+$approval = $null
+if (Test-Path -LiteralPath $approvalPath -PathType Leaf) {
+    try { $approval = Get-Content -LiteralPath $approvalPath -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { throw "正式批准文件不是合法 JSON：$($_.Exception.Message)" }
+}
+if ($IsolatedTestMachine) {
     if ($manifest.releaseDecision -ne 'READY_FOR_EXTERNAL_BUSINESS_VALIDATION') {
         throw "候选包还没达到独立测试机安装门槛：$($manifest.releaseDecision)"
+    }
+} else {
+    if ($null -eq $approval -or [int]$approval.schemaVersion -ne 1 -or
+        [string]$approval.decision -cne 'DEPLOYABLE' -or
+        [string]$approval.product -cne 'CodexTotalManager' -or
+        [string]$approval.productVersion -cne [string]$manifest.productVersion -or
+        $approval.externalAcceptance.valid -ne $true) {
+        throw '这个包没有通过与本包绑定的专用测试电脑真实验收，禁止安装到正式电脑。'
+    }
+    $manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    $approvedSha256 = ([string]$approval.externalAcceptance.candidateManifestSha256).ToUpperInvariant()
+    if ($approvedSha256 -notmatch '^[0-9A-F]{64}$' -or $approvedSha256 -cne $manifestSha256) {
+        throw '正式批准文件绑定的是另一个候选包，禁止安装。'
     }
 }
 
@@ -125,7 +225,7 @@ foreach ($file in @($manifest.files)) {
     $manifestEntries[$relative] = $true
 }
 $extras = @(Get-ChildItem -LiteralPath $publishFull -Recurse -File |
-    Where-Object { $_.FullName -ne $manifestPath } |
+    Where-Object { $_.FullName -ne $manifestPath -and $_.FullName -ne $approvalPath } |
     Where-Object { -not $manifestEntries.ContainsKey($_.FullName.Substring($publishFull.Length + 1)) })
 if ($extras.Count -gt 0) { throw '候选包目录里存在未写入清单的多余文件。' }
 if (@(Get-ChildItem -LiteralPath $publishFull -Recurse -File -Filter '*.pdb').Count -gt 0 -or
@@ -180,6 +280,8 @@ if ($installFull.Equals($localDataFull, [StringComparison]::OrdinalIgnoreCase) -
     -not ($installFull + '\').StartsWith($localDataFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw "安装目录必须严格位于 LocalApplicationData 下面：$installFull"
 }
+Assert-NoReparsePointBelow $localDataFull $installFull '安装目录'
+Assert-TreeHasNoReparsePoints $installFull '现有安装目录'
 
 $version = [string]$manifest.productVersion
 if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "版本号不安全：$version" }
@@ -194,9 +296,25 @@ $acceptancePath = Join-Path $runtimeRoot 'deployment-acceptance-v1.json'
 $managedRootFiles = @(
     'Open-New-Manager-ControlPanel.ps1',
     'Launch-Manager-Hidden.vbs',
+    'Uninstall-Manager.vbs',
     'uninstall-local-release.ps1'
 )
 $managedStateFiles = @($pointerPath, $previousPointerPath, $acceptancePath)
+$programsRoot = [Environment]::GetFolderPath('Programs')
+$desktopRoot = [Environment]::GetFolderPath('DesktopDirectory')
+$startMenuFolder = Join-Path $programsRoot 'Codex 总管家'
+$managedShortcutPaths = @(
+    (Join-Path $startMenuFolder 'Codex 总管家.lnk'),
+    (Join-Path $startMenuFolder '卸载 Codex 总管家.lnk'),
+    (Join-Path $desktopRoot 'Codex 总管家.lnk')
+)
+$uninstallRegistryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexTotalManager'
+$runRegistryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$uninstallRegistrySnapshot = Read-RegistrySnapshot $uninstallRegistryPath
+$runValueSnapshot = if (Test-Path -LiteralPath $runRegistryPath) {
+    [string](Get-ItemPropertyValue -LiteralPath $runRegistryPath -Name 'CodexTotalManager' -ErrorAction SilentlyContinue)
+} else { '' }
+$startMenuFolderExisted = Test-Path -LiteralPath $startMenuFolder
 $destinationCreated = $false
 $installRootExisted = Test-Path -LiteralPath $installFull
 $releaseRootExisted = Test-Path -LiteralPath $releaseRoot
@@ -216,6 +334,12 @@ try {
     foreach ($statePath in $managedStateFiles) {
         if (Test-Path -LiteralPath $statePath -PathType Leaf) {
             Copy-Item -LiteralPath $statePath -Destination (Join-Path $rollbackRoot ('state-' + (Split-Path -Leaf $statePath))) -Force
+        }
+    }
+    for ($shortcutIndex = 0; $shortcutIndex -lt $managedShortcutPaths.Count; $shortcutIndex++) {
+        $shortcutPath = $managedShortcutPaths[$shortcutIndex]
+        if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+            Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $rollbackRoot ("shortcut-$shortcutIndex.lnk")) -Force
         }
     }
 
@@ -300,6 +424,54 @@ try {
     Write-JsonAtomically $acceptance $acceptancePath 6
     Write-JsonAtomically $pointer $pointerPath 5
 
+    $stableLauncher = Join-Path $installFull 'Launch-Manager-Hidden.vbs'
+    $friendlyUninstaller = Join-Path $installFull 'Uninstall-Manager.vbs'
+    $uninstallScript = Join-Path $installFull 'uninstall-local-release.ps1'
+    $quotedLauncher = '"' + $stableLauncher + '"'
+    $quotedUninstaller = '"' + $uninstallScript + '"'
+    New-ManagerShortcut $managedShortcutPaths[0] 'wscript.exe' $quotedLauncher $installFull $installedExe
+    New-ManagerShortcut $managedShortcutPaths[1] 'wscript.exe' `
+        ('"' + $friendlyUninstaller + '"') $installFull $installedExe
+    New-ManagerShortcut $managedShortcutPaths[2] 'wscript.exe' $quotedLauncher $installFull $installedExe
+
+    if (Test-Path -LiteralPath $uninstallRegistryPath) {
+        Remove-Item -LiteralPath $uninstallRegistryPath -Recurse -Force
+    }
+    New-Item -Path $uninstallRegistryPath -Force | Out-Null
+    $uninstallCommand = 'wscript.exe "' + $friendlyUninstaller + '"'
+    $quietUninstallCommand = 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ' + $quotedUninstaller
+    $estimatedSizeKb = [int][Math]::Min(
+        [int]::MaxValue,
+        [Math]::Ceiling((Get-ChildItem -LiteralPath $destination -Recurse -File | Measure-Object Length -Sum).Sum / 1KB))
+    $versionParts = $version.Split('-', 2)[0].Split('.')
+    $registration = [ordered]@{
+        DisplayName = 'Codex 总管家'
+        DisplayVersion = $version
+        Publisher = 'jejee122'
+        DisplayIcon = $installedExe
+        InstallLocation = $installFull
+        UninstallString = $uninstallCommand
+        QuietUninstallString = $quietUninstallCommand
+        URLInfoAbout = 'https://github.com/jejee122/CodexTotalManager'
+        NoModify = 1
+        NoRepair = 1
+        EstimatedSize = $estimatedSizeKb
+        VersionMajor = [int]$versionParts[0]
+        VersionMinor = [int]$versionParts[1]
+    }
+    foreach ($entry in $registration.GetEnumerator()) {
+        $propertyType = if ($entry.Value -is [int]) { 'DWord' } else { 'String' }
+        New-ItemProperty -Path $uninstallRegistryPath -Name ([string]$entry.Key) `
+            -Value $entry.Value -PropertyType $propertyType -Force | Out-Null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($runValueSnapshot) -and
+        $runValueSnapshot.IndexOf($installFull, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        New-Item -Path $runRegistryPath -Force | Out-Null
+        New-ItemProperty -Path $runRegistryPath -Name 'CodexTotalManager' `
+            -Value ('wscript.exe ' + $quotedLauncher) -PropertyType String -Force | Out-Null
+    }
+
     Remove-Item -LiteralPath $rollbackRoot -Recurse -Force
     Write-Output "LOCAL_RELEASE_INSTALLED version=$version path=$destination mode=$(if ($IsolatedTestMachine) { 'isolated-test' } else { 'deployable' })"
 }
@@ -321,6 +493,28 @@ catch {
         } elseif (Test-Path -LiteralPath $statePath) {
             Remove-Item -LiteralPath $statePath -Force
         }
+    }
+    for ($shortcutIndex = 0; $shortcutIndex -lt $managedShortcutPaths.Count; $shortcutIndex++) {
+        $shortcutPath = $managedShortcutPaths[$shortcutIndex]
+        $backupShortcut = Join-Path $rollbackRoot ("shortcut-$shortcutIndex.lnk")
+        if (Test-Path -LiteralPath $backupShortcut -PathType Leaf) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $shortcutPath) -Force | Out-Null
+            Copy-Item -LiteralPath $backupShortcut -Destination $shortcutPath -Force
+        } elseif (Test-Path -LiteralPath $shortcutPath) {
+            Remove-Item -LiteralPath $shortcutPath -Force
+        }
+    }
+    if (-not $startMenuFolderExisted -and (Test-Path -LiteralPath $startMenuFolder) -and
+        (Get-ChildItem -LiteralPath $startMenuFolder -Force | Measure-Object).Count -eq 0) {
+        Remove-Item -LiteralPath $startMenuFolder -Force
+    }
+    Restore-RegistrySnapshot $uninstallRegistryPath $uninstallRegistrySnapshot
+    New-Item -Path $runRegistryPath -Force | Out-Null
+    if ([string]::IsNullOrWhiteSpace($runValueSnapshot)) {
+        Remove-ItemProperty -LiteralPath $runRegistryPath -Name 'CodexTotalManager' -ErrorAction SilentlyContinue
+    } else {
+        New-ItemProperty -Path $runRegistryPath -Name 'CodexTotalManager' `
+            -Value $runValueSnapshot -PropertyType String -Force | Out-Null
     }
     if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
     if ($destinationCreated -and (Test-Path -LiteralPath $destination)) {

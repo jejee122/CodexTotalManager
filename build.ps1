@@ -3,10 +3,11 @@
 
   常用命令：
     .\build.ps1 -Release
-    .\build.ps1 -Publish -Version 3.0.0-rc.26
-    .\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.26
+.\build.ps1 -Publish -Version 3.0.0-rc.28
+.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.28
 
-  -Publish 生成 win-x64 自包含候选包，不安装、不启动总管家，也不会启动 Codex。
+  -Publish 会先运行安全测试和集成自检，再生成 win-x64 自包含候选包；
+  不安装、不启动总管家，也不会启动 Codex。
   发布包必须同时带入经过锁定的 CLIProxyAPI、签名有效的 Node.js 22+，以及
   Node 的 LICENSE 或同版本 OpenJS 官方签名分发包。
 #>
@@ -118,6 +119,38 @@ function Assert-PathBelow([string]$Path, [string]$Parent, [string]$Label) {
   return $full
 }
 
+function Assert-NoReparsePointBelow([string]$BasePath, [string]$TargetPath, [string]$Label) {
+  $baseFull = [IO.Path]::GetFullPath($BasePath).TrimEnd('\')
+  $targetFull = [IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
+  if (-not ($targetFull + '\').StartsWith($baseFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw "$Label is outside its trusted base directory: $targetFull"
+  }
+  $relative = $targetFull.Substring($baseFull.Length).TrimStart('\')
+  $cursor = $baseFull
+  foreach ($part in @($relative -split '\\' | Where-Object { $_ })) {
+    $cursor = Join-Path $cursor $part
+    if (-not (Test-Path -LiteralPath $cursor)) { break }
+    $item = Get-Item -LiteralPath $cursor -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw "$Label contains a symbolic link, junction, or other reparse point: $cursor"
+    }
+  }
+}
+
+function Assert-TreeHasNoReparsePoints([string]$RootPath, [string]$Label) {
+  if (-not (Test-Path -LiteralPath $RootPath)) { return }
+  $rootItem = Get-Item -LiteralPath $RootPath -Force
+  if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "$Label is a symbolic link, junction, or other reparse point: $RootPath"
+  }
+  $reparse = @(Get-ChildItem -LiteralPath $RootPath -Force -Recurse -ErrorAction Stop |
+    Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 } |
+    Select-Object -First 1)
+  if ($reparse.Count -gt 0) {
+    throw "$Label contains a symbolic link, junction, or other reparse point: $($reparse[0].FullName)"
+  }
+}
+
 $dotnet = Resolve-DotNet
 $config = if ($Release -or $Publish) { 'Release' } else { 'Debug' }
 $sln = Join-Path $repoRoot 'CodexTotalManager.sln'
@@ -130,12 +163,29 @@ $productVersion = if ([string]::IsNullOrWhiteSpace($Version)) { $projectVersion 
 $msbuildVersionArgs = @("-p:Version=$productVersion")
 $securityTestsPassed = $false
 $integrationTestsPassed = $false
+$runTests = $Test -or $Publish
+
+if ($runTests) {
+  $existingCliProxy = Join-Path $repoRoot 'out\publish\Resources\CLIProxyAPI\cli-proxy-api.exe'
+  $workspaceCliProxy = Join-Path (Split-Path -Parent $repoRoot) '.tools\CLIProxyAPI-7.2.104\cli-proxy-api.exe'
+  if ([string]::IsNullOrWhiteSpace($CliProxyApiArtifactPath) -and (Test-Path -LiteralPath $existingCliProxy -PathType Leaf)) {
+    $CliProxyApiArtifactPath = $existingCliProxy
+  }
+  if ([string]::IsNullOrWhiteSpace($CliProxyApiArtifactPath) -and (Test-Path -LiteralPath $workspaceCliProxy -PathType Leaf)) {
+    $CliProxyApiArtifactPath = $workspaceCliProxy
+  }
+  $CliProxyApiArtifactPath = Assert-File $CliProxyApiArtifactPath 'CLIProxyAPI 外部制品'
+  $testCliProxyHash = (Get-FileHash -LiteralPath $CliProxyApiArtifactPath -Algorithm SHA256).Hash
+  if ($testCliProxyHash -ine $expectedCliProxySha256) {
+    throw "CLIProxyAPI 测试制品哈希不匹配。预期 $expectedCliProxySha256，实际 $testCliProxyHash。"
+  }
+}
 
 Write-Host "`n==== 构建 ($config) ====" -ForegroundColor Cyan
 & $dotnet build $sln -c $config --nologo @msbuildVersionArgs
 if ($LASTEXITCODE -ne 0) { throw '构建失败。' }
 
-if ($Test) {
+if ($runTests) {
   Write-Host "`n==== 运行安全测试 ====" -ForegroundColor Cyan
   $securityProject = Join-Path $repoRoot 'tests\CodexModelManager.SecurityTests\CodexModelManager.SecurityTests.csproj'
   & $dotnet test $securityProject -c $config --nologo --no-build
@@ -144,8 +194,20 @@ if ($Test) {
 
   Write-Host "`n==== 运行集成自检 ====" -ForegroundColor Cyan
   $integrationProject = Join-Path $repoRoot 'tests\CodexModelManager.IntegrationTests\CodexModelManager.IntegrationTests.csproj'
-  & $dotnet run --project $integrationProject -c $config --no-build
-  if ($LASTEXITCODE -ne 0) { throw '集成自检失败。' }
+  $previousCliProxyArtifact = [Environment]::GetEnvironmentVariable('CMM_TEST_CLIPROXY_ARTIFACT', 'Process')
+  try {
+    [Environment]::SetEnvironmentVariable(
+      'CMM_TEST_CLIPROXY_ARTIFACT',
+      $CliProxyApiArtifactPath,
+      'Process')
+    & $dotnet run --project $integrationProject -c $config --no-build
+    if ($LASTEXITCODE -ne 0) { throw '集成自检失败。' }
+  } finally {
+    [Environment]::SetEnvironmentVariable(
+      'CMM_TEST_CLIPROXY_ARTIFACT',
+      $previousCliProxyArtifact,
+      'Process')
+  }
   $integrationTestsPassed = $true
 }
 
@@ -153,14 +215,8 @@ if ($Publish) {
   Write-Host "`n==== 生成自包含候选包 ====" -ForegroundColor Cyan
   $outDir = Join-Path $repoRoot 'out\publish'
   $outFull = Assert-PathBelow $outDir $repoRoot '发布目录'
-  $existingCliProxy = Join-Path $outFull 'Resources\CLIProxyAPI\cli-proxy-api.exe'
-  $workspaceCliProxy = Join-Path (Split-Path -Parent $repoRoot) '.tools\CLIProxyAPI-7.2.104\cli-proxy-api.exe'
-  if ([string]::IsNullOrWhiteSpace($CliProxyApiArtifactPath) -and (Test-Path -LiteralPath $existingCliProxy -PathType Leaf)) {
-    $CliProxyApiArtifactPath = $existingCliProxy
-  }
-  if ([string]::IsNullOrWhiteSpace($CliProxyApiArtifactPath) -and (Test-Path -LiteralPath $workspaceCliProxy -PathType Leaf)) {
-    $CliProxyApiArtifactPath = $workspaceCliProxy
-  }
+  Assert-NoReparsePointBelow $repoRoot $outFull '发布目录'
+  Assert-TreeHasNoReparsePoints $outFull '现有发布目录'
   $cliProxySource = Assert-File $CliProxyApiArtifactPath 'CLIProxyAPI 外部制品'
   $cliProxyHash = (Get-FileHash -LiteralPath $cliProxySource -Algorithm SHA256).Hash
   if ($cliProxyHash -ine $expectedCliProxySha256) {
@@ -222,7 +278,7 @@ if ($Publish) {
 
     $packageDeployment = Join-Path $outFull 'deployment'
     New-Item -ItemType Directory -Path $packageDeployment -Force | Out-Null
-    foreach ($name in @('Open-New-Manager-ControlPanel.ps1', 'Launch-Manager-Hidden.vbs')) {
+    foreach ($name in @('Open-New-Manager-ControlPanel.ps1', 'Launch-Manager-Hidden.vbs', 'Uninstall-Manager.vbs')) {
       Copy-Item -LiteralPath (Join-Path $repoRoot "deployment\$name") -Destination (Join-Path $packageDeployment $name) -Force
     }
     Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\install-local-release.ps1') `
@@ -246,6 +302,23 @@ if ($Publish) {
     }
     if ((Get-FileHash -LiteralPath (Join-Path $outFull 'Resources\CLIProxyAPI\cli-proxy-api.exe') -Algorithm SHA256).Hash -ine $expectedCliProxySha256) {
       throw '候选包中的 CLIProxyAPI 哈希与锁定值不一致。'
+    }
+    $pdbCount = @(Get-ChildItem -LiteralPath $outFull -Recurse -File -Filter '*.pdb').Count
+    $testToolPatterns = @(
+      'tools/mock-openai-server.mjs',
+      'CodexModelManager.IntegrationTests.dll',
+      'CodexModelManager.SecurityTests.dll',
+      'NativeProxySmoke.dll',
+      'ExtensionTestPlugin.dll'
+    )
+    $testToolCount = @($testToolPatterns | Where-Object {
+      $name = $_
+      @(Get-ChildItem -LiteralPath $outFull -Recurse -File | Where-Object {
+        $_.FullName.Substring($outFull.Length + 1).Replace('\', '/').EndsWith($name, [StringComparison]::OrdinalIgnoreCase)
+      }).Count -gt 0
+    }).Count
+    if ($pdbCount -ne 0 -or $testToolCount -ne 0) {
+      throw "候选包仍包含调试符号或测试工具：pdb=$pdbCount testTools=$testToolCount"
     }
     $publishedInfo = (Get-Item -LiteralPath $publishedExe).VersionInfo
     $publishedProductVersion = [string]$publishedInfo.ProductVersion
@@ -323,8 +396,8 @@ if ($Publish) {
       package = [ordered]@{
         installerIncluded = $true
         uninstallerIncluded = $true
-        pdbCount = 0
-        testToolCount = 0
+        pdbCount = $pdbCount
+        testToolCount = $testToolCount
       }
       verification = [ordered]@{
         buildPassed = $true
@@ -334,13 +407,11 @@ if ($Publish) {
       }
       files = @($payloadFiles)
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
-    if ($Test) {
-      Write-Host "`n==== 验证候选包安装回路（不安装） ====" -ForegroundColor Cyan
-      & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
-        -File (Join-Path $outFull 'install-local-release.ps1') `
-        -PublishDirectory $outFull -IsolatedTestMachine -ValidateOnly
-      if ($LASTEXITCODE -ne 0) { throw '候选包安装回路验证失败。' }
-    }
+    Write-Host "`n==== 验证候选包安装回路（不安装） ====" -ForegroundColor Cyan
+    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+      -File (Join-Path $outFull 'install-local-release.ps1') `
+      -PublishDirectory $outFull -IsolatedTestMachine -ValidateOnly
+    if ($LASTEXITCODE -ne 0) { throw '候选包安装回路验证失败。' }
     Write-Host "候选包清单: $manifestPath" -ForegroundColor Green
     Write-Host "候选包目录: $outFull" -ForegroundColor Green
     Write-Host "发布决定: $decision（没有安装）" -ForegroundColor Yellow

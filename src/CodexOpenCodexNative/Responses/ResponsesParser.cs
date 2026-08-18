@@ -12,7 +12,10 @@ public static class ResponsesParser
         {
             Model = request.Model,
             Stream = request.Stream,
-            Tools = request.Tools,
+            Tools = NormalizeTools(request.Tools),
+            ToolChoice = request.ToolChoice,
+            ParallelToolCalls = request.ParallelToolCalls,
+            Reasoning = request.Reasoning,
             Temperature = request.Temperature,
             MaxTokens = request.MaxOutputTokens,
             PreviousResponseId = request.PreviousResponseId
@@ -46,6 +49,35 @@ public static class ResponsesParser
         }
 
         return parsed;
+    }
+
+    private static List<OcxTool>? NormalizeTools(IReadOnlyList<OcxTool>? tools)
+    {
+        if (tools is null) return null;
+        var normalized = new List<OcxTool>();
+        foreach (var tool in tools)
+        {
+            if (tool.Function is not null)
+            {
+                normalized.Add(tool);
+                continue;
+            }
+            if (!string.Equals(tool.Type, "function", StringComparison.Ordinal)
+                || string.IsNullOrWhiteSpace(tool.Name))
+                continue;
+            normalized.Add(new OcxTool
+            {
+                Type = "function",
+                Function = new OcxToolFunction
+                {
+                    Name = tool.Name,
+                    Description = tool.Description,
+                    Parameters = tool.Parameters,
+                    Strict = tool.Strict
+                }
+            });
+        }
+        return normalized;
     }
 
     public static OcxMessage? MapInputItem(JsonElement item)

@@ -85,8 +85,8 @@ public static class RuntimeMode
         SetProcessEnvironment("CMM_RUNTIME_ROOT", Path.Combine(dataRoot, "runtime"));
 
         // Ordinary detached mode always points at a broken loopback endpoint. The only
-        // exception is the explicit test-double command, whose two ports are reserved
-        // for the inert local simulator and cannot be changed to a production port.
+        // exception is the explicit test-double command, whose two one-time loopback
+        // ports belong to the inert local simulator for this test run only.
         SetProcessEnvironment(
             "CMM_SANDBOX_OCX_URL",
             IsCodexTestDouble
@@ -104,7 +104,7 @@ public static class RuntimeMode
 
     public static string DetachedStatusText =>
         IsCodexTestDouble
-            ? "Codex 测试替身模式：只连接 127.0.0.1:19100/19110 的无能力模拟器，真实 Codex 继续隔离。"
+            ? $"Codex 测试替身模式：只连接一次性动态回环端口 {CodexTestDoubleEngineUri!.Port}/{CodexTestDoubleGatewayUri!.Port} 的无能力模拟器，真实 Codex 继续隔离。"
             : AllowsExternalStatusConnections
             ? "Codex 连接默认关闭：真实 Codex、模型和账号保持隔离；只有你点击连接按钮才会切换网关。"
             : "隔离压力测试模式：真实 Codex、服务器和 v2rayN 网络全部断开；只使用本机假数据与回环测试。";
@@ -117,27 +117,30 @@ public static class RuntimeMode
             || token.Any(character => !Uri.IsHexDigit(character)))
             throw new InvalidOperationException("Codex 测试替身缺少有效的一次性十六进制测试令牌。");
 
-        var engine = ResolveTestDoubleUri(TestDoubleEngineEnvironmentVariable, 19100);
-        var gateway = ResolveTestDoubleUri(TestDoubleGatewayEnvironmentVariable, 19110);
+        var engine = ResolveTestDoubleUri(TestDoubleEngineEnvironmentVariable);
+        var gateway = ResolveTestDoubleUri(TestDoubleGatewayEnvironmentVariable);
+        if (engine.Port == gateway.Port)
+            throw new InvalidOperationException("Codex 测试替身的 Engine 和 Gateway 不能使用同一个端口。");
         IsCodexTestDouble = true;
         CodexTestDoubleToken = token;
         CodexTestDoubleEngineUri = engine;
         CodexTestDoubleGatewayUri = gateway;
     }
 
-    private static Uri ResolveTestDoubleUri(string environmentVariable, int requiredPort)
+    private static Uri ResolveTestDoubleUri(string environmentVariable)
     {
         var value = Environment.GetEnvironmentVariable(environmentVariable);
         if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)
             || uri.Scheme != Uri.UriSchemeHttp
-            || !uri.IsLoopback
-            || uri.Port != requiredPort
+            || !string.Equals(uri.Host, "127.0.0.1", StringComparison.Ordinal)
+            || uri.Port is < 1024 or > 65535
             || uri.AbsolutePath != "/"
             || !string.IsNullOrEmpty(uri.Query)
-            || !string.IsNullOrEmpty(uri.Fragment))
+            || !string.IsNullOrEmpty(uri.Fragment)
+            || !string.IsNullOrEmpty(uri.UserInfo))
             throw new InvalidOperationException(
-                $"Codex 测试替身地址必须严格为 http://127.0.0.1:{requiredPort}/。");
-        return new Uri($"http://127.0.0.1:{requiredPort}/", UriKind.Absolute);
+                $"Codex 测试替身地址必须严格为 http://127.0.0.1:<一次性动态端口>/。");
+        return new Uri($"http://127.0.0.1:{uri.Port}/", UriKind.Absolute);
     }
 
     private static void SetProcessEnvironment(string name, string value) =>

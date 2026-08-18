@@ -33,6 +33,15 @@ public static class UnifiedGatewayConfigurationIdentity
                 route.CredentialIdentity,
                 route.SourceFingerprint));
         }
+        foreach (var group in (configuration.RotationGroups ?? new List<UnifiedGatewayRotationGroup>())
+                     .OrderBy(item => item.GatewayModel, StringComparer.OrdinalIgnoreCase))
+        {
+            lines.Add(string.Join((char)31,
+                "rotation-group",
+                group.GatewayModel,
+                group.UpstreamModel,
+                string.Join(',', group.Candidates.OrderBy(item => item, StringComparer.OrdinalIgnoreCase))));
+        }
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', lines))));
     }
 

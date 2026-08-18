@@ -8,8 +8,26 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 
-const int enginePort = 19100;
-const int gatewayPort = 19110;
+static int ReadLoopbackPort(string variableName, int fallback)
+{
+    var value = Environment.GetEnvironmentVariable(variableName);
+    if (string.IsNullOrWhiteSpace(value)) return fallback;
+    if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)
+        || uri.Scheme != Uri.UriSchemeHttp
+        || !uri.IsLoopback
+        || uri.Port is < 1024 or > 65535
+        || uri.AbsolutePath is not ("" or "/")
+        || !string.IsNullOrEmpty(uri.Query)
+        || !string.IsNullOrEmpty(uri.Fragment)
+        || !string.IsNullOrEmpty(uri.UserInfo))
+        throw new InvalidOperationException($"{variableName} must be a plain loopback HTTP URL.");
+    return uri.Port;
+}
+
+var enginePort = ReadLoopbackPort("CMM_CODEX_TEST_DOUBLE_ENGINE_URL", 19100);
+var gatewayPort = ReadLoopbackPort("CMM_CODEX_TEST_DOUBLE_GATEWAY_URL", 19110);
+if (enginePort == gatewayPort)
+    throw new InvalidOperationException("The test-double engine and gateway ports must be different.");
 var runToken = Environment.GetEnvironmentVariable("CMM_CODEX_TEST_DOUBLE_TOKEN")?.Trim();
 if (string.IsNullOrWhiteSpace(runToken)
     || runToken.Length is < 32 or > 128
@@ -20,7 +38,7 @@ if (string.IsNullOrWhiteSpace(runToken)
 }
 
 var runTokenSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(runToken)));
-var state = new TestDoubleState();
+var state = new TestDoubleState(enginePort, gatewayPort);
 var startedAt = Stopwatch.StartNew();
 var builder = WebApplication.CreateSlimBuilder(Array.Empty<string>());
 builder.Logging.ClearProviders();
@@ -448,6 +466,15 @@ static string TestDoublePage(int localPort, int enginePortValue, int gatewayPort
 
 sealed class TestDoubleState
 {
+    private readonly int _enginePort;
+    private readonly int _gatewayPort;
+
+    public TestDoubleState(int enginePort, int gatewayPort)
+    {
+        _enginePort = enginePort;
+        _gatewayPort = gatewayPort;
+    }
+
     private static readonly FakeModel[] ModelCatalog =
     {
         new("openai", "gpt-5.6-sol", "Codex Pro Official（测试）", "模拟 Codex 自带 Pro 官方线路。", 200_000, "官方", "标准"),
@@ -544,8 +571,8 @@ sealed class TestDoubleState
     public void RecordRequest(int localPort)
     {
         Interlocked.Increment(ref _totalRequests);
-        if (localPort == 19100) Interlocked.Increment(ref _engineRequests);
-        if (localPort == 19110) Interlocked.Increment(ref _gatewayRequests);
+        if (localPort == _enginePort) Interlocked.Increment(ref _engineRequests);
+        if (localPort == _gatewayPort) Interlocked.Increment(ref _gatewayRequests);
     }
 
     public void RecordNonLoopback() => Interlocked.Increment(ref _nonLoopbackRequests);
@@ -700,7 +727,7 @@ sealed class TestDoubleState
                     chatTurns = Interlocked.Read(ref _chatTurns),
                     outboundRequests = 0
                 },
-                ports = new { engine = 19100, gateway = 19110 },
+                ports = new { engine = _enginePort, gateway = _gatewayPort },
                 testOnly = true
             };
         }

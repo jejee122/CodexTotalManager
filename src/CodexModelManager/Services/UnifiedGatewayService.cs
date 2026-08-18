@@ -14,7 +14,9 @@ public sealed class UnifiedGatewayService
     public const int DefaultPort = LocalPortPolicy.DefaultUnifiedGatewayPort;
     public const string PlusPoolId = PoolCatalogDefaults.PlusAgentPoolId;
     public const string ProPoolId = PoolCatalogDefaults.ProAgentPoolId;
-    private const string AdmissionSecretName = "unified-gateway:client";
+    /// <summary>轮换组稳定模型名前缀：codex-auto/&lt;模型&gt; 聚合多个 Codex 账号池的同一模型。</summary>
+    public const string CodexAutoRoutePrefix = "codex-auto/";
+    private const string AdmissionSecretName = UnifiedGatewayKeys.MasterSecretName;
     private readonly AppSettingsService _settings;
     private readonly SecretStore _secrets;
     private readonly CliProxyPoolService _cliProxy;
@@ -98,7 +100,55 @@ public sealed class UnifiedGatewayService
         var created = "cmm-gw-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
         _secrets.SaveInternal(AdmissionSecretName, created);
         return created;
+
     }
+    public sealed record GatewayClientKeyView(string Label, string KeyHint);
+
+    /// <summary>为一个 harness 生成独立网关钥匙；返回完整钥匙（仅此一次可见），label 小写唯一。</summary>
+    public string CreateGatewayClientKey(string label)
+    {
+        if (!UnifiedGatewayKeys.IsValidLabel(label))
+            throw new InvalidOperationException("钥匙名称只能用小写字母、数字和连字符，1-32 位，且以字母或数字开头。");
+        var secretName = UnifiedGatewayKeys.SecretNameForLabel(label);
+        if (!string.IsNullOrWhiteSpace(_secrets.ReadInternal(secretName)))
+            throw new InvalidOperationException($"钥匙 {label} 已存在；如需换新请先吊销旧钥匙。");
+        var value = UnifiedGatewayKeys.GenerateKeyValue(label);
+        _secrets.SaveInternal(secretName, value);
+        return value;
+    }
+
+    public void RevokeGatewayClientKey(string label)
+    {
+        if (!UnifiedGatewayKeys.IsValidLabel(label))
+            throw new InvalidOperationException("钥匙名称格式不正确。");
+        if (label.Equals(UnifiedGatewayKeys.MasterLabel, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("主钥匙不可吊销；如需更换主钥匙请重新安装或手动清理密钥库。");
+        var secretName = UnifiedGatewayKeys.SecretNameForLabel(label);
+        if (string.IsNullOrWhiteSpace(_secrets.ReadInternal(secretName)))
+            throw new InvalidOperationException($"钥匙 {label} 不存在。");
+        _secrets.RemoveInternal(secretName);
+    }
+
+    /// <summary>列出所有客户端钥匙（含主钥匙），只显示尾号提示，不返回完整钥匙。</summary>
+    public IReadOnlyList<GatewayClientKeyView> ReadGatewayClientKeys()
+    {
+        var views = new List<GatewayClientKeyView>
+        {
+            new(
+                UnifiedGatewayKeys.MasterLabel,
+                HintFor(_secrets.ReadInternal(AdmissionSecretName)))
+        };
+        foreach (var internalName in _secrets.ListInternalNames(UnifiedGatewayKeys.ClientPrefix))
+        {
+            var label = UnifiedGatewayKeys.LabelForSecretName(internalName);
+            if (label is null) continue;
+            views.Add(new GatewayClientKeyView(label, HintFor(_secrets.ReadInternal(internalName))));
+        }
+        return views;
+    }
+
+    private static string HintFor(string? key) =>
+        string.IsNullOrWhiteSpace(key) ? "未生成" : $"••••{key[^Math.Min(6, key.Length)..]}";
 
     public async Task<UnifiedGatewayStatus> EnsureReadyAsync(CancellationToken cancellationToken = default)
     {
@@ -109,9 +159,10 @@ public sealed class UnifiedGatewayService
             await EnsureCompatibleHostStoppedBeforeConfigurationWriteAsync(cancellationToken);
             _ = GetClientKey();
             var discovered = await DiscoverAsync(ensureUpstreams: true, cancellationToken);
-            WriteConfiguration(discovered.Routes);
+            WriteConfiguration(discovered.Routes, discovered.RotationGroups);
             var running = await EnsureHostRunningAsync(cancellationToken);
             var modelNames = discovered.Routes.Select(route => route.GatewayModel)
+                .Concat(discovered.RotationGroups.Select(group => group.GatewayModel))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(model => model, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -209,7 +260,7 @@ public sealed class UnifiedGatewayService
                 ReadConfiguredRoutes().Where(route =>
                     !route.SourceId.Equals(sourceId, StringComparison.OrdinalIgnoreCase)),
                 selectedRoutes);
-            WriteConfiguration(routes);
+            WriteConfiguration(routes, BuildCodexAutoRotationGroups(routes));
             var running = await EnsureHostRunningAsync(cancellationToken);
             return BuildStatus(running, routes.Select(route => route.GatewayModel).ToArray(), new[]
             {
@@ -231,7 +282,12 @@ public sealed class UnifiedGatewayService
             var running = await IsHostHealthyAsync(cancellationToken);
             var routes = ReadConfigurationRoutes();
             var pools = BuildPoolStatusFromConfiguration(routes);
-            return BuildStatus(running, routes.Select(route => route.GatewayModel).ToArray(), pools, createKeyIfMissing: false);
+            var models = routes.Select(route => route.GatewayModel)
+                .Concat(ReadConfigurationRotationGroups().Select(group => group.GatewayModel))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(model => model, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return BuildStatus(running, models, pools, createKeyIfMissing: false);
         }
         finally { _gate.Release(); }
     }
@@ -258,7 +314,7 @@ public sealed class UnifiedGatewayService
         await EnsureReadyAsync(cancellationToken);
     }
 
-    private async Task<(List<UnifiedGatewayRoute> Routes, List<UnifiedGatewayPoolStatus> Pools)> DiscoverAsync(
+    private async Task<(List<UnifiedGatewayRoute> Routes, List<UnifiedGatewayPoolStatus> Pools, List<UnifiedGatewayRotationGroup> RotationGroups)> DiscoverAsync(
         bool ensureUpstreams,
         CancellationToken cancellationToken)
     {
@@ -280,50 +336,16 @@ public sealed class UnifiedGatewayService
             await Task.WhenAll(providersTask, modelsTask);
             var providers = providersTask.Result.Where(provider => !provider.Disabled
                 && !provider.Id.Equals("openai", StringComparison.OrdinalIgnoreCase)
-                && !provider.Id.Equals("cmm-plus-agent-api-1", StringComparison.OrdinalIgnoreCase)
-                && !provider.Id.Equals("cmm-pro-agent-api-1", StringComparison.OrdinalIgnoreCase)).ToArray();
+                && !PoolCatalogService.IsManagerOwnedProviderId(provider.Id)).ToArray();
             var customCount = 0;
             foreach (var provider in providers)
             {
-                foreach (var model in modelsTask.Result.Where(model => !model.Disabled
-                             && model.Provider.Equals(provider.Id, StringComparison.OrdinalIgnoreCase)))
-                {
-                    var sourceId = $"custom:{provider.Id}";
-                    var routePrefix = provider.Id + "/";
-                    var endpoint = $"http://127.0.0.1:{_settings.NativeEnginePort}/v1";
-                    var fingerprint = SubagentSourceIdentity.Compute(
-                        sourceId,
-                        SubagentSourceKind.OpenAiCompatible.ToString(),
-                        endpoint,
-                        provider.Adapter,
-                        string.Empty,
-                        routePrefix);
-                    routes.Add(Route(
-                        model.Namespaced,
-                        model.Namespaced,
-                        endpoint,
-                        null,
-                        sourceId,
-                        provider.DisplayName,
-                        sourceId,
-                        SubagentSourceKind.OpenAiCompatible,
-                        routePrefix,
-                        fingerprint,
-                        provider.Adapter));
-                    routes.Add(Route(
-                        model.Id,
-                        model.Id,
-                        endpoint,
-                        null,
-                        sourceId,
-                        provider.DisplayName,
-                        sourceId,
-                        SubagentSourceKind.OpenAiCompatible,
-                        routePrefix,
-                        fingerprint,
-                        provider.Adapter));
-                    customCount++;
-                }
+                var providerRoutes = BuildCustomProviderRoutes(
+                    provider,
+                    modelsTask.Result,
+                    _settings.NativeEnginePort);
+                routes.AddRange(providerRoutes);
+                customCount += providerRoutes.Count;
             }
             pools.Add(new UnifiedGatewayPoolStatus(
                 "custom-api",
@@ -340,7 +362,83 @@ public sealed class UnifiedGatewayService
         }
 
         routes = MergeRoutesFailClosed(Array.Empty<UnifiedGatewayRoute>(), routes).ToList();
-        return (routes, pools);
+        return (routes, pools, BuildCodexAutoRotationGroups(routes));
+    }
+
+    internal static IReadOnlyList<UnifiedGatewayRoute> BuildCustomProviderRoutes(
+        ProviderView provider,
+        IEnumerable<ModelOption> models,
+        int nativeEnginePort)
+    {
+        var result = new List<UnifiedGatewayRoute>();
+        // CLIProxy account pools are already added by AddCliPoolAsync with their
+        // own account identity and readiness checks. Treating the same cmm-*
+        // provider as a custom API would expose it twice and bypass those labels.
+        if (PoolCatalogService.IsManagerOwnedProviderId(provider.Id)) return result;
+        var sourceId = $"custom:{provider.Id}";
+        var routePrefix = provider.Id + "/";
+        var endpoint = $"http://127.0.0.1:{nativeEnginePort}/v1";
+        var fingerprint = SubagentSourceIdentity.Compute(
+            sourceId,
+            SubagentSourceKind.OpenAiCompatible.ToString(),
+            endpoint,
+            provider.Adapter,
+            UnifiedGatewayKeys.NativeEngineAdmissionRouteSecretName,
+            routePrefix);
+        foreach (var model in models.Where(model => !model.Disabled
+                     && model.Provider.Equals(provider.Id, StringComparison.OrdinalIgnoreCase)))
+        {
+            // Third-party models are always namespaced. Adding a bare model ID
+            // here makes two otherwise independent providers collide and can
+            // fail-close the whole unified gateway.
+            result.Add(Route(
+                model.Namespaced,
+                model.Namespaced,
+                endpoint,
+                UnifiedGatewayKeys.NativeEngineAdmissionRouteSecretName,
+                sourceId,
+                provider.DisplayName,
+                sourceId,
+                SubagentSourceKind.OpenAiCompatible,
+                routePrefix,
+                fingerprint,
+                provider.Adapter));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// 从 CLIProxy 号池路由推导 codex-auto/&lt;模型&gt; 轮换组：同一上游模型在每个账号池各有一条精确路由，
+    /// 聚合后外部 harness 只用一个稳定模型名即可获得"哪个号有额度就用哪个号"的自动轮换。
+    /// 撞名的组直接跳过（保持失败关闭，不用改写别人已占用的名字）。
+    /// </summary>
+    internal static List<UnifiedGatewayRotationGroup> BuildCodexAutoRotationGroups(
+        IReadOnlyList<UnifiedGatewayRoute> routes)
+    {
+        var groups = new List<UnifiedGatewayRotationGroup>();
+        var occupiedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var route in routes) occupiedNames.Add(route.GatewayModel);
+        foreach (var cluster in routes
+                     .Where(route => route.SourceKind.Equals(
+                                SubagentSourceKind.CliProxyPool.ToString(),
+                                StringComparison.OrdinalIgnoreCase))
+                     .GroupBy(route => route.UpstreamModel, StringComparer.OrdinalIgnoreCase)
+                     .OrderBy(cluster => cluster.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var gatewayModel = CodexAutoRoutePrefix + cluster.Key;
+            if (!occupiedNames.Add(gatewayModel)) continue;
+            groups.Add(new UnifiedGatewayRotationGroup
+            {
+                GatewayModel = gatewayModel,
+                UpstreamModel = cluster.Key,
+                Candidates = cluster
+                    .OrderBy(route => route.PoolId, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(route => route.GatewayModel, StringComparer.OrdinalIgnoreCase)
+                    .Select(route => route.GatewayModel)
+                    .ToList()
+            });
+        }
+        return groups;
     }
 
     private async Task AddCliPoolAsync(
@@ -417,7 +515,7 @@ public sealed class UnifiedGatewayService
     {
         var configured = _poolCatalog.FindFresh(poolId);
         if (configured?.Transport == PoolTransport.CliProxyApi) return configured;
-        throw new InvalidOperationException("The requested CLIProxy pool is not present in the verified pool catalog.");
+        throw new InvalidOperationException("经过验证的号池清单里找不到请求的 CLIProxy 号池。");
     }
 
     private int CountAuthFiles(string poolId)
@@ -433,7 +531,9 @@ public sealed class UnifiedGatewayService
     }
 
 
-    private void WriteConfiguration(IReadOnlyList<UnifiedGatewayRoute> routes)
+    private void WriteConfiguration(
+        IReadOnlyList<UnifiedGatewayRoute> routes,
+        IReadOnlyList<UnifiedGatewayRotationGroup> rotationGroups)
     {
         if (routes.Any(route => !SubagentSourceIdentity.IsRouteIdentityValid(route)))
             throw new InvalidOperationException("统一网关包含来源身份不完整的路由，已拒绝写入。");
@@ -444,8 +544,11 @@ public sealed class UnifiedGatewayService
             SchemaVersion = 4,
             Port = Port,
             DataDirectory = _settings.DataDirectory,
-            Routes = normalizedRoutes.ToList()
+            Routes = normalizedRoutes.ToList(),
+            RotationGroups = rotationGroups.OrderBy(group => group.GatewayModel, StringComparer.OrdinalIgnoreCase).ToList()
         };
+        if (UnifiedGatewayHost.ValidateRotationGroups(configuration) is { Length: > 0 } groupError)
+            throw new InvalidOperationException($"统一网关轮换组拒绝写入：{groupError}");
         configuration.ConfigurationFingerprint = UnifiedGatewayConfigurationIdentity.Compute(configuration);
         var options = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
         var temp = ConfigurationPath + $".{Guid.NewGuid():N}.tmp";
@@ -479,6 +582,27 @@ public sealed class UnifiedGatewayService
                 : Array.Empty<UnifiedGatewayRoute>();
         }
         catch { return Array.Empty<UnifiedGatewayRoute>(); }
+    }
+
+    private IReadOnlyList<UnifiedGatewayRotationGroup> ReadConfigurationRotationGroups()
+    {
+        try
+        {
+            if (!File.Exists(ConfigurationPath)) return Array.Empty<UnifiedGatewayRotationGroup>();
+            using var stream = new FileStream(
+                ConfigurationPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var configuration = JsonSerializer.Deserialize<UnifiedGatewayConfiguration>(stream,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            return configuration is not null
+                   && configuration.Port == Port
+                   && UnifiedGatewayConfigurationIdentity.Matches(configuration)
+                ? configuration.RotationGroups ?? new List<UnifiedGatewayRotationGroup>()
+                : new List<UnifiedGatewayRotationGroup>();
+        }
+        catch { return Array.Empty<UnifiedGatewayRotationGroup>(); }
     }
 
     private async Task<FileStream> AcquireConfigurationLockAsync(CancellationToken cancellationToken)

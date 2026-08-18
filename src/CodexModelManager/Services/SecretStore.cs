@@ -10,6 +10,7 @@ public sealed class SecretStore
     private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("CodexModelManager:v1");
     private readonly string _path;
     private readonly string _directory;
+    private readonly object _gate = new();
 
     public string? LoadWarning { get; private set; }
 
@@ -24,6 +25,11 @@ public sealed class SecretStore
     public string GetEnvironmentName(string provider)
     {
         EnsureExternalProvider(provider);
+        return BuildEnvironmentName(provider);
+    }
+
+    private static string BuildEnvironmentName(string provider)
+    {
         var safe = new string(provider.ToUpperInvariant()
             .Select(ch => char.IsLetterOrDigit(ch) ? ch : '_')
             .ToArray());
@@ -38,18 +44,26 @@ public sealed class SecretStore
 
     private void SaveCore(string name, string secret)
     {
-        var all = LoadEncrypted();
-        EnsureWritable();
-        var clear = Encoding.UTF8.GetBytes(secret ?? string.Empty);
-        try
+        lock (_gate)
         {
-            var encrypted = ProtectedData.Protect(clear, Entropy, DataProtectionScope.CurrentUser);
-            all[name] = Convert.ToBase64String(encrypted);
-            SaveEncrypted(all);
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(clear);
+            using var fileLock = LocalFileTransaction.Acquire(_path);
+            var all = LoadEncrypted();
+            EnsureWritable();
+            if (!name.StartsWith(InternalPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                EnsureNoEnvironmentNameCollisions(all.Keys.Append(name));
+            }
+            var clear = Encoding.UTF8.GetBytes(secret ?? string.Empty);
+            try
+            {
+                var encrypted = ProtectedData.Protect(clear, Entropy, DataProtectionScope.CurrentUser);
+                all[name] = Convert.ToBase64String(encrypted);
+                SaveEncrypted(all);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
         }
     }
 
@@ -63,34 +77,33 @@ public sealed class SecretStore
     {
         var all = LoadEncrypted();
         if (!all.TryGetValue(name, out var encoded)) return null;
-        try
-        {
-            var encrypted = Convert.FromBase64String(encoded);
-            var clear = ProtectedData.Unprotect(encrypted, Entropy, DataProtectionScope.CurrentUser);
-            try { return Encoding.UTF8.GetString(clear); }
-            finally { CryptographicOperations.ZeroMemory(clear); }
-        }
-        catch
-        {
-            return null;
-        }
+        return Decrypt(encoded);
     }
 
     public IReadOnlyDictionary<string, string> GetProviderProcessEnvironment(
         IEnumerable<string>? allowedProviders = null)
     {
-        var allow = allowedProviders is null
-            ? null
-            : new HashSet<string>(allowedProviders, StringComparer.OrdinalIgnoreCase);
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var provider in LoadEncrypted().Keys)
+        lock (_gate)
         {
-            if (provider.StartsWith(InternalPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-            if (allow is not null && !allow.Contains(provider)) continue;
-            var secret = Read(provider);
-            if (secret is not null) result[GetEnvironmentName(provider)] = secret;
+            using var fileLock = LocalFileTransaction.Acquire(_path);
+            var allow = allowedProviders is null
+                ? null
+                : new HashSet<string>(allowedProviders, StringComparer.OrdinalIgnoreCase);
+            var encrypted = LoadEncrypted();
+            var providers = encrypted.Keys
+                .Where(provider => !provider.StartsWith(InternalPrefix, StringComparison.OrdinalIgnoreCase))
+                .Where(provider => allow is null || allow.Contains(provider))
+                .ToArray();
+            EnsureNoEnvironmentNameCollisions(providers);
+
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var provider in providers)
+            {
+                var secret = Decrypt(encrypted[provider]);
+                if (secret is not null) result[BuildEnvironmentName(provider)] = secret;
+            }
+            return result;
         }
-        return result;
     }
 
     public void SaveInternal(string name, string secret) => SaveCore(InternalName(name), secret);
@@ -98,6 +111,21 @@ public sealed class SecretStore
     public string? ReadInternal(string name) => ReadCore(InternalName(name));
 
     public void RemoveInternal(string name) => RemoveCore(InternalName(name));
+
+    /// <summary>列出所有以指定前缀开头的内部凭据名（已去掉 internal: 前缀），供网关客户端钥匙枚举使用。</summary>
+    public IReadOnlyList<string> ListInternalNames(string prefix)
+    {
+        if (string.IsNullOrWhiteSpace(prefix))
+            throw new ArgumentException("内部凭据前缀不能为空。", nameof(prefix));
+        var fullPrefix = InternalPrefix + prefix;
+        return LoadEncrypted()
+            .Keys
+            .Where(name => name.StartsWith(fullPrefix, StringComparison.OrdinalIgnoreCase)
+                           && name.Length > fullPrefix.Length)
+            .Select(name => name[InternalPrefix.Length..])
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
 
     public void Remove(string provider)
     {
@@ -107,9 +135,13 @@ public sealed class SecretStore
 
     private void RemoveCore(string name)
     {
-        var all = LoadEncrypted();
-        EnsureWritable();
-        if (all.Remove(name)) SaveEncrypted(all);
+        lock (_gate)
+        {
+            using var fileLock = LocalFileTransaction.Acquire(_path);
+            var all = LoadEncrypted();
+            EnsureWritable();
+            if (all.Remove(name)) SaveEncrypted(all);
+        }
     }
 
     private static void EnsureExternalProvider(string provider)
@@ -127,14 +159,43 @@ public sealed class SecretStore
         return InternalPrefix + name;
     }
 
+    private static void EnsureNoEnvironmentNameCollisions(IEnumerable<string> providers)
+    {
+        var owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var provider in providers
+                     .Where(provider => !provider.StartsWith(InternalPrefix, StringComparison.OrdinalIgnoreCase))
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var environmentName = BuildEnvironmentName(provider);
+            if (owners.TryGetValue(environmentName, out var existing)
+                && !string.Equals(existing, provider, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"来源编号“{provider}”与“{existing}”会共用同一个 API Key 环境变量。请修改其中一个来源编号后再试。");
+            }
+            owners[environmentName] = provider;
+        }
+    }
+
     private Dictionary<string, string> LoadEncrypted()
     {
         if (LoadWarning is not null) return new(StringComparer.OrdinalIgnoreCase);
         if (!File.Exists(_path)) return new(StringComparer.OrdinalIgnoreCase);
         try
         {
-            return JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(_path))
-                   ?? new(StringComparer.OrdinalIgnoreCase);
+            using var document = JsonDocument.Parse(File.ReadAllText(_path));
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                throw new JsonException("密钥文件根节点必须是对象。");
+
+            var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (property.Value.ValueKind != JsonValueKind.String)
+                    throw new JsonException("密钥值必须是字符串。");
+                if (!values.TryAdd(property.Name, property.Value.GetString() ?? string.Empty))
+                    throw new JsonException("密钥文件包含大小写重复的名称。");
+            }
+            return values;
         }
         catch
         {
@@ -167,8 +228,23 @@ public sealed class SecretStore
 
     private void SaveEncrypted(Dictionary<string, string> values)
     {
-        var temp = _path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(values, new JsonSerializerOptions { WriteIndented = true }));
-        File.Move(temp, _path, true);
+        LocalFileTransaction.WriteAtomic(
+            _path,
+            JsonSerializer.Serialize(values, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static string? Decrypt(string encoded)
+    {
+        try
+        {
+            var encrypted = Convert.FromBase64String(encoded);
+            var clear = ProtectedData.Unprotect(encrypted, Entropy, DataProtectionScope.CurrentUser);
+            try { return Encoding.UTF8.GetString(clear); }
+            finally { CryptographicOperations.ZeroMemory(clear); }
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

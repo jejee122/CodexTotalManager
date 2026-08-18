@@ -37,9 +37,7 @@ public partial class PoolManagementView : UserControl
         _liveUsageTimer.Tick += LiveUsageTimer_Tick;
         Loaded += (_, _) =>
         {
-            if (!RuntimeMode.IsDetachedUi
-                && _services?.CodexConfig.IsManagedNativeProviderSelected() == true)
-                _liveUsageTimer.Start();
+            SynchronizeLiveUsageTimer();
         };
         Unloaded += (_, _) => _liveUsageTimer.Stop();
         PoolsList.ItemsSource = _pools;
@@ -53,6 +51,7 @@ public partial class PoolManagementView : UserControl
     {
         if (RuntimeMode.IsDetachedUi) return;
         if (_services is null) return;
+        SynchronizeLiveUsageTimer();
         if (!_services.CodexConfig.IsManagedNativeProviderSelected())
         {
             await ReloadDisconnectedAsync(cancellationToken);
@@ -98,6 +97,7 @@ public partial class PoolManagementView : UserControl
     public async Task ReloadAsync(RuntimeTruthSnapshot runtimeTruth, CancellationToken cancellationToken = default)
     {
         if (_services is null) return;
+        SynchronizeLiveUsageTimer();
         var viewsTask = _services.AccountPools.ReadViewsAsync(cancellationToken);
         var gatewayTask = ReadGatewaySafelyAsync(cancellationToken);
         var routingAuditTask = _services.AccountPools.ReadNativeRoutingAuditAsync(cancellationToken);
@@ -143,18 +143,43 @@ public partial class PoolManagementView : UserControl
         ApplyRoutingAudit(routingAuditTask.Result, active, runtimeTruth);
         UpdateLiveUsage(liveUsageTask.Result);
         ApplyAccountLedger(_services.AccountUsageLedger.LastSnapshot);
+        await UpdateUsageFlowChartAsync(cancellationToken);
         StatusMessage.Text = _services.PoolCatalog.LoadWarning
                              ?? $"统一事实快照 #{runtimeTruth.Revision}：{runtimeTruth.Consistency.Message}";
+    }
+
+    /// <summary>刷新近 14 天 token 能量曲线；失败只降级为空态，绝不影响其他数据展示。</summary>
+    private async Task UpdateUsageFlowChartAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            UsageFlowChart.SetDailySeries(
+                await _services!.AccountUsageLedger.ReadDailyTokenSeriesAsync(14, cancellationToken));
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            UsageFlowChart.SetDailySeries(null);
+        }
     }
 
     private async void LiveUsageTimer_Tick(object? sender, EventArgs e)
     {
         if (_services is null || _liveUsageRefreshRunning) return;
+        if (!_services.CodexConfig.IsManagedNativeProviderSelected())
+        {
+            _liveUsageTimer.Stop();
+            return;
+        }
         _liveUsageRefreshRunning = true;
         try
         {
             UpdateLiveUsage(await _services.AccountPools.ReadLiveTokenUsageAsync());
             ApplyAccountLedger(_services.AccountUsageLedger.LastSnapshot);
+            await UpdateUsageFlowChartAsync();
         }
         catch
         {
@@ -163,6 +188,21 @@ public partial class PoolManagementView : UserControl
         finally
         {
             _liveUsageRefreshRunning = false;
+        }
+    }
+
+    private void SynchronizeLiveUsageTimer()
+    {
+        var shouldRun = IsLoaded
+                        && !RuntimeMode.IsDetachedUi
+                        && _services?.CodexConfig.IsManagedNativeProviderSelected() == true;
+        if (shouldRun)
+        {
+            if (!_liveUsageTimer.IsEnabled) _liveUsageTimer.Start();
+        }
+        else if (_liveUsageTimer.IsEnabled)
+        {
+            _liveUsageTimer.Stop();
         }
     }
 
@@ -284,7 +324,7 @@ public partial class PoolManagementView : UserControl
         if (execution is null || actual is null)
         {
             RecentActualText.Text = "暂无可确认记录";
-            RecentActualDetailText.Text = "OpenCodex 日志来源缺失或还没有请求";
+        RecentActualDetailText.Text = "总管家本机引擎日志来源缺失或还没有请求";
             return;
         }
         var status = execution.HttpStatus ?? actual.HttpStatus;
@@ -424,7 +464,7 @@ public partial class PoolManagementView : UserControl
             : $"线路会接入“{pool.DisplayName}”，实际模型为 {model}；桌面统一使用固定入口 cmm/main，不会偷用官方 Pro。Codex 正在运行时只热切换当前任务，不会自动重启。";
         if (MessageBox.Show(
                 Window.GetWindow(this),
-                $"确定切到“{pool.DisplayName}”吗？\n\n{warning}\n\n会先备份并核对 OpenCodex 状态；失败会回滚。",
+            $"确定切到“{pool.DisplayName}”吗？\n\n{warning}\n\n会先备份并核对总管家本机引擎状态；失败会回滚。",
                 "确认切换号池",
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Information,
@@ -514,7 +554,7 @@ public partial class PoolManagementView : UserControl
         {
             if (MessageBox.Show(
                     Window.GetWindow(this),
-                    $"确定删除“{account.Label}”吗？\n\n删除前会备份 OpenCodex 配置、账号凭据库和大管家号池清单。Pro 主账号禁止删除；如果它是当前账号，必须先切到别的账号并发送一条消息确认。\n\n已经绑定这个账号的旧任务可能无法继续请求，建议先确认不再使用。",
+            $"确定删除“{account.Label}”吗？\n\n删除前会备份总管家本机引擎配置、账号凭据库和总管家号池清单。Pro 主账号禁止删除；如果它是当前账号，必须先切到别的账号并发送一条消息确认。\n\n已经绑定这个账号的旧任务可能无法继续请求，建议先确认不再使用。",
                     "确认删除 Codex 账号",
                     MessageBoxButton.YesNo,
                     MessageBoxImage.Warning,

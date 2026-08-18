@@ -11,5 +11,5 @@ If Not fso.FileExists(launcher) Then
     WScript.Quit 2
 End If
 
-shell.Run "powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -WindowStyle Hidden -File " & quote & launcher & quote, 0, False
+shell.Run "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " & quote & launcher & quote, 0, False
 WScript.Quit 0

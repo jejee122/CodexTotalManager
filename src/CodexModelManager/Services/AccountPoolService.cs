@@ -82,9 +82,9 @@ public sealed class AccountPoolService
         var native = await ReadNativeCodexSnapshotCachedAsync(cancellationToken);
         var nativeUsage = await _openCodex.GetNativeAccountUsageAsync(native.Accounts, cancellationToken);
         var pro = nativeUsage.GetValueOrDefault("pro")
-                  ?? LiveTokenUsageView.Empty("pro", "Codex Pro", "OpenCodex 本机完整日志");
+                  ?? LiveTokenUsageView.Empty("pro", "Codex Pro", "总管家本机完整日志");
         var plus = nativeUsage.GetValueOrDefault("plus")
-                   ?? LiveTokenUsageView.Empty("plus", "Codex Plus", "OpenCodex 本机完整日志");
+                   ?? LiveTokenUsageView.Empty("plus", "Codex Plus", "总管家本机完整日志");
 
         var others = nativeUsage.Values
             .Where(usage => usage.Key.StartsWith("provider:", StringComparison.OrdinalIgnoreCase))
@@ -94,7 +94,7 @@ public sealed class AccountPoolService
                 return usage with
                 {
                     DisplayName = _settings.GetProviderName(provider),
-                    Source = $"OpenCodex 成功请求 · {provider}"
+                Source = $"总管家本机引擎成功请求 · {provider}"
                 };
             })
             .OrderByDescending(usage => usage.TotalTokens)
@@ -304,7 +304,7 @@ public sealed class AccountPoolService
         CancellationToken cancellationToken = default)
     {
         if (!await _process.EnsureNativeEngineOnlyAsync(cancellationToken))
-            throw new OpenCodexAccountApiUnavailableException("OpenCodex 没有启动成功，无法调用账号登录接口。");
+            throw new OpenCodexAccountApiUnavailableException("总管家本机引擎没有启动成功，无法调用账号登录接口。");
         return await _openCodex.StartCodexAccountLoginAsync(cancellationToken);
     }
 
@@ -321,12 +321,12 @@ public sealed class AccountPoolService
             if (status.Status.Equals("done", StringComparison.OrdinalIgnoreCase))
             {
                 if (string.IsNullOrWhiteSpace(status.AccountId))
-                    throw new InvalidOperationException("官方登录已完成，但 OpenCodex 没有返回账号编号。");
+            throw new InvalidOperationException("官方登录已完成，但总管家本机引擎没有返回账号编号。");
                 var refreshed = await _openCodex.GetCodexAccountsAsync(forceRefresh: true, cancellationToken);
                 var account = refreshed.Accounts.FirstOrDefault(item =>
                     item.Id.Equals(status.AccountId, StringComparison.OrdinalIgnoreCase));
                 if (account is null)
-                    throw new InvalidOperationException("官方登录已完成，但账号没有出现在 OpenCodex 账号列表中。");
+            throw new InvalidOperationException("官方登录已完成，但账号没有出现在总管家本机引擎的账号列表中。");
                 _catalog.SyncNativeCodexAccounts(refreshed.Accounts, addMissing: true);
                 InvalidateReadCache();
                 return status;
@@ -363,12 +363,12 @@ public sealed class AccountPoolService
         if (pool.Transport != PoolTransport.NativeCodexAccount)
             throw new InvalidOperationException("这个卡片不是 Codex 原生账号。");
         if (!string.Equals(pool.NativeAccountId, accountId, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("账号卡片与 OpenCodex 账号不匹配，已停止删除。");
+            throw new InvalidOperationException("账号卡片与总管家本机引擎账号不匹配，已停止删除。");
 
         var native = await _openCodex.GetCodexAccountsAsync(forceRefresh: true, cancellationToken);
         var account = native.Accounts.FirstOrDefault(item =>
             item.Id.Equals(accountId, StringComparison.OrdinalIgnoreCase))
-                      ?? throw new InvalidOperationException("这个账号已经不在 OpenCodex 中，请刷新状态。");
+                ?? throw new InvalidOperationException("这个账号已经不在总管家本机引擎中，请刷新状态。");
         if (account.IsMain)
             throw new InvalidOperationException("Pro 主账号受保护，禁止删除。");
         if (_catalog.GetActive().PoolId.Equals(poolId, StringComparison.OrdinalIgnoreCase)
@@ -380,7 +380,7 @@ public sealed class AccountPoolService
         await _openCodex.DeleteCodexAccountAsync(accountId, cancellationToken);
         var verified = await _openCodex.GetCodexAccountsAsync(forceRefresh: true, cancellationToken);
         if (verified.Accounts.Any(item => item.Id.Equals(accountId, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException("OpenCodex 没有确认删除账号，大管家没有移除卡片。");
+            throw new InvalidOperationException("总管家本机引擎没有确认删除账号，总管家没有移除卡片。");
         _catalog.RemoveNativeCodexAccountPool(poolId, accountId);
         InvalidateReadCache();
         return backup;
@@ -417,17 +417,16 @@ public sealed class AccountPoolService
         if (!_codexConfig.IsManagedNativeProviderSelected())
             return OperationResult.Fail("Codex 目前没有连接总管家。你仍可添加、登录和管理号池；要把某个号池切给 Codex 使用，请先点“一键连接 Codex”。");
 
-        var desktopBefore = await _desktop.ReadStateAsync(cancellationToken);
-        if (!desktopBefore.Connected && IsCodexProcessRunning())
+        var desktopState = await _desktop.ReadStateAsync(cancellationToken);
+        if (!desktopState.Connected && IsCodexProcessRunning())
             return OperationResult.Fail("Codex is running, but the Manager cannot verify its current task. Close Codex or restore the desktop bridge before switching pools.");
-        if (desktopBefore.IsTurnRunning)
+        if (desktopState.IsTurnRunning)
             return OperationResult.Fail("Codex 正在回答，等回答结束后再切换。");
 
         var oldActive = _catalog.GetActive();
         var codexSnapshot = _codexConfig.CreateSnapshot();
         CodexPoolSettings? nativeSettingsBefore = null;
         var nativeRoutingTouched = false;
-        var desktopRoutingTouched = false;
         var openCodexConfigTouched = false;
         var openCodexBackup = _backups.Create();
         try
@@ -442,12 +441,12 @@ public sealed class AccountPoolService
                 if (!string.IsNullOrWhiteSpace(native.Error))
                     throw new InvalidOperationException($"原生 Codex 账号读取失败：{native.Error}");
                 var account = ResolveNativeAccount(target, native.Accounts)
-                              ?? throw new InvalidOperationException("这个 Codex 账号已经不在 OpenCodex 账号列表中，请先同步账号。");
+            ?? throw new InvalidOperationException("这个 Codex 账号已经不在总管家本机引擎的账号列表中，请先同步账号。");
                 var nativeModel = ResolveModel(requestedModel, target.DefaultModel, native.Models);
                 VerifyFreshTarget(target);
                 nativeSettingsBefore = native.Settings;
                 nativeRoutingTouched = true;
-                return await SwitchNativeCodexAccountAsync(target, account, nativeModel, desktopBefore, cancellationToken);
+                return await SwitchNativeCodexAccountAsync(target, account, nativeModel, cancellationToken);
             }
 
             var backend = target.Transport switch
@@ -465,7 +464,7 @@ public sealed class AccountPoolService
             await EnsureProviderAsync(target, models, cancellationToken);
             var providerTest = await _openCodex.TestProviderAsync(target.ProviderId!, cancellationToken);
             if (!providerTest.Success)
-                throw new InvalidOperationException($"OpenCodex 没有通过号池 API 复查：{providerTest.Message}");
+            throw new InvalidOperationException($"总管家本机引擎没有通过号池 API 复查：{providerTest.Message}");
 
             var comboId = $"cmm-pool-{target.Id}";
             await _openCodex.UpsertPoolRouteAsync(
@@ -482,7 +481,7 @@ public sealed class AccountPoolService
             if (activeTarget is null
                 || !activeTarget.Value.Provider.Equals(target.ProviderId, StringComparison.OrdinalIgnoreCase)
                 || !activeTarget.Value.Model.Equals(model, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("OpenCodex 没有确认固定入口已经指向目标号池。");
+            throw new InvalidOperationException("总管家本机引擎没有确认固定入口已经指向目标号池。");
             var codexModel = $"{target.ProviderId}/{model}";
             _codexConfig.SetDefaultModel(codexModel);
 
@@ -504,9 +503,9 @@ public sealed class AccountPoolService
                 {
                     _backups.Restore(openCodexBackup);
                     if (!await _process.RestartOpenCodexAsync(rollbackToken))
-                        rollback.Add("OpenCodex 配置已恢复，但服务健康检查未通过");
+                    rollback.Add("总管家本机引擎配置已恢复，但服务健康检查未通过");
                 }
-                catch (Exception restore) { rollback.Add($"OpenCodex 配置恢复失败：{restore.Message}"); }
+            catch (Exception restore) { rollback.Add($"总管家本机引擎配置恢复失败：{restore.Message}"); }
             }
             if (nativeRoutingTouched && nativeSettingsBefore is not null)
             {
@@ -524,16 +523,7 @@ public sealed class AccountPoolService
             catch (Exception restore) { rollback.Add($"Codex 默认模型恢复失败：{restore.Message}"); }
             try { _catalog.RestoreActive(oldActive); }
             catch (Exception restore) { rollback.Add($"号池状态恢复失败：{restore.Message}"); }
-            if (desktopRoutingTouched && !string.IsNullOrWhiteSpace(desktopBefore.CurrentModel))
-            {
-                try
-                {
-                    var restored = await EnsureDesktopModelAsync(desktopBefore.CurrentModel!, rollbackToken);
-                    if (restored.Status != CodexAliasSwitchStatus.Success) rollback.Add("当前任务模型未完整恢复");
-                }
-                catch (Exception restore) { rollback.Add($"当前任务恢复失败：{restore.Message}"); }
-            }
-            var detail = rollback.Count == 0 ? "原来的账号、默认模型和当前任务状态已恢复。" : string.Join("；", rollback);
+            var detail = rollback.Count == 0 ? "原来的账号和默认模型已恢复；总管家从未操作当前任务菜单。" : string.Join("；", rollback);
             return OperationResult.Fail($"切换失败：{ex.Message} {detail}");
         }
     }
@@ -542,7 +532,6 @@ public sealed class AccountPoolService
         PoolDefinition target,
         CodexAccountView account,
         string model,
-        CodexDesktopState desktopBefore,
         CancellationToken cancellationToken)
     {
         if (!account.HasCredential || account.NeedsReauth)
@@ -559,7 +548,7 @@ public sealed class AccountPoolService
             || verified.Settings.AutoSwitchThreshold != 0
             || verified.Settings.FailoverThreshold != 0
             || !string.Equals(verified.Settings.ActiveAccountId, account.Id, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("OpenCodex 没有确认全局账号线路已固定到所选账号。");
+            throw new InvalidOperationException("总管家本机引擎没有确认全局账号线路已固定到所选账号。");
         _codexConfig.SetDefaultModel(model);
         var finalAccounts = await _openCodex.GetCodexAccountsAsync(forceRefresh: true, cancellationToken);
         var runtime = await _openCodex.GetRuntimeStatusAsync(cancellationToken);
@@ -571,7 +560,7 @@ public sealed class AccountPoolService
             || !string.Equals(finalAccounts.Settings.ActiveAccountId, account.Id, StringComparison.OrdinalIgnoreCase)
             || !_codexConfig.IsManagedNativeProviderSelected()
             || !string.Equals(_codexConfig.ReadDefaultModel(), model, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("The final Native Engine, account, failover, or model identity did not match the requested pool.");
+            throw new InvalidOperationException("最终的本机引擎、扣费账号、故障转移或模型与所选号池不一致，已拒绝完成切换。");
         _catalog.SetActive(target.Id, model, "native-account-control-plane-and-default-verified");
         var label = account.IsMain ? "Pro 主账号" : $"{account.PlanText}账号";
         return OperationResult.Ok(
@@ -605,7 +594,7 @@ public sealed class AccountPoolService
             cancellationToken);
         _settings.SetProviderName(pool.ProviderId, pool.DisplayName);
         if (!await _process.RestartOpenCodexAsync(cancellationToken))
-            throw new InvalidOperationException("OpenCodex 重启后没有通过健康检查。");
+            throw new InvalidOperationException("总管家本机引擎重启后没有通过健康检查。");
         var verifiedProvider = (await _openCodex.GetProvidersAsync(_settings, cancellationToken))
             .FirstOrDefault(provider => provider.Id.Equals(pool.ProviderId, StringComparison.OrdinalIgnoreCase));
         var expectedBaseUrl = PoolCatalogService.BuildCliBaseUrl(pool);
@@ -614,24 +603,17 @@ public sealed class AccountPoolService
             || !verifiedProvider.HasApiKey
             || !verifiedProvider.BaseUrl.Equals(expectedBaseUrl, StringComparison.Ordinal)
             || !verifiedProvider.Adapter.Equals(adapter, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("OpenCodex did not persist the exact CLIProxy provider identity and endpoint.");
-    }
-
-    private async Task<CodexAliasSwitchResult> EnsureDesktopModelAsync(
-        string model,
-        CancellationToken cancellationToken)
-    {
-        return await _desktop.EnsureCurrentChatUsesAliasAsync(model, cancellationToken);
+            throw new InvalidOperationException("总管家本机引擎没有保存完全一致的 CLIProxy 来源身份和地址。");
     }
 
     private void VerifyFreshTarget(PoolDefinition target)
     {
         var fresh = _catalog.FindFresh(target.Id)
-                    ?? throw new InvalidOperationException("The target pool disappeared before the switch was committed.");
+                    ?? throw new InvalidOperationException("切换提交前，目标号池已不存在。");
         if (!fresh.Enabled
             || fresh.Transport != target.Transport
             || !string.Equals(fresh.NativeAccountId, target.NativeAccountId, StringComparison.Ordinal))
-            throw new InvalidOperationException("The target pool changed while the switch was running.");
+            throw new InvalidOperationException("切换过程中目标号池被修改，已停止操作。");
         if (target.Transport == PoolTransport.CliProxyApi
             && (fresh.LocalPort != target.LocalPort
                 || !string.Equals(fresh.ProviderId, target.ProviderId, StringComparison.Ordinal)
@@ -640,7 +622,7 @@ public sealed class AccountPoolService
                     PoolCatalogService.BuildCliBaseUrl(fresh),
                     PoolCatalogService.BuildCliBaseUrl(target),
                     StringComparison.Ordinal)))
-            throw new InvalidOperationException("The target CLIProxy identity changed while the switch was running.");
+            throw new InvalidOperationException("切换过程中 CLIProxy 号池的端口或身份发生变化，已停止操作。");
     }
 
     private async Task VerifyPoolRouteAsync(
@@ -655,24 +637,11 @@ public sealed class AccountPoolService
             || route.Targets.Count != 1
             || !route.Targets[0].Provider.Equals(target.ProviderId, StringComparison.Ordinal)
             || !route.Targets[0].Model.Equals(model, StringComparison.Ordinal))
-            throw new InvalidOperationException("OpenCodex did not persist the exact target pool route.");
+            throw new InvalidOperationException("总管家本机引擎没有保存完全一致的目标号池路线。");
     }
 
     private static bool IsCodexProcessRunning()
-    {
-        try
-        {
-            return Process.GetProcessesByName("Codex").Any(process =>
-            {
-                try { return !process.HasExited; }
-                finally { process.Dispose(); }
-            });
-        }
-        catch
-        {
-            return true;
-        }
-    }
+        => CodexDesktopProcessDetector.IsRunning();
 
     private async Task<AccountPoolView> ReadViewAsync(
         PoolDefinition pool,
@@ -778,8 +747,8 @@ public sealed class AccountPoolService
                 ? "OpenAI 当前没有为这个账号返回可显示的套餐额度；账号健康状态仍会独立检查。"
                 : account.ResetCredits is > 0 ? $"可用额度重置次数：{account.ResetCredits}" : string.Empty,
             UsageSourceText = account.QuotaUpdatedTime is null
-                ? "OpenCodex 按账号读取 ChatGPT 官方额度 · 官方汇总值，可能延迟更新"
-                : $"OpenCodex 按账号读取 ChatGPT 官方额度 · 更新 {account.QuotaUpdatedTime:MM-dd HH:mm:ss} · 官方汇总值，可能延迟更新",
+                ? "总管家本机引擎按账号读取 ChatGPT 官方额度 · 官方汇总值，可能延迟更新"
+                : $"总管家本机引擎按账号读取 ChatGPT 官方额度 · 更新 {account.QuotaUpdatedTime:MM-dd HH:mm:ss} · 官方汇总值，可能延迟更新",
             UsageUpdatedAt = account.QuotaUpdatedTime
         };
         return new PoolBackendSnapshot(

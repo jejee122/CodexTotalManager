@@ -16,6 +16,7 @@ public static class RouteResolver
         if (IsInternalRouteAlias(model))
         {
             var combo = registry.FindComboByAlias(model!);
+            // 组合路由当前固定使用第一个目标；多目标组合已在配置写入时拒绝（TryReadCombo）。
             var selected = combo?.Targets.FirstOrDefault();
             var target = selected is null ? null : registry.Find(selected.Provider);
             if (selected is null || target is null || target.Disabled)
@@ -44,31 +45,37 @@ public static class RouteResolver
         if (slash > 0)
         {
             var prefix = model[..slash];
+            var explicitModel = model[(slash + 1)..];
             var explicitProvider = registry.Find(prefix);
-            if (explicitProvider is not null && !explicitProvider.Disabled)
+            if (explicitProvider is not null
+                && !explicitProvider.Disabled
+                && !string.IsNullOrWhiteSpace(explicitModel)
+                && (explicitProvider.Models.Contains(explicitModel, StringComparer.OrdinalIgnoreCase)
+                    || string.Equals(explicitProvider.DefaultModel, explicitModel, StringComparison.OrdinalIgnoreCase)))
             {
                 return new RouteResult
                 {
                     Provider = explicitProvider,
                     ProviderId = explicitProvider.Id,
-                    ModelId = model[(slash + 1)..]
+                    ModelId = explicitModel
                 };
             }
         }
 
-        foreach (var provider in registry.All)
+        // Bare model names are reserved for the built-in official provider.
+        // Every third-party source must stay namespaced so two providers with
+        // the same model ID can never route according to dictionary order.
+        var official = registry.Find("openai");
+        if (official is not null && !official.Disabled
+            && (official.Models.Contains(model, StringComparer.OrdinalIgnoreCase)
+                || string.Equals(official.DefaultModel, model, StringComparison.OrdinalIgnoreCase)))
         {
-            if (provider.Disabled) continue;
-            if (provider.Models.Contains(model, StringComparer.OrdinalIgnoreCase)
-                || string.Equals(provider.DefaultModel, model, StringComparison.OrdinalIgnoreCase))
+            return new RouteResult
             {
-                return new RouteResult
-                {
-                    Provider = provider,
-                    ProviderId = provider.Id,
-                    ModelId = model
-                };
-            }
+                Provider = official,
+                ProviderId = official.Id,
+                ModelId = model
+            };
         }
 
         throw new ModelNotFoundException(model);

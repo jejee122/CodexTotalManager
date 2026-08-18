@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using CodexOpenCodexNative.Models;
 using CodexOpenCodexNative.Providers;
 
@@ -11,6 +13,12 @@ public sealed class NativeProxyConfigStore
     private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("CodexTotalManager:NativeProxy:v1");
     private const string SecretPrefix = "dpapi:";
     private readonly string _path;
+    private static readonly ConcurrentDictionary<string, object> PathGates =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly JsonSerializerOptions ReadOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
 
     public NativeProxyConfigStore(string? dataRoot = null)
     {
@@ -25,11 +33,23 @@ public sealed class NativeProxyConfigStore
 
     public NativeProxyConfig Load()
     {
+        var gate = PathGates.GetOrAdd(Path.GetFullPath(_path), static _ => new object());
+        lock (gate)
+        {
+            using var fileLock = AcquireCrossProcessLock();
+            var config = LoadUnlocked();
+            if (MigrateLegacyRouteNames(config)) SaveUnlocked(config, config.Revision);
+            return config;
+        }
+    }
+
+    private NativeProxyConfig LoadUnlocked()
+    {
         if (!File.Exists(_path)) return new NativeProxyConfig();
         NativeProxyConfig config;
         try
         {
-            config = JsonSerializer.Deserialize<NativeProxyConfig>(File.ReadAllText(_path))
+            config = JsonSerializer.Deserialize<NativeProxyConfig>(File.ReadAllText(_path), ReadOptions)
                      ?? throw new InvalidOperationException("原生代理配置为空。");
             config.Providers ??= new List<ProviderDefinition>();
             config.Combos ??= new List<ComboDefinition>();
@@ -49,7 +69,6 @@ public sealed class NativeProxyConfigStore
             if (!string.IsNullOrWhiteSpace(provider.ApiKey))
                 provider.ApiKey = DecryptIfNeeded(provider.ApiKey);
         }
-        if (MigrateLegacyRouteNames(config)) Save(config);
         return config;
     }
 
@@ -71,7 +90,37 @@ public sealed class NativeProxyConfigStore
 
     public void Save(NativeProxyConfig config)
     {
+        var gate = PathGates.GetOrAdd(Path.GetFullPath(_path), static _ => new object());
+        lock (gate)
+        {
+            using var fileLock = AcquireCrossProcessLock();
+            var currentRevision = File.Exists(_path) ? LoadUnlocked().Revision : 0;
+            if (config.Revision != currentRevision)
+                throw new InvalidOperationException(
+                    $"原生代理配置已被另一个进程更新（当前版本 {currentRevision}，待保存版本 {config.Revision}）；已拒绝用旧副本覆盖。请重新读取后再试。");
+            SaveUnlocked(config, currentRevision);
+        }
+    }
+
+    public NativeProxyConfig Update(Action<NativeProxyConfig> mutation)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        var gate = PathGates.GetOrAdd(Path.GetFullPath(_path), static _ => new object());
+        lock (gate)
+        {
+            using var fileLock = AcquireCrossProcessLock();
+            var config = LoadUnlocked();
+            var expectedRevision = config.Revision;
+            mutation(config);
+            SaveUnlocked(config, expectedRevision);
+            return Clone(config);
+        }
+    }
+
+    private void SaveUnlocked(NativeProxyConfig config, long expectedRevision)
+    {
         var copy = Clone(config);
+        copy.Revision = checked(expectedRevision + 1);
         if (!string.IsNullOrWhiteSpace(copy.AdmissionToken) && !copy.AdmissionToken.StartsWith(SecretPrefix, StringComparison.Ordinal))
             copy.AdmissionToken = Encrypt(copy.AdmissionToken);
         foreach (var provider in copy.Providers)
@@ -79,18 +128,56 @@ public sealed class NativeProxyConfigStore
             if (!string.IsNullOrWhiteSpace(provider.ApiKey) && !provider.ApiKey.StartsWith(SecretPrefix, StringComparison.Ordinal))
                 provider.ApiKey = Encrypt(provider.ApiKey);
         }
-        var temp = _path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(copy, new JsonSerializerOptions
+        var temp = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
         {
-            WriteIndented = true
-        }));
-        File.Move(temp, _path, true);
+            var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(copy, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            }));
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                       4096, FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(true);
+            }
+            File.Move(temp, _path, true);
+            config.Revision = copy.Revision;
+        }
+        finally
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); }
+            catch { }
+        }
+    }
+
+    private FileStream AcquireCrossProcessLock()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+        var lockPath = _path + ".lock";
+        var started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                    FileShare.None, 1, FileOptions.WriteThrough);
+            }
+            catch (IOException) when (Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(10))
+            {
+                Thread.Sleep(25);
+            }
+            catch (IOException ex)
+            {
+                throw new IOException("等待原生代理配置跨进程写锁超时；没有覆盖现有配置。", ex);
+            }
+        }
     }
 
     private static NativeProxyConfig Clone(NativeProxyConfig config)
     {
         var json = JsonSerializer.Serialize(config);
-        return JsonSerializer.Deserialize<NativeProxyConfig>(json) ?? new NativeProxyConfig();
+        return JsonSerializer.Deserialize<NativeProxyConfig>(json, ReadOptions) ?? new NativeProxyConfig();
     }
 
     private static bool MigrateLegacyRouteNames(NativeProxyConfig config)

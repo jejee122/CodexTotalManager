@@ -1,6 +1,7 @@
-﻿<UserControl x:Class="CodexModelManager.Views.PoolManagementView"
+<UserControl x:Class="CodexModelManager.Views.PoolManagementView"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:CodexModelManager.Controls"
              Background="Transparent" FontFamily="{StaticResource AppFont}">
     <UserControl.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibility"/>
@@ -136,6 +137,8 @@
 
                 <WrapPanel Grid.Row="2" Margin="0,18,0,0">
                     <Button Style="{StaticResource PoolGhostButton}" Content="刷新实况" Click="RefreshButton_Click"/>
+                    <Button Style="{StaticResource PoolPrimaryButton}" Content="回到官方 Pro" Click="ReturnOfficialButton_Click"
+                            ToolTip="把默认线路切回官方 Pro；当前任务仍由你在 Codex 自己的模型菜单中选择"/>
                     <Button Style="{StaticResource PoolGhostButton}" Content="添加 Codex 账号" IsEnabled="False"
                             ToolTip="内建原生引擎暂不支持第二个 Codex 账号；未绑定 Plus 保持停用"/>
                     <Button Style="{StaticResource PoolGhostButton}" Content="同步账号" Click="SyncCodexAccountsButton_Click"/>
@@ -176,7 +179,17 @@
             </Grid>
 
             <TextBlock x:Name="LiveUsageSourceText" Text="每 30 秒刷新 · Token 统计与官方额度分开显示"
-                       Foreground="#799A9E" FontSize="10" Margin="1,0,0,15"/>
+                       Foreground="#799A9E" FontSize="10" Margin="1,0,0,8"/>
+
+            <Border Style="{StaticResource LiveTokenFrame}" Margin="0,0,0,18" Padding="10,8,10,6">
+                <StackPanel>
+                    <Grid>
+                        <TextBlock Text="近 14 天 token 能量曲线 · 全账号合计" Foreground="#C9DAD7" FontSize="11"/>
+                        <TextBlock Text="光点流动 = 当日能量 · 曲线圆滑不折角" Foreground="#799A9E" FontSize="9.5" HorizontalAlignment="Right"/>
+                    </Grid>
+                    <controls:UsageFlowChart x:Name="UsageFlowChart" Height="150" Margin="0,6,0,2"/>
+                </StackPanel>
+            </Border>
 
             <Border Style="{StaticResource LiveTokenFrame}" Margin="0,0,0,18">
                 <StackPanel>
@@ -249,7 +262,7 @@
                 </StackPanel>
             </Border>
 
-            <Border Visibility="Collapsed" Background="#A60F292E" BorderBrush="#99C99747" BorderThickness="1" CornerRadius="6" Padding="22" Margin="0,0,6,14">
+            <Border Background="#A60F292E" BorderBrush="#99C99747" BorderThickness="1" CornerRadius="6" Padding="22" Margin="0,0,6,14">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -271,7 +284,6 @@
                                 ToolTip="只刷新已有账号的状态、套餐和额度，不新增账号"/>
                         <Button Style="{StaticResource PoolButton}" Content="其他 API 模型" Click="ManageOtherModelsButton_Click"
                                 ToolTip="管理不属于号池的兼容 API 模型来源"/>
-                        <Button Style="{StaticResource PoolPrimaryButton}" Content="回到官方 Pro" Click="ReturnOfficialButton_Click"/>
                     </WrapPanel>
                 </Grid>
             </Border>
@@ -303,7 +315,7 @@
                         <TextBlock Text="最近实际执行" Foreground="#A1BCB8" FontSize="12"/>
                         <TextBlock x:Name="RecentActualText" Text="正在读取…" Foreground="#64CBB5" FontSize="15"
                                    FontWeight="Bold" Margin="0,7,0,0" TextWrapping="Wrap"/>
-                        <TextBlock x:Name="RecentActualDetailText" Text="正在读取 OpenCodex 尝试链" Foreground="#A1BCB8"
+                        <TextBlock x:Name="RecentActualDetailText" Text="正在读取总管家本机引擎尝试链" Foreground="#A1BCB8"
                                    FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
@@ -324,7 +336,7 @@
                         </StackPanel>
                         <Border Grid.Column="1" Background="#3E173B46" BorderBrush="#617C9A94" BorderThickness="1"
                                 CornerRadius="12" Padding="10,4" Margin="16,0,0,0" VerticalAlignment="Top">
-                            <TextBlock Text="OpenCodex 日志" Foreground="#7BE0C2" FontSize="10" FontWeight="SemiBold"/>
+                            <TextBlock Text="总管家本机引擎日志" Foreground="#7BE0C2" FontSize="10" FontWeight="SemiBold"/>
                         </Border>
                     </Grid>
                     <UniformGrid Columns="3" Margin="0,12,0,0">
@@ -402,6 +414,8 @@
                     </Grid>
                     <TextBlock x:Name="GatewayModelsText" Text="正在读取模型目录…" Foreground="#A9C2BF" FontSize="11" Margin="0,12,0,0" TextWrapping="Wrap"/>
                     <TextBlock Text="模型名自带号池前缀。请求只按精确名称进入一个上游；同一 Agent 对话切模型时，上下文由 Agent 继续保存。"
+                               Foreground="#A1BCB8" FontSize="11" Margin="0,7,0,0" TextWrapping="Wrap"/>
+                    <TextBlock Text="codex-auto/ 前缀 = 跨账号自动轮换（限流或登录失效自动换下一个账号，响应头 X-CMM-Served-By 标出实际扣费账号）；cli/号池/ 等其他前缀 = 固定使用该账号。每次请求都记录在 unified-gateway-request-log.jsonl；每个 harness 可用命令行 --gateway-key-create/--gateway-key-list/--gateway-key-revoke 发放和吊销独立钥匙。"
                                Foreground="#A1BCB8" FontSize="11" Margin="0,7,0,0" TextWrapping="Wrap"/>
                     <WrapPanel Margin="0,14,0,0">
                         <Button Style="{StaticResource PoolPrimaryButton}" Content="启动 / 同步网关" Click="StartGatewayButton_Click"/>
@@ -534,7 +548,7 @@
                                                                             <TextBlock Grid.Column="1" Text="{Binding SummaryText}" Foreground="#A8E1C8"
                                                                                        FontSize="12" FontWeight="SemiBold" Margin="16,0,0,0"/>
                                                                             <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100"
-                                                                                         Value="{Binding UsedPercent}" Height="8" Margin="0,7,0,0"
+                                                                                         Value="{Binding VisualUsedPercent}" Height="8" Margin="0,7,0,0"
                                                                                          Foreground="#64CBB5" Background="#38142D34"/>
                                                                             <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding ResetText}"
                                                                                        Foreground="#829FA3" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>

@@ -12,7 +12,7 @@ public sealed class GoogleAdapter : IProviderAdapter
 
     public GoogleAdapter(HttpClient? http = null)
     {
-        _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
+        _http = http ?? AdapterHttpTransport.Shared;
     }
 
     public string AdapterId => "google";
@@ -45,7 +45,8 @@ public sealed class GoogleAdapter : IProviderAdapter
                 Streaming = false,
                 ContentType = "application/json",
                 JsonBody = BuildErrorBody((int)response.StatusCode, errorBody),
-                StatusCode = (int)response.StatusCode
+                StatusCode = (int)response.StatusCode,
+                Owner = response
             };
         }
 
@@ -56,26 +57,94 @@ public sealed class GoogleAdapter : IProviderAdapter
             {
                 Streaming = true,
                 ContentType = "text/event-stream",
-                Events = ParseSseStream(stream, cancellationToken)
+                Events = ParseSseStream(stream, cancellationToken),
+                Owner = response
             };
         }
 
         var jsonBody = await response.Content.ReadAsStringAsync(cancellationToken);
+        var normalized = ParseNonStreamingResponse(jsonBody);
         return new AdapterResponse
         {
             Streaming = false,
             ContentType = "application/json",
-            JsonBody = jsonBody
+            JsonBody = jsonBody,
+            Message = normalized.Message,
+            FinishReason = normalized.FinishReason,
+            Usage = normalized.Usage,
+            Owner = response
         };
+    }
+
+    internal static GoogleNormalizedResponse ParseNonStreamingResponse(string jsonBody)
+    {
+        using var document = JsonDocument.Parse(jsonBody);
+        var root = document.RootElement;
+        var message = new OcxMessage { Role = "assistant" };
+        var text = new StringBuilder();
+        var calls = new List<OcxToolCall>();
+        string? finishReason = null;
+        if (root.TryGetProperty("candidates", out var candidates) && candidates.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var candidate in candidates.EnumerateArray())
+            {
+                finishReason ??= candidate.TryGetProperty("finishReason", out var reason)
+                    ? reason.GetString()
+                    : null;
+                if (!candidate.TryGetProperty("content", out var content)
+                    || !content.TryGetProperty("parts", out var parts)
+                    || parts.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var part in parts.EnumerateArray())
+                {
+                    if (part.TryGetProperty("text", out var textNode))
+                        text.Append(textNode.GetString());
+                    if (!part.TryGetProperty("functionCall", out var functionCall)) continue;
+                    calls.Add(new OcxToolCall
+                    {
+                        Id = ReadString(functionCall, "id")
+                             ?? "call_" + Guid.NewGuid().ToString("N")[..24],
+                        Function = new OcxToolCallFunction
+                        {
+                            Name = functionCall.TryGetProperty("name", out var nameNode)
+                                ? nameNode.GetString()
+                                : null,
+                            Arguments = functionCall.TryGetProperty("args", out var args)
+                                ? args.GetRawText()
+                                : "{}"
+                        }
+                    });
+                }
+            }
+        }
+        message.Content = text.ToString();
+        if (calls.Count > 0) message.ToolCalls = calls;
+        var usage = new OcxUsage();
+        if (root.TryGetProperty("usageMetadata", out var usageNode))
+        {
+            usage.PromptTokens = ReadLong(usageNode, "promptTokenCount");
+            usage.CompletionTokens = ReadLong(usageNode, "candidatesTokenCount");
+            usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens;
+        }
+        var normalizedFinish = calls.Count > 0
+            ? "tool_calls"
+            : NormalizeFinishReason(finishReason);
+        return new GoogleNormalizedResponse(message, normalizedFinish, usage);
     }
 
     public static string BuildRequestJson(OcxParsedRequest request)
     {
         var systemParts = new JsonArray();
         var contents = new JsonArray();
+        var functionNamesByCallId = request.Messages
+            .SelectMany(message => message.ToolCalls ?? Enumerable.Empty<OcxToolCall>())
+            .Where(call => !string.IsNullOrWhiteSpace(call.Id)
+                           && !string.IsNullOrWhiteSpace(call.Function?.Name))
+            .GroupBy(call => call.Id!, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Last().Function!.Name!, StringComparer.Ordinal);
         foreach (var message in request.Messages)
         {
-            var text = message.Content?.ToString() ?? string.Empty;
+            var text = OcxMessageContent.ExtractText(message.Content);
             switch (message.Role)
             {
                 case "system":
@@ -87,21 +156,33 @@ public sealed class GoogleAdapter : IProviderAdapter
                 }
                 case "tool":
                 {
-                    contents.Add(new JsonObject
+                    var functionResponse = new JsonObject
                     {
-                        ["role"] = "user",
-                        ["parts"] = new JsonArray
+                        ["functionResponse"] = new JsonObject
                         {
-                            new JsonObject
-                            {
-                                ["functionResponse"] = new JsonObject
-                                {
-                                    ["name"] = message.ToolCallId ?? "tool",
-                                    ["response"] = new JsonObject { ["output"] = text }
-                                }
-                            }
+                            ["name"] = message.ToolCallId is { Length: > 0 } callId
+                                       && functionNamesByCallId.TryGetValue(callId, out var functionName)
+                                ? functionName
+                                : message.Name ?? message.ToolCallId ?? "tool",
+                            ["response"] = BuildFunctionResponse(text)
                         }
-                    });
+                    };
+                    if (contents.Count > 0
+                        && contents[^1] is JsonObject previous
+                        && previous["role"]?.GetValue<string>() == "user"
+                        && previous["parts"] is JsonArray previousParts
+                        && previousParts.All(part => part?["functionResponse"] is not null))
+                    {
+                        previousParts.Add(functionResponse);
+                    }
+                    else
+                    {
+                        contents.Add(new JsonObject
+                        {
+                            ["role"] = "user",
+                            ["parts"] = new JsonArray(functionResponse)
+                        });
+                    }
                     break;
                 }
                 case "assistant" when message.ToolCalls is { Count: > 0 }:
@@ -164,7 +245,74 @@ public sealed class GoogleAdapter : IProviderAdapter
             if (tools.Count > 0)
                 root["tools"] = tools;
         }
+        if (BuildToolConfig(request.ToolChoice) is { } toolConfig)
+            root["toolConfig"] = toolConfig;
+        var generationConfig = new JsonObject();
+        if (request.Temperature is not null)
+            generationConfig["temperature"] = request.Temperature;
+        if (request.MaxTokens is not null)
+            generationConfig["maxOutputTokens"] = request.MaxTokens;
+        if (generationConfig.Count > 0)
+            root["generationConfig"] = generationConfig;
         return root.ToJsonString();
+    }
+
+    private static JsonObject BuildFunctionResponse(string text)
+    {
+        try
+        {
+            var parsed = JsonNode.Parse(text);
+            return parsed as JsonObject ?? new JsonObject { ["output"] = parsed };
+        }
+        catch (JsonException)
+        {
+            return new JsonObject { ["output"] = text };
+        }
+    }
+
+    private static JsonObject? BuildToolConfig(JsonElement? choice)
+    {
+        if (choice is not { ValueKind: not JsonValueKind.Undefined and not JsonValueKind.Null })
+            return null;
+
+        string? mode = null;
+        string? functionName = null;
+        var value = choice.Value;
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            mode = value.GetString()?.ToLowerInvariant() switch
+            {
+                "none" => "NONE",
+                "required" => "ANY",
+                _ => "AUTO"
+            };
+        }
+        else if (value.ValueKind == JsonValueKind.Object)
+        {
+            var type = ReadString(value, "type")?.ToLowerInvariant();
+            if (type == "function")
+            {
+                functionName = ReadString(value, "name");
+                if (string.IsNullOrWhiteSpace(functionName)
+                    && value.TryGetProperty("function", out var function))
+                    functionName = ReadString(function, "name");
+                mode = "ANY";
+            }
+            else
+            {
+                mode = type switch
+                {
+                    "none" => "NONE",
+                    "required" => "ANY",
+                    _ => "AUTO"
+                };
+            }
+        }
+        if (mode is null) return null;
+        var functionCalling = new JsonObject { ["mode"] = mode };
+        if (!string.IsNullOrWhiteSpace(functionName))
+            functionCalling["allowedFunctionNames"] = new JsonArray(functionName);
+        return new JsonObject { ["functionCallingConfig"] = functionCalling };
     }
 
     private static JsonNode ParseArguments(string? arguments)
@@ -187,6 +335,8 @@ public sealed class GoogleAdapter : IProviderAdapter
         using var reader = new StreamReader(raw, Encoding.UTF8);
         var usage = new OcxUsage();
         var sawAny = false;
+        var nextToolIndex = 0;
+        var sawToolCall = false;
 
         while (await reader.ReadLineAsync(cancellationToken) is { } line)
         {
@@ -214,18 +364,59 @@ public sealed class GoogleAdapter : IProviderAdapter
                 yield break;
             }
 
+            if (root.TryGetProperty("promptFeedback", out var feedback)
+                && ReadString(feedback, "blockReason") is { Length: > 0 } blockReason)
+            {
+                yield return new AdapterEvent
+                {
+                    Type = "error",
+                    ErrorType = "content_filter",
+                    Text = $"Google 拒绝了这次请求：{blockReason}"
+                };
+                yield break;
+            }
+
+            string? terminalReason = null;
             if (root.TryGetProperty("candidates", out var candidates) && candidates.ValueKind == JsonValueKind.Array)
             {
                 foreach (var candidate in candidates.EnumerateArray())
                 {
+                    terminalReason ??= ReadString(candidate, "finishReason");
                     if (!candidate.TryGetProperty("content", out var content)) continue;
                     if (!content.TryGetProperty("parts", out var parts)) continue;
                     foreach (var part in parts.EnumerateArray())
                     {
-                        if (!part.TryGetProperty("text", out var text)) continue;
-                        var textValue = text.GetString();
-                        if (!string.IsNullOrEmpty(textValue))
-                            yield return new AdapterEvent { Type = "text", Text = textValue, Role = "assistant" };
+                        if (part.TryGetProperty("text", out var text))
+                        {
+                            var textValue = text.GetString();
+                            if (!string.IsNullOrEmpty(textValue))
+                                yield return new AdapterEvent { Type = "text", Text = textValue, Role = "assistant" };
+                        }
+                        if (!part.TryGetProperty("functionCall", out var functionCall)) continue;
+                        var index = nextToolIndex++;
+                        var callId = ReadString(functionCall, "id")
+                                     ?? "call_" + Guid.NewGuid().ToString("N")[..24];
+                        var name = ReadString(functionCall, "name") ?? string.Empty;
+                        var arguments = functionCall.TryGetProperty("args", out var args)
+                            ? args.GetRawText()
+                            : "{}";
+                        sawToolCall = true;
+                        yield return new AdapterEvent
+                        {
+                            Type = "function_call",
+                            ToolCallIndex = index,
+                            CallId = callId,
+                            FunctionName = name,
+                            Arguments = arguments
+                        };
+                        yield return new AdapterEvent
+                        {
+                            Type = "function_call_done",
+                            ToolCallIndex = index,
+                            CallId = callId,
+                            FunctionName = name,
+                            Arguments = arguments
+                        };
                     }
                 }
             }
@@ -235,6 +426,24 @@ public sealed class GoogleAdapter : IProviderAdapter
                 usage.PromptTokens = ReadLong(usageMetadata, "promptTokenCount");
                 usage.CompletionTokens = ReadLong(usageMetadata, "candidatesTokenCount");
                 usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens;
+                yield return new AdapterEvent { Type = "usage", Usage = usage };
+            }
+
+            if (!string.IsNullOrWhiteSpace(terminalReason))
+            {
+                var finishReason = sawToolCall ? "tool_calls" : NormalizeFinishReason(terminalReason);
+                if (finishReason == "content_filter")
+                {
+                    yield return new AdapterEvent
+                    {
+                        Type = "error",
+                        ErrorType = "content_filter",
+                        Text = $"Google 没有完成回复：{terminalReason}"
+                    };
+                    yield break;
+                }
+                yield return new AdapterEvent { Type = "finish", FinishReason = finishReason };
+                yield break;
             }
         }
 
@@ -243,7 +452,7 @@ public sealed class GoogleAdapter : IProviderAdapter
             yield return new AdapterEvent { Type = "incomplete", Text = "上游没有返回任何数据" };
             yield break;
         }
-        yield return new AdapterEvent { Type = "done", Usage = usage };
+        yield return new AdapterEvent { Type = "incomplete", Text = "Google 流未发送完成原因" };
     }
 
     private static string BuildErrorBody(int status, string upstreamBody) =>
@@ -262,4 +471,24 @@ public sealed class GoogleAdapter : IProviderAdapter
 
     private static long ReadLong(JsonElement root, string name) =>
         root.TryGetProperty(name, out var value) && value.TryGetInt64(out var number) ? number : 0;
+
+    private static string? ReadString(JsonElement root, string name) =>
+        root.ValueKind == JsonValueKind.Object
+        && root.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static string NormalizeFinishReason(string? reason) =>
+        reason?.ToUpperInvariant() switch
+        {
+            "MAX_TOKENS" => "length",
+            null or "" or "STOP" => "stop",
+            _ => "content_filter"
+        };
+
+    internal sealed record GoogleNormalizedResponse(
+        OcxMessage Message,
+        string FinishReason,
+        OcxUsage Usage);
 }

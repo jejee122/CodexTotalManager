@@ -78,9 +78,14 @@ public sealed class CodexConfigService
             var document = ParseDocument(source);
             if (!document.TryGetValue("model_provider", out var value)) return true;
             if (value is not string provider) return false;
-            return provider.Equals(ManagedNativeProviderId, StringComparison.OrdinalIgnoreCase)
-                   || provider.Equals(LegacyManagedNativeProviderId, StringComparison.Ordinal)
-                   && IsExpectedLegacyBlock(source, FindLegacyProviderBlock(source)!.Value, out _);
+            if (provider.Equals(ManagedNativeProviderId, StringComparison.OrdinalIgnoreCase))
+            {
+                var block = FindManagedRoutingBlock(source);
+                return block is not null && IsExpectedManagedRoutingBlock(source, block.Value);
+            }
+            if (!provider.Equals(LegacyManagedNativeProviderId, StringComparison.Ordinal)) return false;
+            var legacyBlock = FindLegacyProviderBlock(source);
+            return legacyBlock is not null && IsExpectedLegacyBlock(source, legacyBlock.Value, out _);
         }
         catch
         {

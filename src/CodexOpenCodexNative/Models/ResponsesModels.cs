@@ -10,6 +10,8 @@ public sealed class ResponsesRequest
     [JsonPropertyName("input")] public JsonElement? Input { get; set; }
     [JsonPropertyName("instructions")] public string? Instructions { get; set; }
     [JsonPropertyName("tools")] public List<OcxTool>? Tools { get; set; }
+    [JsonPropertyName("tool_choice")] public JsonElement? ToolChoice { get; set; }
+    [JsonPropertyName("parallel_tool_calls")] public bool? ParallelToolCalls { get; set; }
     [JsonPropertyName("reasoning")] public JsonElement? Reasoning { get; set; }
     [JsonPropertyName("stream")] public bool Stream { get; set; }
     [JsonPropertyName("previous_response_id")] public string? PreviousResponseId { get; set; }

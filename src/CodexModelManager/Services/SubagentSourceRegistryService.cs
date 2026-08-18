@@ -251,7 +251,7 @@ public sealed class SubagentSourceRegistryService
                     SubagentSourceKind.OpenAiCompatible,
                     provider.Id + "/",
                     SafeEndpointDisplay(provider.BaseUrl),
-                    provider.HasApiKey ? "OpenCodex 已保存独立 API Key" : "未配置 API Key",
+                provider.HasApiKey ? "总管家本机引擎已保存独立 API Key" : "未配置 API Key",
                     $"消耗兼容 API 来源 {provider.DisplayName}",
                     provider.Adapter,
                     fingerprint,

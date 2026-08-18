@@ -27,25 +27,28 @@ public static class AnthropicParser
         }
         else if (request.System is { ValueKind: JsonValueKind.Array } systemArray)
         {
-            var builder = new System.Text.StringBuilder();
+            var parts = new List<string>();
             foreach (var block in systemArray.EnumerateArray())
             {
-                if (block.TryGetProperty("text", out var text))
-                    builder.Append(text.GetString());
+                if (block.ValueKind == JsonValueKind.Object
+                    && block.TryGetProperty("text", out var text)
+                    && text.ValueKind == JsonValueKind.String
+                    && !string.IsNullOrWhiteSpace(text.GetString()))
+                    parts.Add(text.GetString()!);
             }
-            if (builder.Length > 0)
+            if (parts.Count > 0)
             {
                 parsed.Messages.Add(new OcxMessage
                 {
                     Role = "developer",
-                    Content = builder.ToString()
+                    Content = string.Join("\n\n", parts)
                 });
             }
         }
 
         foreach (var message in request.Messages)
         {
-            parsed.Messages.Add(MapMessage(message));
+            parsed.Messages.AddRange(MapMessages(message));
         }
 
         if (request.Tools is { Count: > 0 })
@@ -67,12 +70,18 @@ public static class AnthropicParser
         return parsed;
     }
 
-    private static OcxMessage MapMessage(AnthropicMessage message)
+    private static IReadOnlyList<OcxMessage> MapMessages(AnthropicMessage message)
     {
         var text = new System.Text.StringBuilder();
         var toolUses = new List<OcxToolCall>();
-        string? toolResultCallId = null;
-        var toolResultText = new System.Text.StringBuilder();
+        var userMessages = new List<OcxMessage>();
+
+        void FlushUserText()
+        {
+            if (text.Length == 0) return;
+            userMessages.Add(new OcxMessage { Role = "user", Content = text.ToString() });
+            text.Clear();
+        }
 
         if (message.Content.ValueKind == JsonValueKind.String)
         {
@@ -82,6 +91,12 @@ public static class AnthropicParser
         {
             foreach (var block in message.Content.EnumerateArray())
             {
+                if (block.ValueKind == JsonValueKind.String)
+                {
+                    text.Append(block.GetString());
+                    continue;
+                }
+                if (block.ValueKind != JsonValueKind.Object) continue;
                 var type = block.TryGetProperty("type", out var typeValue) ? typeValue.GetString() : null;
                 switch (type)
                 {
@@ -107,52 +122,78 @@ public static class AnthropicParser
                     }
                     case "tool_result":
                     {
-                        toolResultCallId = block.TryGetProperty("tool_use_id", out var idValue)
+                        FlushUserText();
+                        var toolResultCallId = block.TryGetProperty("tool_use_id", out var idValue)
+                                               && idValue.ValueKind == JsonValueKind.String
                             ? idValue.GetString()
                             : null;
-                        if (block.TryGetProperty("content", out var content))
+                        userMessages.Add(new OcxMessage
                         {
-                            if (content.ValueKind == JsonValueKind.String)
-                                toolResultText.Append(content.GetString());
-                            else if (content.ValueKind == JsonValueKind.Array)
-                            {
-                                foreach (var part in content.EnumerateArray())
-                                {
-                                    if (part.TryGetProperty("text", out var partText))
-                                        toolResultText.Append(partText.GetString());
-                                }
-                            }
-                        }
+                            Role = "tool",
+                            ToolCallId = toolResultCallId,
+                            Content = block.TryGetProperty("content", out var content)
+                                ? ExtractToolResultText(content)
+                                : string.Empty
+                        });
                         break;
                     }
                 }
             }
         }
 
-        if (toolResultCallId is not null)
+        if (!string.Equals(message.Role, "assistant", StringComparison.OrdinalIgnoreCase))
         {
-            return new OcxMessage
-            {
-                Role = "tool",
-                ToolCallId = toolResultCallId,
-                Content = toolResultText.ToString()
-            };
+            FlushUserText();
+            if (userMessages.Count == 0)
+                userMessages.Add(new OcxMessage { Role = "user", Content = string.Empty });
+            return userMessages;
         }
 
         if (toolUses.Count > 0)
         {
-            return new OcxMessage
-            {
-                Role = "assistant",
-                Content = text.Length > 0 ? text.ToString() : string.Empty,
-                ToolCalls = toolUses
-            };
+            return
+            [
+                new OcxMessage
+                {
+                    Role = "assistant",
+                    Content = text.Length > 0 ? text.ToString() : string.Empty,
+                    ToolCalls = toolUses
+                }
+            ];
         }
 
-        return new OcxMessage
+        return
+        [
+            new OcxMessage
+            {
+                Role = "assistant",
+                Content = text.ToString()
+            }
+        ];
+    }
+
+    private static string ExtractToolResultText(JsonElement content)
+    {
+        if (content.ValueKind == JsonValueKind.String)
+            return content.GetString() ?? string.Empty;
+        if (content.ValueKind != JsonValueKind.Array)
+            return content.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
+                ? string.Empty
+                : content.GetRawText();
+
+        var builder = new System.Text.StringBuilder();
+        foreach (var part in content.EnumerateArray())
         {
-            Role = message.Role == "assistant" ? "assistant" : "user",
-            Content = text.ToString()
-        };
+            if (part.ValueKind == JsonValueKind.String)
+            {
+                builder.Append(part.GetString());
+                continue;
+            }
+            if (part.ValueKind == JsonValueKind.Object
+                && part.TryGetProperty("text", out var partText)
+                && partText.ValueKind == JsonValueKind.String)
+                builder.Append(partText.GetString());
+        }
+        return builder.ToString();
     }
 }

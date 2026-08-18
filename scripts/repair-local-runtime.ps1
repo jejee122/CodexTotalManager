@@ -2,6 +2,8 @@
 param(
     [string]$InstallRoot,
     [switch]$RemoveLegacyCandidates,
+    [switch]$PurgeCredentialStores,
+    [string]$ConfirmPurgeCredentialStores,
     [switch]$Apply
 )
 
@@ -11,16 +13,57 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
     $InstallRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CodexTotalManager'
 }
 $installFull = [IO.Path]::GetFullPath($InstallRoot)
-$localData = ([IO.Path]::GetFullPath([Environment]::GetFolderPath('LocalApplicationData'))).TrimEnd('\') + '\'
+$localDataRoot = ([IO.Path]::GetFullPath([Environment]::GetFolderPath('LocalApplicationData'))).TrimEnd('\')
+$localData = $localDataRoot + '\'
+if ($installFull.TrimEnd('\').Equals($localDataRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Repair root must be a child of LocalApplicationData, not LocalApplicationData itself: $installFull"
+}
 if (-not ($installFull + '\').StartsWith($localData, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Repair root must remain below LocalApplicationData: $installFull"
 }
+
+function Assert-NoReparsePointBelow([string]$BasePath, [string]$TargetPath, [string]$Label) {
+    $baseFull = [IO.Path]::GetFullPath($BasePath).TrimEnd('\')
+    $targetFull = [IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
+    if (-not ($targetFull + '\').StartsWith($baseFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label is outside its trusted base directory: $targetFull"
+    }
+    $relative = $targetFull.Substring($baseFull.Length).TrimStart('\')
+    $cursor = $baseFull
+    foreach ($part in @($relative -split '\\' | Where-Object { $_ })) {
+        $cursor = Join-Path $cursor $part
+        if (-not (Test-Path -LiteralPath $cursor)) { break }
+        $item = Get-Item -LiteralPath $cursor -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label contains a symbolic link, junction, or other reparse point: $cursor"
+        }
+    }
+}
+
+function Assert-TreeHasNoReparsePoints([string]$RootPath, [string]$Label) {
+    $rootItem = Get-Item -LiteralPath $RootPath -Force
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label is a symbolic link, junction, or other reparse point: $RootPath"
+    }
+    $reparse = @(Get-ChildItem -LiteralPath $RootPath -Force -Recurse -ErrorAction Stop |
+        Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 } |
+        Select-Object -First 1)
+    if ($reparse.Count -gt 0) {
+        throw "$Label contains a symbolic link, junction, or other reparse point: $($reparse[0].FullName)"
+    }
+}
+
 if (-not $Apply) {
     Write-Output 'DRY_RUN_ONLY: pass -Apply to make local runtime changes; no files or processes were changed.'
     exit 0
 }
+if ($PurgeCredentialStores -and $ConfirmPurgeCredentialStores -cne 'DELETE_LOCAL_CREDENTIALS') {
+    throw 'Deleting account/API credential stores requires -ConfirmPurgeCredentialStores DELETE_LOCAL_CREDENTIALS.'
+}
 $runtimeRoot = Join-Path $installFull 'runtime-v3'
 if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) { throw 'runtime-v3 is missing.' }
+Assert-NoReparsePointBelow $localDataRoot $installFull 'Repair root'
+Assert-TreeHasNoReparsePoints $installFull 'Repair root'
 
 $removedAuthFiles = 0
 $removedTemporaryFiles = 0
@@ -63,11 +106,13 @@ foreach ($record in $managerProcesses) {
 }
 
 $cliProxyRoot = Join-Path $runtimeRoot 'cli-proxy'
-if (Test-Path -LiteralPath $cliProxyRoot) {
-    $removedAuthFiles = @(Get-ChildItem -LiteralPath $cliProxyRoot -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.DirectoryName -match '[\\/]auth(?:[\\/]|$)' }).Count
+if ($PurgeCredentialStores) {
+    if (Test-Path -LiteralPath $cliProxyRoot) {
+        $removedAuthFiles = @(Get-ChildItem -LiteralPath $cliProxyRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '[\\/]auth(?:[\\/]|$)' }).Count
+    }
+    Remove-ExactTree $cliProxyRoot 'CLIProxy account and credential runtime explicitly selected for deletion'
 }
-Remove-ExactTree $cliProxyRoot 'untrusted CLIProxy runtime and plaintext credentials'
 Remove-ExactTree (Join-Path $runtimeRoot 'config-validation') 'temporary configuration snapshots'
 
 foreach ($tree in @(Get-ChildItem -LiteralPath $runtimeRoot -Directory -Filter 'opencodex-*' -ErrorAction SilentlyContinue)) {
@@ -111,8 +156,9 @@ $poolsPath = Join-Path $runtimeRoot 'pools.json'
 if (Test-Path -LiteralPath $poolsPath -PathType Leaf) {
     $catalog = Get-Content -LiteralPath $poolsPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $originalPools = @($catalog.Pools)
+    $obsoletePoolIds = @('ollama-pro')
     $catalog.Pools = @($originalPools | Where-Object {
-        [string]$_.Id -in @('official-pro', 'plus-api-1')
+        [string]$_.Id -notin $obsoletePoolIds
     })
     $removedPollutedPools = $originalPools.Count - @($catalog.Pools).Count
     if (@($catalog.Pools | Where-Object { [string]$_.Id -eq 'official-pro' }).Count -ne 1 -or
@@ -135,13 +181,20 @@ if (Test-Path -LiteralPath $poolsPath -PathType Leaf) {
 $secretsPath = Join-Path $runtimeRoot 'secrets.json'
 if (Test-Path -LiteralPath $secretsPath -PathType Leaf) {
     $secrets = Get-Content -LiteralPath $secretsPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    foreach ($name in @($secrets.PSObject.Properties.Name | Where-Object {
-        $_ -ne 'internal:unified-gateway:client'
-    })) {
+    $obsoleteSecretNames = @('ollama-pro', 'cmm-ollama-pro')
+    $secretNamesToRemove = @($secrets.PSObject.Properties.Name | Where-Object {
+        if ($PurgeCredentialStores) {
+            $_ -ne 'internal:unified-gateway:client'
+        } else {
+            $_ -in $obsoleteSecretNames
+        }
+    })
+    foreach ($name in $secretNamesToRemove) {
         [void]$secrets.PSObject.Properties.Remove($name)
         $removedPollutedSecrets++
     }
-    if ($PSCmdlet.ShouldProcess($secretsPath, 'Remove polluted or obsolete secret entries')) {
+    if ($secretNamesToRemove.Count -gt 0 -and
+        $PSCmdlet.ShouldProcess($secretsPath, 'Remove only explicitly obsolete or confirmed credential entries')) {
         $temp = $secretsPath + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
         $secrets | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding UTF8
         Move-Item -LiteralPath $temp -Destination $secretsPath -Force
@@ -177,14 +230,27 @@ $acl = [IO.Directory]::GetAccessControl(
     $installFull,
     [Security.AccessControl.AccessControlSections]::Access)
 $acl.SetAccessRuleProtection($true, $true)
-$sandboxRules = @($acl.Access | Where-Object { $_.IdentityReference.Value -match '[\\]CodexSandboxUsers$' })
-foreach ($rule in $sandboxRules) { [void]$acl.PurgeAccessRules($rule.IdentityReference) }
-if ($PSCmdlet.ShouldProcess($installFull, 'Remove CodexSandboxUsers read access')) {
-    [IO.Directory]::SetAccessControl($installFull, $acl)
-}
-$remainingSandboxRules = @((Get-Acl -LiteralPath $installFull).Access |
+$remainingSandboxRules = @($acl.Access |
     Where-Object { $_.IdentityReference.Value -match '[\\]CodexSandboxUsers$' }).Count
-if ($remainingSandboxRules -ne 0) { throw 'CodexSandboxUsers access rule remains after ACL repair.' }
+if ($PSCmdlet.ShouldProcess($installFull, 'Remove CodexSandboxUsers read access')) {
+    # Persist inheritance protection first. On Windows PowerShell, inherited
+    # rules remain marked as inherited in memory until the ACL is written and
+    # reloaded, so trying to remove them before this step is a no-op.
+    [IO.Directory]::SetAccessControl($installFull, $acl)
+    $acl = [IO.Directory]::GetAccessControl(
+        $installFull,
+        [Security.AccessControl.AccessControlSections]::Access)
+    $sandboxRules = @($acl.Access |
+        Where-Object { $_.IdentityReference.Value -match '[\\]CodexSandboxUsers$' })
+    foreach ($rule in $sandboxRules) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+    [IO.Directory]::SetAccessControl($installFull, $acl)
+    $verifiedAcl = [IO.Directory]::GetAccessControl(
+        $installFull,
+        [Security.AccessControl.AccessControlSections]::Access)
+    $remainingSandboxRules = @($verifiedAcl.Access |
+        Where-Object { $_.IdentityReference.Value -match '[\\]CodexSandboxUsers$' }).Count
+    if ($remainingSandboxRules -ne 0) { throw 'CodexSandboxUsers access rule remains after ACL repair.' }
+}
 
 $remainingAuthFiles = @(Get-ChildItem -LiteralPath $installFull -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object { $_.DirectoryName -match '[\\/]auth(?:[\\/]|$)' }).Count
@@ -198,9 +264,10 @@ $report = [ordered]@{
     legacyCandidateBytesRemoved = $removedLegacyBytes
     pollutedPoolsRemoved = $removedPollutedPools
     pollutedSecretEntriesRemoved = $removedPollutedSecrets
+    credentialStoresPurgedByExplicitConfirmation = [bool]$PurgeCredentialStores
     gatewayRoutesCleared = $true
     sandboxGroupReadAccessRemoved = ($remainingSandboxRules -eq 0)
-    note = 'External OAuth revocation is intentionally not attempted by this local-only repair.'
+    note = 'Custom providers, user-created pools, and their API keys are preserved unless credential-store deletion is explicitly confirmed. External OAuth revocation is never attempted.'
 }
 $reportPath = Join-Path $runtimeRoot 'remediation-state.json'
 if ($PSCmdlet.ShouldProcess($reportPath, 'Write remediation state')) {

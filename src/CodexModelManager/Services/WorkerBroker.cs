@@ -43,10 +43,24 @@ public sealed class WorkerBroker
         var role = ResolveRoleOrThrow(roleId);
         ValidatePricingOrThrow(role);
 
-        // 预算检查：超支或未配置 → 拒绝（P0 失败关闭）。
-        var budgetBlock = _budget.CheckBeforeCall(role);
-        if (budgetBlock is not null)
-            throw new WorkerBrokerException("budget_exceeded", budgetBlock);
+        // UTF-8 byte count is a conservative upper bound for input token count:
+        // a tokenizer cannot emit more byte-backed tokens than encoded bytes.
+        // Reserve that plus the caller's maximum output before any upstream I/O.
+        var maximumBillableTokens = checked(
+            (long)System.Text.Encoding.UTF8.GetByteCount(task)
+            + System.Text.Encoding.UTF8.GetByteCount(context ?? string.Empty)
+            + System.Text.Encoding.UTF8.GetByteCount(role.DeveloperInstructions ?? string.Empty)
+            + 1024L
+            + maxOutputTokens);
+        WorkerBudgetReservation reservation;
+        try
+        {
+            reservation = await _budget.ReserveAsync(role, maximumBillableTokens, cancellationToken);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            throw new WorkerBrokerException("budget_exceeded", ex.Message);
+        }
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         if (role.MaxTimeoutSeconds is > 0)
@@ -58,12 +72,15 @@ public sealed class WorkerBroker
             context,
             maxOutputTokens), timeoutCts.Token);
 
-        // 委托完成后按实际用量扣减预算。
-        await _budget.DeductAsync(
+        // Settlement cannot be cancelled by the caller after an upstream call
+        // has completed. Cancellation/failure before settlement intentionally
+        // leaves the conservative reservation charged (fail closed).
+        await _budget.SettleAsync(
+            reservation,
             role,
             completion.Usage.PromptTokens,
             completion.Usage.CompletionTokens,
-            cancellationToken);
+            CancellationToken.None);
 
         return completion;
     }
@@ -85,11 +102,13 @@ public sealed class WorkerBroker
     }
 
     /// <summary>当前角色已消耗 / 剩余预算（供界面显示）。</summary>
-    public WorkerBudgetView? GetRoleBudget(string roleId)
+    public async Task<WorkerBudgetView?> GetRoleBudgetAsync(
+        string roleId,
+        CancellationToken cancellationToken = default)
     {
         var role = _configuration.Roles.FirstOrDefault(item => item.Id.Equals(roleId, StringComparison.OrdinalIgnoreCase));
         if (role is null || role.BudgetLimit is null) return null;
-        var spent = _budget.GetSpent(roleId);
+        var spent = await _budget.GetSpentAsync(roleId, cancellationToken).ConfigureAwait(false);
         return new WorkerBudgetView(roleId, role.Currency ?? string.Empty, role.BudgetLimit.Value, spent, role.BudgetLimit.Value - spent);
     }
 

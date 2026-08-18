@@ -37,6 +37,9 @@ public partial class MainWindow : Window
         OfficialModelsList.ItemsSource = _officialModels;
         CustomModelsList.ItemsSource = _customModels;
         ProvidersList.ItemsSource = _providers;
+        ProviderPresetBox.ItemsSource = ProviderPresetCatalog.All;
+        ProviderPresetBox.DisplayMemberPath = nameof(ProviderPreset.DisplayName);
+        ProviderPresetBox.SelectedIndex = 0;
         AccountsPage.Initialize(_services);
         SubagentsPage.Initialize(_services);
         AccountsPage.ManageOtherModelsRequested += async (_, _) => await ShowModelsPageAsync();
@@ -48,6 +51,7 @@ public partial class MainWindow : Window
         ServerEventStreamList.ItemsSource = _serverFeed;
         ServerCardsList.ItemsSource = _serverCards;
         ExtensionsPage.Initialize(_services.Extensions);
+        InitializeProductShell();
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -63,8 +67,7 @@ public partial class MainWindow : Window
         catch (InvalidOperationException) { }
     }
 
-    private void MinimizeWindowButton_Click(object sender, RoutedEventArgs e) =>
-        WindowState = WindowState.Minimized;
+    private void MinimizeWindowButton_Click(object sender, RoutedEventArgs e) => MinimizeOrHideWindow();
 
     private void MaximizeWindowButton_Click(object sender, RoutedEventArgs e) => ToggleWindowMaximize();
 
@@ -78,6 +81,7 @@ public partial class MainWindow : Window
         if (MaximizeWindowButton is null) return;
         MaximizeWindowButton.Content = WindowState == WindowState.Maximized ? "❐" : "□";
         MaximizeWindowButton.ToolTip = WindowState == WindowState.Maximized ? "还原" : "最大化";
+        HandleTrayStateChange();
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -92,11 +96,13 @@ public partial class MainWindow : Window
         }
         await InitializeAsync();
         ShowHomePage();
+        if (!_services.Settings.ProductSetupCompleted) ShowSoftwareCenterPage();
         StartServerMonitoring();
     }
 
     protected override void OnClosing(CancelEventArgs e)
     {
+        if (TryMinimizeToTrayOnClose(e)) return;
         if (RuntimeMode.IsDetachedUi)
         {
             base.OnClosing(e);
@@ -131,6 +137,12 @@ public partial class MainWindow : Window
             // killing an engine that Codex may still be using.
         }
         base.OnClosing(e);
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        DisposeProductShell();
+        base.OnClosed(e);
     }
 
     private async Task InitializeAsync()
@@ -235,7 +247,9 @@ public partial class MainWindow : Window
             .ThenBy(model => model.Id, StringComparer.OrdinalIgnoreCase));
         _allCustomModels.Clear();
         _allCustomModels.AddRange(models
-            .Where(model => !model.IsOfficial && model.Provider is not "openai" and not "combo")
+            .Where(model => !model.IsOfficial
+                            && model.Provider is not "openai" and not "combo"
+                            && !PoolCatalogService.IsManagerOwnedProviderId(model.Provider))
             .OrderBy(model => model.ProviderLabel, StringComparer.CurrentCultureIgnoreCase)
             .ThenBy(model => model.Title, StringComparer.CurrentCultureIgnoreCase));
         ApplyModelFilter();
@@ -243,7 +257,8 @@ public partial class MainWindow : Window
         var modelCounts = models
             .GroupBy(model => model.Provider, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
-        var customProviders = providersTask.Result.Where(provider => provider.Id != "openai").ToArray();
+        var customProviders = providersTask.Result.Where(provider => provider.Id != "openai"
+            && !PoolCatalogService.IsManagerOwnedProviderId(provider.Id)).ToArray();
         var quotaReports = quotaReportsTask.Result.ToDictionary(report => report.Provider, StringComparer.OrdinalIgnoreCase);
         foreach (var provider in customProviders)
         {
@@ -291,8 +306,8 @@ public partial class MainWindow : Window
         var v2rayReady = await v2rayTask;
         var runtime = runtimeTask.Result;
         HomeLocalServiceText.Text = runtime.Healthy && v2rayReady
-            ? "OpenCodex、v2rayN 可用"
-            : runtime.Healthy ? "OpenCodex 可用，v2rayN 异常" : "OpenCodex 不可用";
+            ? "总管家本机引擎、v2rayN 可用"
+            : runtime.Healthy ? "总管家本机引擎可用，v2rayN 异常" : "总管家本机引擎不可用";
         HomeLocalServiceDetail.Text = runtime.Healthy && v2rayReady
             ? "已验证本机入口与代理端口"
             : runtime.Healthy ? "私人或国外模型可能无法访问" : runtime.LastError;
@@ -353,7 +368,7 @@ public partial class MainWindow : Window
                 : fixedEntryReady && currentTaskRouted
                     ? "当前任务已接入当前外部 API"
                     : fixedEntryReady ? "外部 API 入口已就绪；当前任务尚未接入" : "当前默认模型与外部 API 入口不一致"
-            : "OpenCodex 不可用，仍保留官方直连备用";
+            : "总管家本机引擎不可用，仍保留官方直连备用";
         try
         {
             var backups = _services.BackupCatalog.List();
@@ -471,7 +486,7 @@ public partial class MainWindow : Window
         {
             if (!await _services.Process.EnsurePreservingConnectionStateAsync(connectionState))
                 throw new InvalidOperationException("总管家本机模型引擎没有准备好，或 Codex 连接状态发生了变化。");
-            var probe = await _services.Probe.ProbeAsync(url, apiKey);
+            var probe = await _services.Probe.ProbeAsync(url, apiKey, adapter);
             FooterMessage.Text = $"连接成功，发现 {probe.Models.Count} 个模型。正在安全保存…";
             var existing = await _services.OpenCodex.GetProvidersAsync(_services.Settings);
             providerId = ProviderId.From(displayName, probe.BaseUrl, existing.Select(item => item.Id));
@@ -579,7 +594,7 @@ public partial class MainWindow : Window
             }
             catch (Exception rollbackException)
             {
-                errors.Add($"OpenCodex 重启失败：{FriendlyError(rollbackException)}");
+            errors.Add($"总管家本机引擎重启失败：{FriendlyError(rollbackException)}");
             }
         }
         return errors;
@@ -727,7 +742,7 @@ public partial class MainWindow : Window
             }
             catch (Exception rollbackException)
             {
-                errors.Add($"OpenCodex 重启失败：{FriendlyError(rollbackException)}");
+            errors.Add($"总管家本机引擎重启失败：{FriendlyError(rollbackException)}");
             }
         }
 
@@ -848,7 +863,7 @@ public partial class MainWindow : Window
             ? "展示最近 53 周；当前没有可标记日期"
             : $"展示最近 53 周 · 当前日志覆盖 {snapshot.FirstSeen:yyyy-MM-dd} 至 {snapshot.LastSeen:yyyy-MM-dd}";
         TokenSourceText.Text = snapshot.SourceAvailable
-            ? $"来源：~\\.opencodex\\usage.jsonl · {snapshot.Message} 输入 {UsageFormatting.Number(snapshot.InputTokens)} / 输出 {UsageFormatting.Number(snapshot.OutputTokens)}。"
+            ? $"来源：总管家本机 request-log.jsonl · {snapshot.Message} 输入 {UsageFormatting.Number(snapshot.InputTokens)} / 输出 {UsageFormatting.Number(snapshot.OutputTokens)}。"
             : snapshot.Message;
         TokenSourceText.Foreground = new SolidColorBrush(snapshot.SourceAvailable
             ? Color.FromRgb(156, 181, 184)
@@ -925,6 +940,8 @@ public partial class MainWindow : Window
 
     private void ExtensionsNavButton_Click(object sender, RoutedEventArgs e) => ShowExtensionsPage();
 
+    private void SoftwareNavButton_Click(object sender, RoutedEventArgs e) => ShowSoftwareCenterPage();
+
     private async void StudyNavButton_Click(object sender, RoutedEventArgs e)
     {
         if (_busy || !StudyNavButton.IsEnabled) return;
@@ -940,28 +957,32 @@ public partial class MainWindow : Window
                 Arguments = $"-NoProfile -ExecutionPolicy RemoteSigned -File \"{launcherPath}\"",
                 WorkingDirectory = Path.GetDirectoryName(launcherPath)!,
                 UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
+                CreateNoWindow = true
             };
 
             using var process = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("无法启动学习系统启动器。");
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errorTask = process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync();
-            var output = await outputTask;
-            var error = await errorTask;
+            using var launchTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                await process.WaitForExitAsync(launchTimeout.Token);
+            }
+            catch (OperationCanceledException) when (launchTimeout.IsCancellationRequested)
+            {
+                try
+                {
+                    if (!process.HasExited) process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // The launcher may have exited between the timeout and cleanup.
+                }
+                try { await process.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
+                throw new TimeoutException("学习系统启动器 30 秒内没有退出，已停止它及其子进程，避免按钮永久转圈。");
+            }
 
             if (process.ExitCode != 0)
-            {
-                var detail = string.Join(" ", $"{output}\n{error}"
-                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                    .TakeLast(2));
-                throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail)
-                    ? "学习系统启动器返回失败。"
-                    : detail);
-            }
+                throw new InvalidOperationException($"学习系统启动器返回失败（退出码 {process.ExitCode}）。");
 
             FooterMessage.Text = "知耕考研已经在浏览器中打开。";
         }
@@ -1178,13 +1199,19 @@ public partial class MainWindow : Window
         ExtensionsPage.Refresh();
     }
 
+    private void ShowSoftwareCenterPage()
+    {
+        ShowPage(SoftwarePage, SoftwareNavButton, "软件中心", "管理总管家这个软件本身：启动、托盘、更新、诊断、隐私与版本。 ");
+        RefreshProductShellUi();
+    }
+
     private void ShowPage(FrameworkElement page, Button navButton, string title, string subtitle)
     {
         foreach (var candidate in new FrameworkElement[]
-                 { HomePage, TokenPage, ModelsPage, SourcesPage, AccountsPage, SubagentsPage, ThemesPage, ServicesPage, ServersPage, ExtensionsPage })
+                 { HomePage, TokenPage, ModelsPage, SourcesPage, AccountsPage, SubagentsPage, ThemesPage, ServicesPage, ServersPage, ExtensionsPage, SoftwarePage })
             candidate.Visibility = candidate == page ? Visibility.Visible : Visibility.Collapsed;
         foreach (var button in new[]
-                 { HomeNavButton, AccountsNavButton, SubagentsNavButton, TokenNavButton, ThemesNavButton, ServicesNavButton, ServersNavButton, ExtensionsNavButton })
+                 { HomeNavButton, AccountsNavButton, SubagentsNavButton, TokenNavButton, ThemesNavButton, ServicesNavButton, ServersNavButton, ExtensionsNavButton, SoftwareNavButton })
             button.Tag = button == navButton ? "active" : null;
         PageTitle.Text = title;
         PageSubtitle.Text = RuntimeMode.IsDetachedUi
@@ -1367,8 +1394,26 @@ public partial class MainWindow : Window
             SetBusy(false);
             RefreshCodexConnectionUi();
             if (RuntimeMode.IsDetachedUi) DisableDetachedActionButtons();
-            FooterMessage.Text = FriendlyError(ex);
-            MessageBox.Show(FriendlyError(ex), "连接切换没有完成", MessageBoxButton.OK, MessageBoxImage.Warning);
+            var actual = realCodexConfig.ReadGatewaySnapshot();
+            var requestedStateCommitted = disconnecting
+                ? !actual.IsManagedConnected && actual.CanToggle
+                : actual.IsManagedConnected && actual.CanToggle;
+            if (requestedStateCommitted)
+            {
+                FooterMessage.Text = disconnecting
+                    ? "Codex 已断开；后续状态刷新失败，请稍后刷新主页。"
+                    : "Codex 已连接；后续状态刷新失败，请稍后刷新主页。";
+                MessageBox.Show(
+                    $"连接状态已经写入成功，但后续刷新没有完成：{FriendlyError(ex)}\n\n请不要重复点击切换；稍后刷新主页即可。",
+                    disconnecting ? "已断开，刷新失败" : "已连接，刷新失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+            else
+            {
+                FooterMessage.Text = FriendlyError(ex);
+                MessageBox.Show(FriendlyError(ex), "连接切换没有完成", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
     }
 

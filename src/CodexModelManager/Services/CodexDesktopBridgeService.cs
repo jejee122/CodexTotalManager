@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
@@ -30,8 +29,6 @@ public sealed record CodexAliasSwitchResult(
     CodexAliasSwitchStatus Status,
     string Message,
     string? CurrentModel = null);
-
-public sealed record CodexRestartResult(bool Success, string Message);
 
 public static class CodexConversationContinuity
 {
@@ -84,25 +81,14 @@ public static class CodexConversationContinuity
 }
 
 /// <summary>
-/// Uses the ordinary Windows accessibility tree first and the already-installed
-/// Dream Skin CDP endpoint only as a fallback. Neither path patches Codex files
-/// or touches the chat database: both use the visible model menu.
+/// Reads the ordinary Windows accessibility tree first and the already-installed
+/// Dream Skin CDP endpoint only as a read-only fallback. Model selection remains
+/// a user action in Codex's own menu.
 /// </summary>
 public sealed class CodexDesktopBridgeService
 {
     private const int DreamSkinPort = 9335;
     private const string CodexPageUrl = "app://-/index.html";
-    private static string DreamSkinStartScript => ResolveDreamSkinStartScript();
-
-    private static string ResolveDreamSkinStartScript()
-    {
-        var bundled = Path.Combine(AppContext.BaseDirectory, "Resources", "CodexDreamSkin", "scripts", "start-dream-skin.ps1");
-        if (File.Exists(bundled)) return bundled;
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CodexDreamSkin", "engine", "scripts", "start-dream-skin.ps1");
-    }
-
     private readonly HttpClient _http = new()
     {
         BaseAddress = new Uri($"http://127.0.0.1:{DreamSkinPort}"),
@@ -142,205 +128,21 @@ public sealed class CodexDesktopBridgeService
             return new CodexAliasSwitchResult(
                 CodexAliasSwitchStatus.Unavailable,
                 "独立模式禁止连接或切换 Codex 当前任务。");
-        var windowsResult = await CodexWindowsAutomation.EnsureAliasAsync(alias, cancellationToken);
-        if (windowsResult.Status != CodexAliasSwitchStatus.Unavailable)
-            return windowsResult;
-
-        CdpSession session;
-        try
-        {
-            session = await ConnectAsync(cancellationToken);
-        }
-        catch
-        {
+        var current = await ReadStateAsync(cancellationToken);
+        if (current.IsTurnRunning)
             return new CodexAliasSwitchResult(
-                CodexAliasSwitchStatus.Unavailable,
-                "没有找到可操作的 Codex 当前任务。请先打开一个任务。");
-        }
-
-        await using (session)
-        {
-            var before = await ReadStateAsync(session, cancellationToken);
-            if (before.IsTurnRunning)
-            {
-                return new CodexAliasSwitchResult(
-                    CodexAliasSwitchStatus.Busy,
-                    "Codex 正在回答。等回答结束后再点一次模型。",
-                    before.CurrentModel);
-            }
-
-            if (SameModel(before.CurrentModel, alias))
-            {
-                return new CodexAliasSwitchResult(
-                    CodexAliasSwitchStatus.Success,
-                    "当前聊天已经接到固定入口。",
-                    before.CurrentModel);
-            }
-
-            await CloseMenusAsync(session, cancellationToken);
-            var opened = await session.EvaluateJsonAsync(OpenModelPickerScript, cancellationToken);
-            if (!ReadBoolean(opened, "ok"))
-            {
-                return new CodexAliasSwitchResult(
-                    CodexAliasSwitchStatus.Failed,
-                    ReadString(opened, "message") ?? "没有找到 Codex 的模型按钮。",
-                    before.CurrentModel);
-            }
-
-            await Task.Delay(250, cancellationToken);
-            var submenu = await session.EvaluateJsonAsync(OpenModelSubmenuScript, cancellationToken);
-            if (!ReadBoolean(submenu, "ok"))
-            {
-                await CloseMenusAsync(session, cancellationToken);
-                return new CodexAliasSwitchResult(
-                    CodexAliasSwitchStatus.Failed,
-                    ReadString(submenu, "message") ?? "没有打开 Codex 的模型列表。",
-                    before.CurrentModel);
-            }
-
-            await Task.Delay(300, cancellationToken);
-            var aliasJson = JsonSerializer.Serialize(alias);
-            var selection = await session.EvaluateJsonAsync(
-                SelectAliasScript.Replace("__ALIAS__", aliasJson, StringComparison.Ordinal),
-                cancellationToken);
-            if (!ReadBoolean(selection, "found"))
-            {
-                await CloseMenusAsync(session, cancellationToken);
-                return new CodexAliasSwitchResult(
-                    CodexAliasSwitchStatus.NeedsRestart,
-                    "Codex 还没有读到固定入口，需要安全重开一次。",
-                    before.CurrentModel);
-            }
-
-            await Task.Delay(650, cancellationToken);
-            var after = await ReadStateAsync(session, cancellationToken);
-            if (!SameModel(after.CurrentModel, alias))
-            {
-                return new CodexAliasSwitchResult(
-                    CodexAliasSwitchStatus.Failed,
-                    "Codex 没有确认当前聊天的模型切换。",
-                    after.CurrentModel);
-            }
-
+                CodexAliasSwitchStatus.Busy,
+                "Codex 正在回答。等回答结束后再手动选择模型。",
+                current.CurrentModel);
+        if (SameModel(current.CurrentModel, alias))
             return new CodexAliasSwitchResult(
                 CodexAliasSwitchStatus.Success,
-                "当前聊天已经接到固定入口。",
-                after.CurrentModel);
-        }
-    }
-
-    public Task<CodexRestartResult> RestartCodexWithDreamSkinAsync(
-        CancellationToken cancellationToken = default) =>
-        RestartCodexWithDreamSkinAsync(null, cancellationToken);
-
-    public async Task<CodexRestartResult> RestartCodexWithDreamSkinAsync(
-        IReadOnlyDictionary<string, string>? launchEnvironment,
-        CancellationToken cancellationToken = default)
-    {
-        if (RuntimeMode.IsDetachedUi)
-            return new CodexRestartResult(false, "独立模式禁止关闭、启动或重启 Codex。");
-        var state = await ReadStateAsync(cancellationToken);
-        if (state.Connected && state.IsTurnRunning)
-            return new CodexRestartResult(false, "Codex 正在回答，不能现在重开。");
-        if (!File.Exists(DreamSkinStartScript))
-            return new CodexRestartResult(false, "没有找到 Codex 皮肤启动文件。");
-
-        try
-        {
-            await using var session = await ConnectAsync(cancellationToken);
-            await session.CloseBrowserAsync(cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            return new CodexRestartResult(false, $"Codex 没有正常关闭：{ex.Message}");
-        }
-
-        var closeDeadline = DateTime.UtcNow.AddSeconds(15);
-        var closed = false;
-        while (DateTime.UtcNow < closeDeadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var current = await ReadStateAsync(cancellationToken);
-            if (!current.Connected)
-            {
-                closed = true;
-                break;
-            }
-            await Task.Delay(300, cancellationToken);
-        }
-        if (!closed)
-            return new CodexRestartResult(false, "Codex 没有正常关闭。请保存输入后手动关掉所有 Codex 窗口。");
-
-        var powershell = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.System),
-            @"WindowsPowerShell\v1.0\powershell.exe");
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = powershell,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WindowStyle = ProcessWindowStyle.Hidden,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        if (launchEnvironment is not null)
-        {
-            foreach (var pair in launchEnvironment)
-            {
-                if (string.IsNullOrWhiteSpace(pair.Key) || string.IsNullOrWhiteSpace(pair.Value))
-                    return new CodexRestartResult(false, "Codex 托管线路缺少安全启动环境，已取消重开。");
-                startInfo.Environment[pair.Key] = pair.Value;
-            }
-        }
-        startInfo.ArgumentList.Add("-NoProfile");
-        startInfo.ArgumentList.Add("-STA");
-        startInfo.ArgumentList.Add("-WindowStyle");
-        startInfo.ArgumentList.Add("Hidden");
-        startInfo.ArgumentList.Add("-ExecutionPolicy");
-        startInfo.ArgumentList.Add("RemoteSigned");
-        startInfo.ArgumentList.Add("-File");
-        startInfo.ArgumentList.Add(DreamSkinStartScript);
-        startInfo.ArgumentList.Add("-Port");
-        startInfo.ArgumentList.Add(DreamSkinPort.ToString());
-        startInfo.ArgumentList.Add("-RestartExisting");
-        startInfo.ArgumentList.Add("-FullTheme");
-        startInfo.ArgumentList.Add("-OperationLockTimeoutMilliseconds");
-        startInfo.ArgumentList.Add("15000");
-
-        using var launcher = new Process { StartInfo = startInfo };
-        try
-        {
-            if (!launcher.Start())
-                return new CodexRestartResult(false, "Codex 皮肤启动失败。");
-            var stdoutTask = launcher.StandardOutput.ReadToEndAsync(cancellationToken);
-            var stderrTask = launcher.StandardError.ReadToEndAsync(cancellationToken);
-            await launcher.WaitForExitAsync(cancellationToken).WaitAsync(TimeSpan.FromSeconds(75), cancellationToken);
-            var stdout = await stdoutTask;
-            var stderr = await stderrTask;
-            if (launcher.ExitCode != 0)
-            {
-                var detail = LastUsefulLine(stderr) ?? LastUsefulLine(stdout) ?? "启动程序返回失败";
-                return new CodexRestartResult(false, $"Codex 没有重开成功：{detail}");
-            }
-        }
-        catch (TimeoutException)
-        {
-            return new CodexRestartResult(false, "Codex 重开超时了。");
-        }
-        catch (Exception ex)
-        {
-            return new CodexRestartResult(false, $"Codex 没有重开成功：{ex.Message}");
-        }
-
-        var readyDeadline = DateTime.UtcNow.AddSeconds(45);
-        while (DateTime.UtcNow < readyDeadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var ready = await ReadStateAsync(cancellationToken);
-            if (ready.Connected) return new CodexRestartResult(true, "Codex 已经重新打开。");
-            await Task.Delay(500, cancellationToken);
-        }
-        return new CodexRestartResult(false, "Codex 已启动，但模型按钮还没准备好。请打开刚才的聊天后再点一次。");
+                "当前任务已经显示这个模型。",
+                current.CurrentModel);
+        return new CodexAliasSwitchResult(
+            CodexAliasSwitchStatus.Unavailable,
+            $"总管家已准备 {alias}，但不会自动点击或重启 Codex。请在 Codex 自己的模型菜单中选择。",
+            current.CurrentModel);
     }
 
     private async Task<CdpSession> ConnectAsync(CancellationToken cancellationToken)
@@ -387,16 +189,8 @@ public sealed class CodexDesktopBridgeService
             ConversationFingerprint: ReadString(json, "conversationFingerprint"));
     }
 
-    private static Task CloseMenusAsync(CdpSession session, CancellationToken cancellationToken) =>
-        session.SendEscapeAsync(cancellationToken);
-
     private static bool SameModel(string? left, string right) =>
         string.Equals(left?.Trim(), right.Trim(), StringComparison.OrdinalIgnoreCase);
-
-    private static string? LastUsefulLine(string text) =>
-        text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-            .Select(line => line.Trim())
-            .LastOrDefault(line => line.Length > 0);
 
     private static bool ReadBoolean(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object
@@ -451,63 +245,6 @@ public sealed class CodexDesktopBridgeService
         })())
         """;
 
-    private const string OpenModelPickerScript = """
-        JSON.stringify((() => {
-          const hit = (node) => {
-            node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1 }));
-            node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, button: 0 }));
-            node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
-          };
-          const trigger = document.querySelector('button[data-codex-intelligence-trigger="true"]');
-          if (!trigger) return { ok: false, message: '没有找到 Codex 的模型按钮。' };
-          hit(trigger);
-          return { ok: true };
-        })())
-        """;
-
-    private const string OpenModelSubmenuScript = """
-        JSON.stringify((() => {
-          const hit = (node) => {
-            node.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }));
-            node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
-          };
-          const item = [...document.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]')]
-            .find((node) => {
-              const label = (node.getAttribute('aria-label') || '').trim();
-              const firstLine = (node.innerText || '').split(/\r?\n/)[0].trim();
-              return label.startsWith('模型 ') || label.startsWith('Model ') || firstLine === '模型' || firstLine === 'Model';
-            });
-          if (!item) return { ok: false, message: '没有打开 Codex 的模型列表。' };
-          hit(item);
-          return { ok: true };
-        })())
-        """;
-
-    private const string SelectAliasScript = """
-        JSON.stringify((() => {
-          const alias = __ALIAS__;
-          const hit = (node) => {
-            node.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }));
-            node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-            node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
-          };
-          const items = [...document.querySelectorAll('[role="menuitem"]')]
-            .filter((node) => !node.hasAttribute('aria-haspopup'));
-          const firstLine = (node) => (node.innerText || '').split(/\r?\n/)[0].trim();
-          const target = items.find((node) => firstLine(node).toLowerCase() === alias.toLowerCase());
-          if (!target) return { found: false, available: items.map(firstLine).filter(Boolean) };
-          hit(target);
-          return { found: true };
-        })())
-        """;
-
     private sealed class CdpSession : IAsyncDisposable
     {
         private readonly ClientWebSocket _socket;
@@ -545,38 +282,6 @@ public sealed class CodexDesktopBridgeService
                 throw new InvalidOperationException("Codex 页面没有返回可识别的结果。");
             using var document = JsonDocument.Parse(value.GetString() ?? "{}");
             return document.RootElement.Clone();
-        }
-
-        public async Task SendEscapeAsync(CancellationToken cancellationToken)
-        {
-            var key = new
-            {
-                type = "keyDown",
-                key = "Escape",
-                code = "Escape",
-                windowsVirtualKeyCode = 27,
-                nativeVirtualKeyCode = 27
-            };
-            await SendAsync("Input.dispatchKeyEvent", key, cancellationToken);
-            await SendAsync(
-                "Input.dispatchKeyEvent",
-                new
-                {
-                    type = "keyUp",
-                    key = "Escape",
-                    code = "Escape",
-                    windowsVirtualKeyCode = 27,
-                    nativeVirtualKeyCode = 27
-                },
-                cancellationToken);
-        }
-
-        public async Task CloseBrowserAsync(CancellationToken cancellationToken)
-        {
-            var id = Interlocked.Increment(ref _nextId);
-            var payload = JsonSerializer.Serialize(new { id, method = "Browser.close", @params = new { } });
-            var bytes = Encoding.UTF8.GetBytes(payload);
-            await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, cancellationToken);
         }
 
         private async Task<JsonElement> SendAsync(

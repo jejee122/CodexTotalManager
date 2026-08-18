@@ -26,8 +26,9 @@ $marker = [Guid]::NewGuid().ToString('N')
 $markerPath = Join-Path $runRoot '.owned-ui-stress'
 Set-Content -LiteralPath $markerPath -Value $marker -Encoding UTF8 -NoNewline
 $realConfig = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.codex\config.toml'
-$beforeHash = (Get-FileHash -LiteralPath $realConfig -Algorithm SHA256).Hash
-$beforeTime = (Get-Item -LiteralPath $realConfig).LastWriteTimeUtc
+$realConfigExists = Test-Path -LiteralPath $realConfig -PathType Leaf
+$beforeHash = if ($realConfigExists) { (Get-FileHash -LiteralPath $realConfig -Algorithm SHA256).Hash } else { $null }
+$beforeTime = if ($realConfigExists) { (Get-Item -LiteralPath $realConfig).LastWriteTimeUtc } else { $null }
 
 try {
     $info = [Diagnostics.ProcessStartInfo]::new()
@@ -36,12 +37,12 @@ try {
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
-    $info.Environment['CMM_DETACHED_NO_EXTERNAL_NETWORK'] = '1'
-    $info.Environment['CMM_DETACHED_DATA_ROOT'] = $runRoot
-    $info.Environment['HTTP_PROXY'] = 'http://127.0.0.1:1'
-    $info.Environment['HTTPS_PROXY'] = 'http://127.0.0.1:1'
-    $info.Environment['ALL_PROXY'] = 'socks5://127.0.0.1:1'
-    $info.Environment['NO_PROXY'] = '127.0.0.1,localhost'
+    $info.EnvironmentVariables['CMM_DETACHED_NO_EXTERNAL_NETWORK'] = '1'
+    $info.EnvironmentVariables['CMM_DETACHED_DATA_ROOT'] = $runRoot
+    $info.EnvironmentVariables['HTTP_PROXY'] = 'http://127.0.0.1:1'
+    $info.EnvironmentVariables['HTTPS_PROXY'] = 'http://127.0.0.1:1'
+    $info.EnvironmentVariables['ALL_PROXY'] = 'socks5://127.0.0.1:1'
+    $info.EnvironmentVariables['NO_PROXY'] = '127.0.0.1,localhost'
 
     $process = [Diagnostics.Process]::Start($info)
     if (-not $process.WaitForExit(180000)) {
@@ -63,9 +64,10 @@ try {
         throw "Installed UI stress test failed. Exit code: $exitCode"
     }
 
-    $afterHash = (Get-FileHash -LiteralPath $realConfig -Algorithm SHA256).Hash
-    $afterTime = (Get-Item -LiteralPath $realConfig).LastWriteTimeUtc
-    if ($beforeHash -ne $afterHash -or $beforeTime -ne $afterTime) {
+    $afterExists = Test-Path -LiteralPath $realConfig -PathType Leaf
+    $afterHash = if ($afterExists) { (Get-FileHash -LiteralPath $realConfig -Algorithm SHA256).Hash } else { $null }
+    $afterTime = if ($afterExists) { (Get-Item -LiteralPath $realConfig).LastWriteTimeUtc } else { $null }
+    if ($realConfigExists -ne $afterExists -or $beforeHash -ne $afterHash -or $beforeTime -ne $afterTime) {
         throw 'Real Codex config changed during isolated UI stress testing.'
     }
 
@@ -73,7 +75,8 @@ try {
         MaxCycleLatencyMs, EnabledActionButtonCount,
         ExternalStatusConnectionsAllowed, LocalServiceRows, ServerMonitorRunning
     Write-Output "REAL_CODEX_CONFIG_UNCHANGED=True"
-    Write-Output "REAL_CODEX_CONFIG_SHA256=$afterHash"
+    Write-Output "REAL_CODEX_CONFIG_PRESENT=$afterExists"
+    if ($afterHash) { Write-Output "REAL_CODEX_CONFIG_SHA256=$afterHash" }
 }
 finally {
     if (Test-Path -LiteralPath $runRoot) {

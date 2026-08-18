@@ -35,9 +35,12 @@ public sealed class ComboDefinition
 
 public sealed class NativeProxyConfig
 {
+    public long Revision { get; set; }
     public int ListenPort { get; set; } = 10100;
     public string? AdmissionToken { get; set; }
     public string? DefaultProvider { get; set; }
+    public int AutoSwitchThreshold { get; set; }
+    public int FailoverThreshold { get; set; }
     public List<ProviderDefinition> Providers { get; set; } = new();
     public List<ComboDefinition> Combos { get; set; } = new();
 }

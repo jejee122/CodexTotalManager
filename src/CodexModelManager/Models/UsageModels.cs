@@ -6,7 +6,10 @@ public sealed class UsageWindowView
     public string Label { get; init; } = string.Empty;
     public double UsedPercent { get; init; }
     public QuotaValueValidationState ValueValidation =>
-        double.IsFinite(UsedPercent) && UsedPercent is >= 0d and <= 100d
+        // Some providers legitimately report overage above 100%. Treat only
+        // negative or non-finite values as malformed; the progress bar remains
+        // visually capped while the exact upstream overage stays visible.
+        double.IsFinite(UsedPercent) && UsedPercent >= 0d
             ? QuotaValueValidationState.Valid
             : QuotaValueValidationState.InvalidRange;
     public double VisualUsedPercent => Math.Clamp(double.IsFinite(UsedPercent) ? UsedPercent : 0d, 0d, 100d);
@@ -15,7 +18,9 @@ public sealed class UsageWindowView
     public DateTimeOffset? ResetAtUtc { get; init; }
     public QuotaResetState ResetState { get; init; } = QuotaResetState.NotProvided;
     public string SummaryText => ValueValidation == QuotaValueValidationState.Valid
-        ? $"已用 {UsedPercent:0.#}% · 剩余 {RemainingPercent:0.#}%"
+        ? UsedPercent > 100d
+            ? $"已用 {UsedPercent:0.#}% · 已超用 {UsedPercent - 100d:0.#}%"
+            : $"已用 {UsedPercent:0.#}% · 剩余 {RemainingPercent:0.#}%"
         : $"额度值无效（上游原值 {UsedPercent:0.###}）";
 }
 
@@ -96,8 +101,8 @@ public sealed record LiveTokenUsageSnapshot(
     DateTimeOffset UpdatedAt)
 {
     public static LiveTokenUsageSnapshot Empty { get; } = new(
-        LiveTokenUsageView.Empty("pro", "Codex Pro", "OpenCodex 本机日志"),
-        LiveTokenUsageView.Empty("plus", "Codex Plus", "OpenCodex 本机日志"),
+        LiveTokenUsageView.Empty("pro", "Codex Pro", "总管家本机引擎日志"),
+        LiveTokenUsageView.Empty("plus", "Codex Plus", "总管家本机引擎日志"),
         Array.Empty<LiveTokenUsageView>(),
         DateTimeOffset.Now);
 }

@@ -41,24 +41,27 @@ public sealed class LocalServiceControlService
     {
         EnsureAttachedMode("读取完整本机服务状态");
         var runtimeTask = _openCodex.GetRuntimeStatusAsync(cancellationToken);
-        var v2rayPortTask = IsPortOpenAsync(_settings.V2rayProxyPort, cancellationToken);
+        var v2rayConfigured = TryGetConfiguredV2rayExecutable(out _);
+        var v2rayPortTask = v2rayConfigured
+            ? IsPortOpenAsync(_settings.V2rayProxyPort, cancellationToken)
+            : Task.FromResult(false);
         var dreamTask = _dreamSkin.DiscoverAsync(cancellationToken);
         await Task.WhenAll(runtimeTask, v2rayPortTask, dreamTask);
         var runtime = runtimeTask.Result;
-        var v2rayProcesses = FindManagedV2rayProcesses();
+        var v2rayProcesses = v2rayConfigured ? FindManagedV2rayProcesses() : [];
         var v2rayReady = v2rayPortTask.Result;
         var dream = dreamTask.Result;
         return new[]
         {
             new LocalServiceView
             {
-                Id = "opencodex",
-                Name = "OpenCodex",
+                Id = "native-engine",
+            Name = "总管家本机引擎",
                 Running = runtime.Healthy,
                 Status = runtime.Healthy ? "运行正常" : "不可用",
                 PortText = $"监听端口 {runtime.Port} · PID {runtime.ProcessId?.ToString() ?? "--"}",
                 Detail = runtime.Healthy ? $"运行 {FormatUptime(runtime.Uptime)} · 内存 {FormatBytes(runtime.WorkingSetBytes)}" : "官方模型仍可通过 Codex 直连备用入口使用",
-                LastError = string.IsNullOrWhiteSpace(runtime.LastError) ? ReadLastLine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".opencodex", "service.log")) : Scrub(runtime.LastError),
+                LastError = ReadNativeEngineError(runtime.LastError),
                 Capability = runtime.Healthy ? "已经可用" : "部分可用",
                 Purpose = "负责把账号池和独立 API 接到 Codex。",
                 PlainStatus = runtime.Healthy ? "模型中转正常" : "模型中转暂不可用",
@@ -72,13 +75,21 @@ public sealed class LocalServiceControlService
                 Id = "v2rayn",
                 Name = "v2rayN",
                 Running = v2rayReady && v2rayProcesses.Count > 0,
-                Status = v2rayReady ? (v2rayProcesses.Count > 0 ? "运行正常" : "端口被其他进程占用") : "未连接",
-                PortText = $"本机代理 {_settings.V2rayProxyUrl} · 已验证进程 {v2rayProcesses.Count} 个",
-                Detail = "只控制安装目录内已核对路径的 v2rayN/Xray 进程",
+                Status = !v2rayConfigured
+                    ? "未配置"
+                    : v2rayReady ? (v2rayProcesses.Count > 0 ? "运行正常" : "端口被其他进程占用") : "未连接",
+                PortText = v2rayConfigured
+                    ? $"本机代理 {_settings.V2rayProxyUrl} · 已验证进程 {v2rayProcesses.Count} 个"
+                    : "还没有选择 v2rayN.exe",
+                Detail = v2rayConfigured
+                    ? "只控制安装目录内已核对路径的 v2rayN/Xray 进程"
+                    : "v2rayN 是可选项；需要代理时再手动选择程序路径",
                 LastError = ReadLatestV2rayLog(),
                 Capability = v2rayReady && v2rayProcesses.Count > 0 ? "已经可用" : "不可用",
                 Purpose = "负责需要代理的网络连接。",
-                PlainStatus = v2rayReady && v2rayProcesses.Count > 0 ? "网络通道正常" : "网络通道需要处理",
+                PlainStatus = !v2rayConfigured
+                    ? "未配置（可选）"
+                    : v2rayReady && v2rayProcesses.Count > 0 ? "网络通道正常" : "网络通道需要处理",
                 ImpactText = v2rayReady && v2rayProcesses.Count > 0
                     ? "国外接口与依赖代理的程序可以联网。"
                     : "部分国外模型可能连接失败；国内服务不一定受影响。",
@@ -111,9 +122,8 @@ public sealed class LocalServiceControlService
     public async Task<bool> StartV2rayAsync(CancellationToken cancellationToken = default)
     {
         EnsureAttachedMode("启动 v2rayN");
+        var path = GetConfiguredV2rayExecutable("启动 v2rayN");
         if (await IsPortOpenAsync(_settings.V2rayProxyPort, cancellationToken) && FindManagedV2rayProcesses().Count > 0) return true;
-        var path = Path.GetFullPath(_settings.V2rayPath);
-        if (!File.Exists(path)) return false;
         Process.Start(new ProcessStartInfo
         {
             FileName = path,
@@ -127,6 +137,7 @@ public sealed class LocalServiceControlService
     public async Task<bool> StopV2rayAsync(CancellationToken cancellationToken = default)
     {
         EnsureAttachedMode("停止 v2rayN");
+        _ = GetConfiguredV2rayExecutable("停止 v2rayN");
         var processes = FindManagedV2rayProcesses();
         foreach (var process in processes)
         {
@@ -223,13 +234,13 @@ public sealed class LocalServiceControlService
 
     private string GetV2rayConfigDirectory()
     {
-        var executable = Path.GetFullPath(_settings.V2rayPath);
+        var executable = GetConfiguredV2rayExecutable("备份或恢复 v2rayN");
         return Path.Combine(Path.GetDirectoryName(executable)!, "guiConfigs");
     }
 
     private List<Process> FindManagedV2rayProcesses()
     {
-        var executable = Path.GetFullPath(_settings.V2rayPath);
+        if (!TryGetConfiguredV2rayExecutable(out var executable)) return [];
         var root = Path.GetDirectoryName(executable)!.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var result = new List<Process>();
         foreach (var process in Process.GetProcesses())
@@ -277,13 +288,55 @@ public sealed class LocalServiceControlService
 
     private string ReadLatestV2rayLog()
     {
+        if (!TryGetConfiguredV2rayExecutable(out var executable)) return "v2rayN 尚未配置";
+        if (!File.Exists(executable)) return "配置的 v2rayN.exe 已不存在，请重新选择";
         try
         {
-            var root = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(_settings.V2rayPath))!, "guiLogs");
+            var root = Path.Combine(Path.GetDirectoryName(executable)!, "guiLogs");
             var latest = new DirectoryInfo(root).GetFiles().OrderByDescending(file => file.LastWriteTimeUtc).FirstOrDefault();
             return latest is null ? "暂无错误记录" : ReadLastLine(latest.FullName);
         }
         catch { return "日志暂时读不到"; }
+    }
+
+    private bool TryGetConfiguredV2rayExecutable(out string executable)
+    {
+        executable = string.Empty;
+        if (string.IsNullOrWhiteSpace(_settings.V2rayPath)) return false;
+        try
+        {
+            var candidate = Path.GetFullPath(_settings.V2rayPath);
+            if (!Path.GetFileName(candidate).Equals("v2rayN.exe", StringComparison.OrdinalIgnoreCase)) return false;
+            executable = candidate;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private string GetConfiguredV2rayExecutable(string action)
+    {
+        if (!TryGetConfiguredV2rayExecutable(out var executable))
+            throw new InvalidOperationException($"还没有配置 v2rayN.exe，不能{action}。请先在本机设置里选择程序路径。");
+        if (!File.Exists(executable))
+            throw new FileNotFoundException("配置的 v2rayN.exe 已不存在，请重新选择程序路径。", executable);
+        return executable;
+    }
+
+    private string ReadNativeEngineError(string? runtimeError)
+    {
+        if (!string.IsNullOrWhiteSpace(runtimeError)) return Scrub(runtimeError);
+        foreach (var path in new[]
+                 {
+                     Path.Combine(_settings.DataDirectory, "native-proxy", "diagnostics", "native-engine.txt"),
+                     Path.Combine(_settings.DataDirectory, "diagnostics", "native-engine.txt")
+                 })
+        {
+            if (File.Exists(path)) return ReadLastLine(path);
+        }
+        return "暂无错误记录";
     }
 
     private static string ReadLastLine(string path)

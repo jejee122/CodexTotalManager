@@ -4,15 +4,16 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>CodexModelManager</AssemblyName>
     <RootNamespace>CodexModelManager</RootNamespace>
     <ApplicationIcon>Resources\Brand\CodexTotalManager-v4.ico</ApplicationIcon>
     <!-- Keep the desktop payload, assembly metadata and deployment evidence on one version. -->
-    <Version>3.0.0-rc.26</Version>
+    <Version>3.0.0-rc.28</Version>
     <AssemblyVersion>3.0.0.0</AssemblyVersion>
-    <FileVersion>3.0.0.26</FileVersion>
+    <FileVersion>3.0.0.28</FileVersion>
     <InformationalVersion>$(Version)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AssemblyTitle>Codex 总管家</AssemblyTitle>
@@ -28,6 +29,11 @@
     <DefineConstants>$(DefineConstants);CMM_DETACHED_ONLY</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
+    <!-- WinForms is used only for the Windows tray icon. Keep its broad implicit
+         namespaces out of the WPF source tree to avoid Button/Brush ambiguity. -->
+    <Using Remove="System.Drawing" />
+    <Using Remove="System.Windows.Forms" />
+    <InternalsVisibleTo Include="CodexModelManager.SecurityTests" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Tomlyn" Version="0.20.0" />
     <ProjectReference Include="..\CodexOpenCodexNative\CodexOpenCodexNative.csproj" />

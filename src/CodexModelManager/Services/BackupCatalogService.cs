@@ -25,7 +25,7 @@ public sealed class BackupCatalogService
                 var name = Path.GetFileName(path);
                 if (File.Exists(path) && name.StartsWith("config-", StringComparison.OrdinalIgnoreCase)
                     && name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
-                    items.Add(Create(path, "OpenCodex 配置", "模型来源、账号池和路由", "OpenCodex", true));
+        items.Add(Create(path, "总管家本机引擎配置", "模型来源、账号池和路由", "总管家本机引擎", true));
                 else if (File.Exists(path) && name.StartsWith("codex-config-", StringComparison.OrdinalIgnoreCase)
                          && name.EndsWith(".toml", StringComparison.OrdinalIgnoreCase))
                     items.Add(Create(path, "Codex 配置", "默认模型入口", "Codex", true));
@@ -171,7 +171,7 @@ public sealed class BackupCatalogService
     }
 
     private static bool IsCriticalType(string type) => type is
-        "OpenCodex 配置" or
+            "总管家本机引擎配置" or
         "Codex 配置" or
         "v2rayN 配置" or
         "Dream Skin 主题" or

@@ -89,6 +89,17 @@ public sealed record AccountUsageImporterStatus(
         AccountUsageImporterHealth.NotStarted, null, null, "Uninitialized", null);
 }
 
+/// <summary>每日 token 用量聚合点（本地时区自然日），供用量曲线展示使用。</summary>
+public sealed record DailyTokenUsagePoint(
+    DateOnly LocalDate,
+    long InputTokens,
+    long OutputTokens,
+    long TotalTokens,
+    int Requests)
+{
+    public static DailyTokenUsagePoint Empty(DateOnly date) => new(date, 0, 0, 0, 0);
+}
+
 public sealed record AttemptTokenUsageFact(
     long? InputTokens,
     long? CachedInputTokens,
@@ -377,6 +388,7 @@ public sealed record AccountUsageIngestResult(
 {
     public AccountUsageSourceAvailability SourceAvailability { get; init; } = AccountUsageSourceAvailability.Available;
     public bool CoverageGapDetected { get; init; }
+    public bool SourceContractMigrated { get; init; }
 }
 
 public sealed record AccountQuotaIngestResult(
