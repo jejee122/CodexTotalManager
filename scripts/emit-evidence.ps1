@@ -65,7 +65,7 @@ if (-not [string]::IsNullOrWhiteSpace($PayloadManifestPath)) {
   } catch { }
 }
 $cliProxyCandidates += Join-Path $repoRoot 'out\publish\Resources\CLIProxyAPI\cli-proxy-api.exe'
-$cliProxyCandidates += Join-Path (Split-Path -Parent $repoRoot) '.tools\CLIProxyAPI-7.2.104\cli-proxy-api.exe'
+$cliProxyCandidates += Join-Path (Split-Path -Parent $repoRoot) '.tools\CLIProxyAPI-7.2.135\cli-proxy-api.exe'
 $resolvedCliProxyArtifact = $cliProxyCandidates |
   Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
   ForEach-Object { [IO.Path]::GetFullPath($_) } |

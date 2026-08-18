@@ -6,7 +6,7 @@
         xmlns:views="clr-namespace:CodexModelManager.Views"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         mc:Ignorable="d"
-        Title="Codex 总管家"
+        Title="AI 中转站总管家"
         Icon="Resources/Brand/CodexTotalManager-v4.ico"
         Width="1440" Height="850" MinWidth="1040" MinHeight="720"
         WindowStartupLocation="CenterScreen"
@@ -639,7 +639,7 @@
                             <Border Width="27" Height="27" CornerRadius="7" ClipToBounds="True" Background="#0A1B22">
                                 <Image Source="Resources/Brand/CodexTotalManager-v4.ico" Stretch="UniformToFill"/>
                             </Border>
-                            <TextBlock Text="Codex 总管家" Foreground="#F2EBDD" FontSize="13" FontWeight="SemiBold"
+                            <TextBlock Text="AI 中转站总管家" Foreground="#F2EBDD" FontSize="13" FontWeight="SemiBold"
                                        Margin="10,0,0,0" VerticalAlignment="Center"/>
                         </StackPanel>
                     </Border>
@@ -666,15 +666,15 @@
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <StackPanel Margin="36,38,20,34">
-                    <TextBlock Text="天工 · Codex" Style="{StaticResource CloudTitleText}" FontSize="24"/>
-                    <TextBlock Text="总管家 / CELESTIAL CONSOLE" Foreground="#9FD5CF" FontSize="11" Margin="0,5,0,0"/>
+                    <TextBlock Text="天工 · AI 中转站" Style="{StaticResource CloudTitleText}" FontSize="24"/>
+                    <TextBlock Text="统一中转 / GATEWAY CONSOLE" Foreground="#9FD5CF" FontSize="11" Margin="0,5,0,0"/>
                 </StackPanel>
 
                 <StackPanel Grid.Row="1">
                     <Button x:Name="HomeNavButton" Style="{StaticResource NavButton}" Tag="active"
-                            Click="HomeNavButton_Click" Content="◈  总览"/>
+                            Click="HomeNavButton_Click" Content="◈  中转站总览"/>
                     <Button x:Name="AccountsNavButton" Style="{StaticResource NavButton}"
-                            Click="AccountsNavButton_Click" Content="◇  中转站"/>
+                            Click="AccountsNavButton_Click" Content="◇  模型与线路"/>
                     <Button x:Name="SubagentsNavButton" Style="{StaticResource NavButton}"
                             Click="SubagentsNavButton_Click" Content="⌘  子代理"/>
                     <Button x:Name="TokenNavButton" Style="{StaticResource NavButton}"
@@ -682,7 +682,7 @@
                     <Button x:Name="ThemesNavButton" Style="{StaticResource NavButton}"
                             Click="ThemesNavButton_Click" Content="◐  皮肤"/>
                     <Button x:Name="ServicesNavButton" Style="{StaticResource NavButton}"
-                            Click="ServicesNavButton_Click" Content="◎  本机服务"/>
+                            Click="ServicesNavButton_Click" Content="◎  Codex 接入"/>
                     <Button x:Name="ServersNavButton" Style="{StaticResource NavButton}"
                             Click="ServersNavButton_Click" Content="⌁  服务器"/>
                     <Button x:Name="ExtensionsNavButton" Style="{StaticResource NavButton}"
@@ -721,8 +721,8 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <StackPanel>
-                        <TextBlock x:Name="PageTitle" Text="首页" Style="{StaticResource CloudTitleText}" FontSize="25"/>
-                        <TextBlock x:Name="PageSubtitle" Text="一眼看清 Codex 和服务器是否正常。" Foreground="#C6DAD7"
+                        <TextBlock x:Name="PageTitle" Text="AI 中转站" Style="{StaticResource CloudTitleText}" FontSize="25"/>
+                        <TextBlock x:Name="PageSubtitle" Text="统一管理 API、模型、线路和调用方；Codex 只是可选接入。" Foreground="#C6DAD7"
                                    FontSize="13" Margin="0,5,0,0"/>
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -748,7 +748,7 @@
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel>
-                                    <TextBlock x:Name="HomeOverallTitle" Text="正在检查你的 Codex…" Foreground="White"
+                                    <TextBlock x:Name="HomeOverallTitle" Text="正在检查 AI 中转站…" Foreground="White"
                                                FontSize="22" FontWeight="Bold" TextWrapping="Wrap"/>
                                     <TextBlock x:Name="HomeOverallDetail" Text="不会改聊天记录，服务器保持只读。"
                                                Foreground="#BBD1D6" FontSize="13" Margin="0,7,0,0" TextWrapping="Wrap"/>
@@ -759,6 +759,92 @@
                             </Grid>
                         </Border>
 
+                        <Border Background="#7410262E" BorderBrush="#9AC99747" BorderThickness="1.5"
+                                CornerRadius="12" Padding="20" Margin="0,0,10,18">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="AI 统一中转站 API" Foreground="White" FontSize="21" FontWeight="Bold"/>
+                                        <TextBlock x:Name="HomeUnifiedGatewayStatusText" Text="正在读取本机中转站状态…"
+                                                   Foreground="#AEEBD6" FontSize="13" FontWeight="SemiBold" Margin="0,7,0,0"/>
+                                    </StackPanel>
+                                    <Border Grid.Column="1" Background="#244E4432" BorderBrush="#71C99747" BorderThickness="1"
+                                            CornerRadius="15" Padding="11,6" VerticalAlignment="Center">
+                                        <TextBlock Text="主功能" Foreground="#F0D49B" FontSize="11" FontWeight="Bold"/>
+                                    </Border>
+                                </Grid>
+
+                                <TextBlock Text="统一 Base URL" Foreground="#E9DFC3" FontSize="12" Margin="0,15,0,4"/>
+                                <TextBlock x:Name="HomeUnifiedGatewayUrlText" Text="http://127.0.0.1:10110/v1"
+                                           Foreground="#79DDBA" FontFamily="{StaticResource CodeFont}" FontSize="14" FontWeight="SemiBold"/>
+                                <Grid Margin="0,12,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="16"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Border Background="#3510272E" BorderBrush="#4779A99E" BorderThickness="1" CornerRadius="8" Padding="12">
+                                        <StackPanel>
+                                            <TextBlock Text="Responses API" Foreground="#DDEBE7" FontSize="11"/>
+                                            <TextBlock x:Name="HomeResponsesEndpointText" Text="http://127.0.0.1:10110/v1/responses"
+                                                       Foreground="#A9CFC8" FontFamily="{StaticResource CodeFont}" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Border Grid.Column="2" Background="#3510272E" BorderBrush="#4779A99E" BorderThickness="1" CornerRadius="8" Padding="12">
+                                        <StackPanel>
+                                            <TextBlock Text="Chat Completions API" Foreground="#DDEBE7" FontSize="11"/>
+                                            <TextBlock x:Name="HomeChatEndpointText" Text="http://127.0.0.1:10110/v1/chat/completions"
+                                                       Foreground="#A9CFC8" FontFamily="{StaticResource CodeFont}" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <TextBlock x:Name="HomeModelsEndpointText" Text="模型目录：http://127.0.0.1:10110/v1/models"
+                                           Foreground="#8FAEB4" FontFamily="{StaticResource CodeFont}" FontSize="11" Margin="0,9,0,0" TextWrapping="Wrap"/>
+                                <TextBlock Text="Codex Pro/Plus 授权池通过 codex-auto/模型 或 cli/号池/模型路由；Grok、Claude、Gemini 等通过下面的官方 API URL 模板接入。"
+                                           Foreground="#BCD4D1" FontSize="12" Margin="0,11,0,0" TextWrapping="Wrap"/>
+
+                                <WrapPanel Margin="0,15,0,0">
+                                    <Button Style="{StaticResource PrimaryButton}" Content="启动 / 同步中转站" Padding="15,9" Margin="0,0,9,0"
+                                            Click="StartHomeGatewayButton_Click"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="管理模型与线路" Padding="15,9" Margin="0,0,9,0"
+                                            Click="AccountsNavButton_Click"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="添加上游 API" Padding="14,9" Margin="0,0,9,0"
+                                            Click="GoToAddButton_Click"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="复制 Base URL" Padding="14,9" Margin="0,0,9,0"
+                                            Click="CopyHomeGatewayUrlButton_Click"/>
+                                    <Button Style="{StaticResource SecondaryButton}" Content="复制 API Key" Padding="14,9"
+                                            Click="CopyHomeGatewayKeyButton_Click"/>
+                                </WrapPanel>
+
+                                <Expander Header="查看内置上游 API 与 URL" Foreground="#D6E5E1" FontSize="13" Margin="0,16,0,0" IsExpanded="False">
+                                    <ItemsControl x:Name="HomeProviderPresetsList" Margin="0,10,0,0">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate><UniformGrid Columns="2"/></ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Background="#3210272E" BorderBrush="#4779A99E" BorderThickness="1"
+                                                        CornerRadius="8" Padding="12" Margin="0,0,10,10">
+                                                    <StackPanel>
+                                                        <TextBlock Text="{Binding DisplayName}" Foreground="#F0E9D6" FontWeight="SemiBold" FontSize="12"/>
+                                                        <TextBlock Text="{Binding BaseUrl}" Foreground="#79DDBA" FontFamily="{StaticResource CodeFont}"
+                                                                   FontSize="10" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                                                        <TextBlock Text="{Binding ProtocolText}" Foreground="#8FAEB4" FontSize="10" Margin="0,4,0,0"/>
+                                                        <TextBlock Text="{Binding Summary}" Foreground="#AFC7C8" FontSize="10" Margin="0,5,0,0"
+                                                                   TextWrapping="Wrap" MaxHeight="34"/>
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </Expander>
+                            </StackPanel>
+                        </Border>
+
                         <Border Background="#7410262E" BorderBrush="#9A79DDBA" BorderThickness="1.5"
                                 CornerRadius="12" Padding="20" Margin="0,0,10,18">
                             <Grid>
@@ -767,13 +853,13 @@
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel Margin="0,0,24,0">
-                                    <TextBlock Text="Codex 一键网关" Foreground="White" FontSize="20" FontWeight="Bold"/>
+                                    <TextBlock Text="可选功能 · Codex 接入" Foreground="White" FontSize="20" FontWeight="Bold"/>
                                     <TextBlock x:Name="HomeCodexConnectionStatusText" Text="正在安全读取网关…"
                                                Foreground="#AEEBD6" FontSize="14" FontWeight="SemiBold" Margin="0,8,0,0"/>
                                     <TextBlock Text="当前 Codex 网关" Foreground="#E9DFC3" FontSize="12" Margin="0,13,0,4"/>
                                     <TextBlock x:Name="HomeCurrentCodexGatewayText" Text="正在读取…" Foreground="White"
                                                FontFamily="{StaticResource CodeFont}" FontSize="12" TextWrapping="Wrap"/>
-                                    <TextBlock Text="点连接后 / 点断开后" Foreground="#E9DFC3" FontSize="12" Margin="0,11,0,4"/>
+                                    <TextBlock Text="接入中转站后 / 取消接入后" Foreground="#E9DFC3" FontSize="12" Margin="0,11,0,4"/>
                                     <TextBlock x:Name="HomeManagedCodexGatewayText" Text="http://127.0.0.1:10100/v1" Foreground="#79DDBA"
                                                FontFamily="{StaticResource CodeFont}" FontSize="12" TextWrapping="Wrap"/>
                                     <TextBlock x:Name="HomeCodexConnectionDetailText"
@@ -782,7 +868,7 @@
                                 </StackPanel>
                                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="245">
                                     <Button x:Name="HomeToggleCodexConnectionButton" Style="{StaticResource PrimaryButton}"
-                                            Content="一键连接 Codex 使用总管家" Padding="15,12"
+                                             Content="一键让 Codex 接入中转站" Padding="15,12"
                                             Click="ToggleCodexConnectionButton_Click"/>
                                     <TextBlock Text="默认断开 · 不会自动关闭或重启 Codex" Foreground="#8FAEB4" FontSize="11"
                                                Margin="0,8,0,0" TextAlignment="Center" TextWrapping="Wrap"/>
@@ -1117,7 +1203,7 @@
                                             Padding="14,9" Margin="0,0,10,0" Click="GoToAddButton_Click"/>
                                     <Button Style="{StaticResource SecondaryButton}" Content="刷新实际路由"
                                             Padding="14,9" Margin="0,0,10,0" Click="RefreshButton_Click"/>
-                                    <Button Style="{StaticResource SecondaryButton}" Content="去中转站切官方 Pro"
+                                    <Button Style="{StaticResource SecondaryButton}" Content="回到 Codex 官方模型"
                                             Padding="14,9" Click="UseOfficialDirectButton_Click"/>
                                 </StackPanel>
                             </Grid>
@@ -1313,6 +1399,8 @@
                                                 <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="15"/>
                                                 <TextBlock Text="{Binding BaseUrl}" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,5,0,0"/>
                                                 <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource Success}" FontSize="12" Margin="0,4,0,0"/>
+                                                <TextBlock Text="{Binding HealthDetail}" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,4,0,0"
+                                                           TextWrapping="Wrap" MaxWidth="650"/>
                                                 <ItemsControl ItemsSource="{Binding QuotaWindows}" Margin="0,10,0,0">
                                                     <ItemsControl.ItemTemplate>
                                                         <DataTemplate>
@@ -1340,6 +1428,8 @@
                                                 <TextBlock Text="{Binding UsageText}" Foreground="#9FC6BC" FontSize="12" Margin="0,5,0,0" TextWrapping="Wrap"/>
                                             </StackPanel>
                                             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                                <Button Style="{StaticResource SecondaryButton}" Content="复制调用示例" Padding="12,8"
+                                                        Margin="0,0,8,0" Tag="{Binding Id}" Click="CopyProviderExampleButton_Click"/>
                                                 <Button Style="{StaticResource SecondaryButton}" Content="测试" Padding="12,8"
                                                         Margin="0,0,8,0" Tag="{Binding Id}" Click="TestProviderButton_Click"/>
                                                 <Button Style="{StaticResource SecondaryButton}" Content="编辑" Padding="12,8"
@@ -1557,13 +1647,13 @@
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel Margin="0,0,24,0">
-                                    <TextBlock Text="Codex 连接开关" Foreground="White" FontSize="20" FontWeight="Bold"/>
+                                    <TextBlock Text="Codex 接入开关" Foreground="White" FontSize="20" FontWeight="Bold"/>
                                     <TextBlock x:Name="CodexConnectionStatusText" Text="正在安全读取网关…"
                                                Foreground="#AEEBD6" FontSize="14" FontWeight="SemiBold" Margin="0,8,0,0"/>
                                     <TextBlock Text="当前 Codex 网关" Foreground="#E9DFC3" FontSize="12" Margin="0,13,0,4"/>
                                     <TextBlock x:Name="CurrentCodexGatewayText" Text="正在读取…" Foreground="White"
                                                FontFamily="{StaticResource CodeFont}" FontSize="12" TextWrapping="Wrap"/>
-                                    <TextBlock Text="连接总管家后 / 取消连接后" Foreground="#E9DFC3" FontSize="12" Margin="0,11,0,4"/>
+                                    <TextBlock Text="接入中转站后 / 取消接入后" Foreground="#E9DFC3" FontSize="12" Margin="0,11,0,4"/>
                                     <TextBlock x:Name="ManagedCodexGatewayText" Text="http://127.0.0.1:10100/v1" Foreground="#79DDBA"
                                                FontFamily="{StaticResource CodeFont}" FontSize="12" TextWrapping="Wrap"/>
                                     <TextBlock x:Name="CodexConnectionDetailText"
@@ -1572,7 +1662,7 @@
                                 </StackPanel>
                                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="245">
                                     <Button x:Name="ToggleCodexConnectionButton" Style="{StaticResource PrimaryButton}"
-                                            Content="一键连接 Codex 使用总管家" Padding="15,10"
+                                             Content="一键让 Codex 接入中转站" Padding="15,10"
                                             Click="ToggleCodexConnectionButton_Click"/>
                                     <TextBlock Text="不会自动关闭或重启 Codex" Foreground="#8FAEB4" FontSize="11"
                                                Margin="0,8,0,0" TextAlignment="Center" TextWrapping="Wrap"/>
@@ -1750,10 +1840,10 @@
                     <StackPanel Margin="30,26,24,38">
                         <Border x:Name="FirstRunGuidePanel" Style="{StaticResource HeroGlassCard}">
                             <StackPanel>
-                                <TextBlock Text="第一次使用总管家" Style="{StaticResource CloudTitleText}" FontSize="21"/>
-                                <TextBlock Text="先确认三件事：默认不连接 Codex；账号和密钥只保存在本机；候选版更新必须由你手动确认。"
+                                <TextBlock Text="第一次使用 AI 中转站" Style="{StaticResource CloudTitleText}" FontSize="21"/>
+                                <TextBlock Text="先确认三件事：中转站可独立使用；Codex 默认不接入；账号和密钥只保存在本机。候选版更新必须由你手动确认。"
                                            Foreground="#D5E5E1" FontSize="13" Margin="0,9,0,0" TextWrapping="Wrap"/>
-                                <TextBlock Text="1. 先在中转站添加来源并测试。&#x0a;2. 需要时才在首页点击一键连接 Codex。&#x0a;3. 出错先到本页复制诊断摘要，不要粘贴真实 Cookie、Token 或 API Key。"
+                                <TextBlock Text="1. 先添加上游 API，再启动 / 同步中转站。&#x0a;2. 需要 Codex 时，才点一键让 Codex 接入中转站。&#x0a;3. 出错先到本页复制诊断摘要，不要粘贴真实 Cookie、Token 或 API Key。"
                                            Foreground="#AFC9C6" FontSize="12" Margin="0,13,0,14" TextWrapping="Wrap"/>
                                 <Button x:Name="CompleteFirstRunButton" Style="{StaticResource PrimaryButton}"
                                         Content="我知道了，完成首次设置" HorizontalAlignment="Left"
@@ -1830,6 +1920,26 @@
                                             Content="打开 Release 页面" IsEnabled="False" Margin="0,8,0,0"
                                             Click="OpenProductReleaseButton_Click"/>
                                 </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <Border Style="{StaticResource PageCard}">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="第三方组件版本" FontSize="19" FontWeight="Bold"/>
+                                    <TextBlock Text="只读取 OpenCodex、CLIProxyAPI 和 Dream Skin 的公开正式 Release。不会下载、安装或覆盖任何组件。"
+                                               Foreground="{StaticResource Muted}" FontSize="12" Margin="0,7,18,0" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="ThirdPartyComponentStatusText"
+                                               Text="内置状态：OpenCodex 为 C# 迁移基线；CLIProxyAPI 7.2.135；Dream Skin 1.5.14。尚未联网复查上游。"
+                                               Foreground="#AFC9C6" FontSize="12" Margin="0,10,18,0" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <Button x:Name="CheckThirdPartyUpdatesButton" Grid.Column="1"
+                                        Style="{StaticResource SecondaryButton}" Content="检查组件版本"
+                                        VerticalAlignment="Center" Click="CheckThirdPartyUpdatesButton_Click"/>
                             </Grid>
                         </Border>
 

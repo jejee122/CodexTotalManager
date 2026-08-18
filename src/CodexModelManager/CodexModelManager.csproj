@@ -3,6 +3,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <RuntimeFrameworkVersion>10.0.11</RuntimeFrameworkVersion>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -11,15 +12,15 @@
     <RootNamespace>CodexModelManager</RootNamespace>
     <ApplicationIcon>Resources\Brand\CodexTotalManager-v4.ico</ApplicationIcon>
     <!-- Keep the desktop payload, assembly metadata and deployment evidence on one version. -->
-    <Version>3.0.0-rc.28</Version>
+    <Version>3.0.0-rc.29</Version>
     <AssemblyVersion>3.0.0.0</AssemblyVersion>
-    <FileVersion>3.0.0.28</FileVersion>
+    <FileVersion>3.0.0.29</FileVersion>
     <InformationalVersion>$(Version)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <AssemblyTitle>Codex 总管家</AssemblyTitle>
-    <Product>Codex 总管家</Product>
-    <Description>统一管理 Codex 号池、模型、皮肤、本机服务、服务器状态与自定义插件。</Description>
-    <CliProxyApiExpectedSha256>BD3456675B98CFF406B600D1361F1441879220CAD2DD4083B63409A09210629B</CliProxyApiExpectedSha256>
+    <AssemblyTitle>AI 中转站总管家</AssemblyTitle>
+    <Product>AI 中转站总管家</Product>
+    <Description>统一管理 AI 上游 API、模型线路、调用方、账号池与可选的 Codex 接入。</Description>
+    <CliProxyApiExpectedSha256>0A8FFC52DFB2A466BAA1B006341B350BDB1F76FC70B6CC80375BB99AFDFF697B</CliProxyApiExpectedSha256>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <DebugType>none</DebugType>
@@ -53,6 +54,11 @@
              CopyToPublishDirectory="PreserveNewest"
              ExcludeFromSingleFile="true" />
     <Content Include="Resources\CodexDreamSkin\**\*"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+    <Content Include="..\..\THIRD-PARTY-NOTICES.md"
+             Link="THIRD-PARTY-NOTICES.md"
              CopyToOutputDirectory="PreserveNewest"
              CopyToPublishDirectory="PreserveNewest"
              ExcludeFromSingleFile="true" />

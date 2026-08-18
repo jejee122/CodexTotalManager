@@ -3,7 +3,7 @@
 This file separates a usable Windows application shell from Codex-specific business acceptance.
 Passing source tests never upgrades a candidate to a stable release by itself.
 
-## Implemented in 3.0.0-rc.28 source
+## Implemented in 3.0.0-rc.29 source
 
 - single-instance desktop process;
 - global crash capture, local rotation and credential redaction;
@@ -21,7 +21,7 @@ Passing source tests never upgrades a candidate to a stable release by itself.
 
 ## Still required before a stable Windows release
 
-- produce a new rc.28 candidate package from a clean, reproducible source revision;
+- verify and publish the exact rc.29 candidate package from a clean, reproducible source revision;
 - validate install, upgrade, rollback and uninstall on a separate clean Windows test computer;
 - complete the hash-bound real Codex acceptance matrix;
 - verify current Codex model catalog, official/third-party tool calls, conversation continuity,

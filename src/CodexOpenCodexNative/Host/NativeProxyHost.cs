@@ -844,6 +844,7 @@ public sealed class NativeProxyHost
             }
             var officialPassThrough = route.Provider.Adapter == "openai-responses"
                                       && OpenAiResponsesAdapter.IsOfficialCodexProvider(route.Provider);
+            var continuationScope = BuildContinuationScope(context, route.ProviderId, route.ModelId);
             if (!locallyAdmitted
                 && !officialPassThrough
                 && !codexSessionAdmission.Contains(context))
@@ -861,6 +862,7 @@ public sealed class NativeProxyHost
             {
                 if (!continuationStore.TryExpand(
                         parsed.PreviousResponseId,
+                        continuationScope,
                         parsed.Messages,
                         out var expandedMessages))
                 {
@@ -899,7 +901,10 @@ public sealed class NativeProxyHost
                     context.Response.ContentType = "application/json; charset=utf-8";
                     await context.Response.WriteAsync(result.JsonBody ?? "{}", ct);
                     if (result.StatusCode is >= 200 and < 300 && !officialPassThrough)
-                        continuationStore.SaveFromResponseJson(result.JsonBody, parsed.Messages);
+                        continuationStore.SaveFromResponseJson(
+                            result.JsonBody,
+                            continuationScope,
+                            parsed.Messages);
                 }
                 else
                 {
@@ -922,9 +927,16 @@ public sealed class NativeProxyHost
                             finishReason);
                         context.Response.ContentType = "application/json; charset=utf-8";
                         await context.Response.WriteAsync(responseJson.ToJsonString(), ct);
-                        continuationStore.SaveFromResponseJson(responseJson.ToJsonString(), parsed.Messages);
                         usage = upstreamUsage;
                         status = IsIncompleteFinishReason(finishReason) ? "incomplete" : "completed";
+                        if (status == "completed" && message is not null)
+                        {
+                            continuationStore.Save(
+                                responseJson["id"]?.GetValue<string>(),
+                                continuationScope,
+                                parsed.Messages,
+                                new[] { message });
+                        }
                     }
                 }
                 sw.Stop();
@@ -977,10 +989,14 @@ public sealed class NativeProxyHost
             {
                 await context.Response.WriteAsync(frame, ct);
             }
-            continuationStore.Save(
-                bridgeStream.ResponseId,
-                parsed.Messages,
-                bridgeStream.GetContinuationMessages());
+            if (bridgeStream.Status == "completed")
+            {
+                continuationStore.Save(
+                    bridgeStream.ResponseId,
+                    continuationScope,
+                    parsed.Messages,
+                    bridgeStream.GetContinuationMessages());
+            }
             sw.Stop();
             _requestLog.Record(new RequestLogEntry
             {
@@ -1419,6 +1435,48 @@ public sealed class NativeProxyHost
                 headers[name] = value.ToString();
         }
         return headers;
+    }
+
+    private static ContinuationScope BuildContinuationScope(
+        HttpContext context,
+        string providerId,
+        string modelId)
+    {
+        string[] stableIdentityHeaders =
+        [
+            "session_id",
+            "session-id",
+            "thread-id",
+            "x-codex-parent-thread-id",
+            "x-codex-window-id",
+            "x-codex-installation-id"
+        ];
+        var identity = new StringBuilder();
+        foreach (var headerName in stableIdentityHeaders)
+        {
+            if (!context.Request.Headers.TryGetValue(headerName, out var value)
+                || string.IsNullOrWhiteSpace(value))
+                continue;
+            identity.Append(headerName.ToLowerInvariant())
+                .Append(':')
+                .Append(value.ToString().Trim())
+                .Append('\n');
+        }
+
+        // Non-Codex clients may not send a task header. Fall back to the
+        // presented admission credential, but retain only a one-way digest.
+        if (identity.Length == 0)
+        {
+            var admission = context.Request.Headers["X-CMM-Admission"].ToString();
+            var authorization = context.Request.Headers.Authorization.ToString();
+            identity.Append(!string.IsNullOrWhiteSpace(admission) ? admission : authorization);
+        }
+        if (identity.Length == 0)
+            identity.Append("anonymous-loopback");
+
+        var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(identity.ToString())));
+        return ContinuationScope.Create(providerId, modelId, digest);
     }
 
     private static async Task<string> ReadRawBodyAsync(HttpContext context)

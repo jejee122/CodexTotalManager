@@ -3,8 +3,8 @@
 
   常用命令：
     .\build.ps1 -Release
-.\build.ps1 -Publish -Version 3.0.0-rc.28
-.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.28
+    .\build.ps1 -Publish -Version 3.0.0-rc.29
+.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.29
 
   -Publish 会先运行安全测试和集成自检，再生成 win-x64 自包含候选包；
   不安装、不启动总管家，也不会启动 Codex。
@@ -31,8 +31,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $requiredSdk = '10.0.302'
-$expectedCliProxySha256 = 'BD3456675B98CFF406B600D1361F1441879220CAD2DD4083B63409A09210629B'
-$expectedCliProxyVersion = '7.2.104'
+$expectedCliProxySha256 = '0A8FFC52DFB2A466BAA1B006341B350BDB1F76FC70B6CC80375BB99AFDFF697B'
+$expectedCliProxyVersion = '7.2.135'
 $temporaryInputRoot = $null
 
 function Resolve-DotNet {
@@ -167,7 +167,7 @@ $runTests = $Test -or $Publish
 
 if ($runTests) {
   $existingCliProxy = Join-Path $repoRoot 'out\publish\Resources\CLIProxyAPI\cli-proxy-api.exe'
-  $workspaceCliProxy = Join-Path (Split-Path -Parent $repoRoot) '.tools\CLIProxyAPI-7.2.104\cli-proxy-api.exe'
+  $workspaceCliProxy = Join-Path (Split-Path -Parent $repoRoot) '.tools\CLIProxyAPI-7.2.135\cli-proxy-api.exe'
   if ([string]::IsNullOrWhiteSpace($CliProxyApiArtifactPath) -and (Test-Path -LiteralPath $existingCliProxy -PathType Leaf)) {
     $CliProxyApiArtifactPath = $existingCliProxy
   }

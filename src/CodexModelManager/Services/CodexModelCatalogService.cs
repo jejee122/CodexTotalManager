@@ -48,8 +48,8 @@ public sealed class CodexModelCatalogService
                     ? slug
                     : model.DisplayName!.Trim(),
                 ["description"] = model.IsOfficial
-                    ? "OpenAI official model routed through Codex Total Manager."
-                    : $"{model.ProviderLabel} model routed locally by Codex Total Manager.",
+                ? "OpenAI official model routed through AI Gateway Manager."
+                : $"{model.ProviderLabel} model routed locally by AI Gateway Manager.",
                 ["default_reasoning_level"] = "medium",
                 ["supported_reasoning_levels"] = new JsonArray
                 {

@@ -14,6 +14,15 @@ public sealed record ProviderPreset(
     string Summary)
 {
     public bool IsCustom => Id.Equals("custom", StringComparison.OrdinalIgnoreCase);
+
+    public string ProtocolText => Adapter switch
+    {
+        "openai-responses" => "OpenAI Responses",
+        "openai-chat" => "OpenAI Chat Completions",
+        "anthropic" => "Anthropic Messages",
+        "google" => "Google Generative Language",
+        _ => Adapter
+    };
 }
 
 public static class ProviderPresetCatalog
@@ -28,6 +37,14 @@ public static class ProviderPresetCatalog
             "openai-chat",
             128_000,
             "适合 LiteLLM、New API、One API、LocalAI 和其他 OpenAI 兼容地址；URL 由你填写。"),
+        new(
+            "openai-api",
+            "OpenAI API（开发者平台）",
+            "OpenAI API",
+            "https://api.openai.com/v1",
+            "openai-responses",
+            128_000,
+            "使用 OpenAI 开发者平台 API Key；它与 ChatGPT/Codex 套餐登录相互独立。"),
         new(
             "xai",
             "xAI Grok（官方 API）",

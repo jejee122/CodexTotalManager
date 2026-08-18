@@ -1,6 +1,6 @@
 # Account usage ledger retention
 
-The account-usage store is intentionally append-only in `3.0.0-rc.28`.
+The account-usage store is intentionally append-only in `3.0.0-rc.29`.
 Monthly files are partitions, not disposable logs. They are the durable source
 for all of the following:
 

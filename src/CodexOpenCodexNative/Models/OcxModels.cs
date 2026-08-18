@@ -18,6 +18,9 @@ public sealed class OcxToolCall
     [JsonPropertyName("id")] public string? Id { get; set; }
     [JsonPropertyName("type")] public string Type { get; set; } = "function";
     [JsonPropertyName("function")] public OcxToolCallFunction? Function { get; set; }
+    [JsonPropertyName("thought_signature")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ThoughtSignature { get; set; }
 }
 
 public sealed class OcxToolCallFunction

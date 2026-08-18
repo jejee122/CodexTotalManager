@@ -71,6 +71,7 @@ public sealed class AdapterEvent
     public string? CallId { get; init; }
     public string? FunctionName { get; init; }
     public string? Arguments { get; init; }
+    public string? ThoughtSignature { get; init; }
     public int ToolCallIndex { get; init; }
 }
 

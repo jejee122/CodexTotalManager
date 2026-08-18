@@ -59,6 +59,30 @@ public partial class MainWindow
         }
     }
 
+    private void CopyProviderExampleButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_busy || sender is not Button { Tag: string providerId }) return;
+        var provider = _providers.FirstOrDefault(item =>
+            item.Id.Equals(providerId, StringComparison.OrdinalIgnoreCase));
+        if (provider is null) return;
+
+        try
+        {
+            var model = _allCustomModels.FirstOrDefault(item =>
+                    item.Provider.Equals(provider.Id, StringComparison.OrdinalIgnoreCase)
+                    && !item.Disabled)
+                ?.Namespaced;
+            if (string.IsNullOrWhiteSpace(model)) model = $"{provider.Id}/<MODEL_ID>";
+            Clipboard.SetText(_services.UnifiedGateway.BuildSafePowerShellExample(model));
+            FooterMessage.Text =
+                $"已复制 {provider.DisplayName} 的本机中转站调用示例。密钥位置是占位符，不包含真实 API Key，也没有发送请求或启动中转站。";
+        }
+        catch (Exception ex)
+        {
+            FooterMessage.Text = $"调用示例没有复制：{FriendlyError(ex)}";
+        }
+    }
+
     private void EditProviderButton_Click(object sender, RoutedEventArgs e)
     {
         if (_busy || sender is not Button { Tag: string providerId }) return;
@@ -372,7 +396,7 @@ public partial class MainWindow
     {
         if (_busy) return;
         ShowAccountsPage();
-        FooterMessage.Text = "请在中转站顶部点“回到官方 Pro”；它会切回官方线路和默认模型。当前任务仍由你在 Codex 自己的模型菜单中选择，总管家不会自动点击或重启 Codex。";
+        FooterMessage.Text = "请在模型与线路页点“回到官方 Pro”；它会切回官方线路和默认模型。当前任务仍由你在 Codex 自己的模型菜单中选择，软件不会自动点击或重启 Codex。";
     }
 
     private static string FormatUptime(TimeSpan? uptime)

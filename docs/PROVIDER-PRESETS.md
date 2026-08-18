@@ -1,6 +1,6 @@
 # Provider presets and gateway boundary
 
-Provider presets are source-controlled metadata inside Codex Total Manager.
+Provider presets are source-controlled metadata inside AI Gateway Manager.
 They are not downloaded plugins, embedded third-party services or background
 containers. Selecting a preset only fills a public endpoint, adapter type and
 conservative context-window value. The user must supply the provider's own API
@@ -10,6 +10,7 @@ key, which is stored through the existing Windows CurrentUser secret store.
 
 | Preset | Endpoint | Native adapter |
 | --- | --- | --- |
+| OpenAI API | `https://api.openai.com/v1` | OpenAI Responses |
 | xAI Grok | `https://api.x.ai/v1` | OpenAI Responses |
 | OpenRouter | `https://openrouter.ai/api/v1` | OpenAI Chat |
 | DeepSeek | `https://api.deepseek.com/v1` | OpenAI Chat |
@@ -23,7 +24,8 @@ key, which is stored through the existing Windows CurrentUser secret store.
 | Together AI | `https://api.together.xyz/v1` | OpenAI Chat |
 
 Model discovery uses the provider's model-list endpoint before anything is
-saved. Anthropic and Google use their native authentication headers. Other
+saved. The OpenAI developer API key is separate from a ChatGPT or Codex plan
+login. Anthropic and Google use their native authentication headers. Other
 presets use an OpenAI-compatible Bearer header. Remote HTTP, URL credentials,
 queries and fragments are rejected; only HTTPS or an explicit loopback HTTP
 address is accepted.
@@ -52,7 +54,7 @@ the same model name from being selected by dictionary order.
 
 No code, executable, OAuth credential, browser cookie or installation script
 from those repositories is bundled by this feature. The integration is a C#
-implementation using the Total Manager's existing adapters and security model.
+implementation using AI Gateway Manager's existing adapters and security model.
 
 ## Deliberate exclusions
 

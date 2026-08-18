@@ -3,16 +3,17 @@
     <!-- This assembly uses CurrentUser DPAPI and is intentionally Windows-only. -->
     <TargetFramework>net10.0-windows</TargetFramework>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <RuntimeFrameworkVersion>10.0.11</RuntimeFrameworkVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>CodexOpenCodexNative</RootNamespace>
     <AssemblyName>CodexOpenCodexNative</AssemblyName>
     <Version>0.1.0</Version>
-    <Description>Codex 总管家本机代理内核。</Description>
+    <Description>AI 中转站总管家的本机代理内核。</Description>
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.11" />
     <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
   </ItemGroup>
 </Project>

@@ -26,7 +26,7 @@ public partial class App : Application
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
             MessageBox.Show(
                 "这个安装是独立开发版，只允许打开界面。Native Engine、统一网关、自检和外部工人命令全部被锁定。",
-                "Codex 总管家 - 独立开发版",
+                "AI 中转站总管家 - 独立开发版",
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);
             Shutdown(64);
@@ -405,8 +405,8 @@ public partial class App : Application
         if (!createdNew)
         {
             MessageBox.Show(
-                "Codex 总管家已经打开了，请使用原来的窗口。",
-                "Codex 总管家",
+                "AI 中转站总管家已经打开了，请使用原来的窗口。",
+                "AI 中转站总管家",
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);
             _singleInstanceMutex.Dispose();
@@ -606,7 +606,7 @@ public partial class App : Application
         {
             MessageBox.Show(
                 "总管家遇到意外错误，已安全停止。错误记录已写入本地 diagnostics 文件夹，请重开软件；如果反复出现，请保留该记录用于排查。",
-                "Codex 总管家遇到错误",
+                "AI 中转站总管家遇到错误",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
         }

@@ -87,8 +87,8 @@ if (-not $ownedInstallation) {
 if ($Interactive -and -not $PurgeRuntimeData) {
     Add-Type -AssemblyName System.Windows.Forms
     $choice = [Windows.Forms.MessageBox]::Show(
-        "要卸载 Codex 总管家吗？`n`n是：只删除软件，保留账号、号池、账本、密钥、皮肤和设置。`n否：继续确认是否连用户数据一起彻底删除。`n取消：不做任何改动。",
-        '卸载 Codex 总管家',
+        "要卸载 AI 中转站总管家吗？`n`n是：只删除软件，保留账号、号池、账本、密钥、皮肤和设置。`n否：继续确认是否连用户数据一起彻底删除。`n取消：不做任何改动。",
+        '卸载 AI 中转站总管家',
         [Windows.Forms.MessageBoxButtons]::YesNoCancel,
         [Windows.Forms.MessageBoxIcon]::Question,
         [Windows.Forms.MessageBoxDefaultButton]::Button1)
@@ -161,12 +161,18 @@ function Remove-OwnedShortcut([string]$ShortcutPath) {
     }
 }
 
-$startMenuFolder = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex 总管家'
-Remove-OwnedShortcut (Join-Path $startMenuFolder 'Codex 总管家.lnk')
-Remove-OwnedShortcut (Join-Path $startMenuFolder '卸载 Codex 总管家.lnk')
-if ((Test-Path -LiteralPath $startMenuFolder -PathType Container) -and
-    (Get-ChildItem -LiteralPath $startMenuFolder -Force | Measure-Object).Count -eq 0) {
-    Remove-Item -LiteralPath $startMenuFolder -Force
+$programsFolder = [Environment]::GetFolderPath('Programs')
+foreach ($startMenuSpec in @(
+    [pscustomobject]@{ Folder = 'AI 中转站总管家'; Open = 'AI 中转站总管家.lnk'; Uninstall = '卸载 AI 中转站总管家.lnk' },
+    [pscustomobject]@{ Folder = 'Codex 总管家'; Open = 'Codex 总管家.lnk'; Uninstall = '卸载 Codex 总管家.lnk' }
+)) {
+    $startMenuFolder = Join-Path $programsFolder $startMenuSpec.Folder
+    Remove-OwnedShortcut (Join-Path $startMenuFolder $startMenuSpec.Open)
+    Remove-OwnedShortcut (Join-Path $startMenuFolder $startMenuSpec.Uninstall)
+    if ((Test-Path -LiteralPath $startMenuFolder -PathType Container) -and
+        (Get-ChildItem -LiteralPath $startMenuFolder -Force | Measure-Object).Count -eq 0) {
+        Remove-Item -LiteralPath $startMenuFolder -Force
+    }
 }
 
 if (Test-Path -LiteralPath $uninstallRegistryPath) {
@@ -201,19 +207,21 @@ foreach ($target in $programTargets) {
     if (Test-Path -LiteralPath $targetFull) { Remove-Item -LiteralPath $targetFull -Recurse -Force }
 }
 
-# Remove only shortcuts that both use the Total Manager name and resolve back to this
-# exact installation root. A similarly named user shortcut to another program is kept.
+# Remove only new-name or legacy-name shortcuts that resolve back to this exact
+# installation root. A similarly named user shortcut to another program is kept.
 foreach ($desktopFolder in @(
     [Environment]::GetFolderPath('DesktopDirectory'),
     [Environment]::GetFolderPath('CommonDesktopDirectory')
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) {
     $desktopFull = [IO.Path]::GetFullPath($desktopFolder).TrimEnd('\')
-    foreach ($shortcut in @(Get-ChildItem -LiteralPath $desktopFull -Filter 'Codex 总管家*.lnk' -File -ErrorAction SilentlyContinue)) {
-        $shortcutFull = [IO.Path]::GetFullPath($shortcut.FullName)
-        if (-not $shortcutFull.StartsWith($desktopFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            throw "快捷方式越过桌面目录：$shortcutFull"
+    foreach ($shortcutPattern in @('AI 中转站总管家*.lnk', 'Codex 总管家*.lnk')) {
+        foreach ($shortcut in @(Get-ChildItem -LiteralPath $desktopFull -Filter $shortcutPattern -File -ErrorAction SilentlyContinue)) {
+            $shortcutFull = [IO.Path]::GetFullPath($shortcut.FullName)
+            if (-not $shortcutFull.StartsWith($desktopFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw "快捷方式越过桌面目录：$shortcutFull"
+            }
+            Remove-OwnedShortcut $shortcutFull
         }
-        Remove-OwnedShortcut $shortcutFull
     }
 }
 

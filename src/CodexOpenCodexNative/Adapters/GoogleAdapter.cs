@@ -112,7 +112,8 @@ public sealed class GoogleAdapter : IProviderAdapter
                             Arguments = functionCall.TryGetProperty("args", out var args)
                                 ? args.GetRawText()
                                 : "{}"
-                        }
+                        },
+                        ThoughtSignature = ReadString(part, "thoughtSignature")
                     });
                 }
             }
@@ -192,14 +193,17 @@ public sealed class GoogleAdapter : IProviderAdapter
                         parts.Add(new JsonObject { ["text"] = text });
                     foreach (var call in message.ToolCalls)
                     {
-                        parts.Add(new JsonObject
+                        var functionCallPart = new JsonObject
                         {
                             ["functionCall"] = new JsonObject
                             {
                                 ["name"] = call.Function?.Name ?? string.Empty,
                                 ["args"] = ParseArguments(call.Function?.Arguments)
                             }
-                        });
+                        };
+                        if (!string.IsNullOrWhiteSpace(call.ThoughtSignature))
+                            functionCallPart["thoughtSignature"] = call.ThoughtSignature;
+                        parts.Add(functionCallPart);
                     }
                     contents.Add(new JsonObject { ["role"] = "model", ["parts"] = parts });
                     break;
@@ -400,6 +404,7 @@ public sealed class GoogleAdapter : IProviderAdapter
                         var arguments = functionCall.TryGetProperty("args", out var args)
                             ? args.GetRawText()
                             : "{}";
+                        var thoughtSignature = ReadString(part, "thoughtSignature");
                         sawToolCall = true;
                         yield return new AdapterEvent
                         {
@@ -407,7 +412,8 @@ public sealed class GoogleAdapter : IProviderAdapter
                             ToolCallIndex = index,
                             CallId = callId,
                             FunctionName = name,
-                            Arguments = arguments
+                            Arguments = arguments,
+                            ThoughtSignature = thoughtSignature
                         };
                         yield return new AdapterEvent
                         {
@@ -415,7 +421,8 @@ public sealed class GoogleAdapter : IProviderAdapter
                             ToolCallIndex = index,
                             CallId = callId,
                             FunctionName = name,
-                            Arguments = arguments
+                            Arguments = arguments,
+                            ThoughtSignature = thoughtSignature
                         };
                     }
                 }

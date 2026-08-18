@@ -14,8 +14,8 @@ namespace CodexModelManager.Services;
 
 public sealed class CliProxyPoolService
 {
-    public const string BundledVersion = "7.2.104";
-    public const string BundledSha256 = "BD3456675B98CFF406B600D1361F1441879220CAD2DD4083B63409A09210629B";
+    public const string BundledVersion = "7.2.135";
+    public const string BundledSha256 = "0A8FFC52DFB2A466BAA1B006341B350BDB1F76FC70B6CC80375BB99AFDFF697B";
 
     private readonly AppSettingsService _settings;
     private readonly SecretStore _secrets;
