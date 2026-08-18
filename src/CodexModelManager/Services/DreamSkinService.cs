@@ -14,13 +14,27 @@ public sealed class DreamSkinService
     private const int DreamSkinPort = 9335;
     private const string ManagerScriptHash = "04DC2EA5069DF71619E2CD1D782C850C9B4DB92E0B40F514CB768693CA071F32";
 
-    private static readonly Dictionary<string, string> EngineScriptHashes = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly Dictionary<string, string> EngineFileHashes = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["common-windows.ps1"] = "0443214475F5B99773C931FD4613517FCED54FF94CF6437609139D186F022046",
-        ["theme-windows.ps1"] = "F271F4DFA9E1155C165758570A7116091E1964AF8D9E4E164A2CC0F76221B158",
-        ["start-dream-skin.ps1"] = "703EFF94D4C91B122F106FCF5E3AF5954C913B2C17EE460F41A0CD3AD730DB0A",
-        ["restore-dream-skin.ps1"] = "455BBEC8FB5FBC42FDD299382AC4C0D612F8651BFA19BC59AF28F793CA305E5E",
-        ["apply-community-theme.ps1"] = "85F43F3C3338228158500F95207D9345B83440CE282BD0E6DD50E077D95BA194"
+        ["assets/dream-skin.css"] = "AF3BD8820FF21AA8E1246375150AAEB67EA8161B99067C1787D2C7C9D8324C35",
+        ["assets/renderer-inject.js"] = "EBB8EAB63ABF129980AD91B2103177A8E0DBA92576E96AE139E5AD8EC542ED6C",
+        ["assets/safe-css-validator.mjs"] = "B0AB5D3C75F18621F6045FD1AD32DC8AA646A51FF71B2D87D08DADFA1309A4B0",
+        ["assets/selectors.json"] = "5E38678B6F787110236ACF2B856ABC43071AED4A8CBAAF14917BFC8AB772EFA7",
+        ["assets/theme-package-validator.mjs"] = "8F249D726367C383D8C5894890E2B6D1C3B56A7282D7441A80CFB6470955B5F8",
+        ["scripts/apply-community-theme.ps1"] = "383070870547BA0429DA6A2CFEFA2BDFD94DE533CC7BC4000DE85BACC778AFF4",
+        ["scripts/check-update.ps1"] = "24BBD5335861FDC661D40B70F7477EDABC7D14D0E2B1ACF7B61CE755B2590D21",
+        ["scripts/common-windows.ps1"] = "8F26CCD08F4EE9F2D71265C13619FA6B1D2DB60F04B31E96B4FFFD376DA0920B",
+        ["scripts/config-utf8.ps1"] = "63AC66B2753E08689ACE58384391BCC523970D56B7938A79DC0B028FFF962E82",
+        ["scripts/image-metadata.mjs"] = "4EC6D1794A2BA58E3733BCAB74723F4E2E061AD8D4E7BBC8664693D4AEF09CB4",
+        ["scripts/injector.mjs"] = "AE32AEEB1A5F7790E7FB784B94C9966FCB4BB669E21A43633B257C9B58FB2F99",
+        ["scripts/install-dream-skin.ps1"] = "36C1B05EBCC92A39166ED6DEABA7EF6A5746E453EFE66AC100C83C463C157DA8",
+        ["scripts/localization-windows.ps1"] = "520EC2F58D6FE4CF1391D938163472A9A15FBF20A8292A4C6F8B7A078CC9C00A",
+        ["scripts/restore-dream-skin.ps1"] = "A3BE21AC5F265FDC023B89C51BC99FD6553F3C8B63E8443A06C6537436043DC0",
+        ["scripts/start-dream-skin.ps1"] = "9CE63546FAA7B634D1208AB06D8945FE331E1E7591BF20076B4850DA8E925D80",
+        ["scripts/theme-windows.ps1"] = "F72555CCE5D1222A694AD23DD9922360BFE8649CAE701CF98D938642A8310B0E",
+        ["scripts/tray-dream-skin.ps1"] = "6B55D9C208F367D61C8B562FAAA2841A1B99DF7D3BE44C4D11AF20509F1B2427",
+        ["scripts/validate-safe-css-file.mjs"] = "51A7FF9E2F85D6586390B3855DC63FAA4D549C20FE76D852D82196D558B5DA26",
+        ["scripts/verify-dream-skin.ps1"] = "D9395184272E8998FD0EE58A4C5845EB7DA9ABCF2D6D93A1A28926B9062C1AB5"
     };
     private static readonly Regex SafeThemeId = new(
         @"\A[A-Za-z0-9][A-Za-z0-9._-]{0,79}\z",
@@ -63,22 +77,21 @@ public sealed class DreamSkinService
             return await DiscoverTestDoubleAsync(cancellationToken);
 
         var managerTrusted = HashMatches(ManagerScript, ManagerScriptHash);
-        var required = new[]
-        {
-            Path.Combine(EngineRoot, "VERSION"),
-            Path.Combine(EngineRoot, "scripts", "common-windows.ps1"),
-            Path.Combine(EngineRoot, "scripts", "theme-windows.ps1"),
-            Path.Combine(EngineRoot, "scripts", "start-dream-skin.ps1"),
-            Path.Combine(EngineRoot, "scripts", "restore-dream-skin.ps1"),
-            CommunityApplyScript
-        };
-        var engineScriptsTrusted = required
-            .Where(path => Path.GetFileName(path).EndsWith(".ps1", StringComparison.OrdinalIgnoreCase))
-            .All(path => EngineScriptHashes.TryGetValue(Path.GetFileName(path), out var expected)
-                         && HashMatches(path, expected));
+        var versionPath = Path.Combine(EngineRoot, "VERSION");
+        var trustedFiles = EngineFileHashes
+            .Select(entry => new
+            {
+                Path = Path.Combine(
+                    EngineRoot,
+                    entry.Key.Replace('/', Path.DirectorySeparatorChar)),
+                entry.Value
+            })
+            .ToArray();
+        var required = trustedFiles.Select(file => file.Path).Prepend(versionPath).ToArray();
+        var engineFilesTrusted = trustedFiles.All(file => HashMatches(file.Path, file.Value));
         var stateRootSafe = Directory.Exists(StateRoot) && IsManagedPathSafe(StateRoot);
         var engineReady = managerTrusted
-                          && engineScriptsTrusted
+                          && engineFilesTrusted
                           && stateRootSafe
                           && Directory.Exists(EngineRoot)
                           && required.All(File.Exists)

@@ -47,7 +47,11 @@ try {
     $process = [Diagnostics.Process]::Start($info)
     if (-not $process.WaitForExit(180000)) {
         if (-not $process.HasExited) {
-            $process.Kill($true)
+            # Windows PowerShell 5.1 runs on .NET Framework, whose Process type
+            # does not have Kill(bool). The stress target is a single-process,
+            # detached-only executable, so the compatible parameterless overload
+            # is the correct cleanup path here.
+            $process.Kill()
             $null = $process.WaitForExit(5000)
         }
         throw 'Installed UI stress test exceeded 180 seconds.'

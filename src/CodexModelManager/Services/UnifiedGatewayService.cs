@@ -42,6 +42,33 @@ public sealed class UnifiedGatewayService
     public string Url => $"http://127.0.0.1:{Port}/v1";
     public string ConfigurationPath => Path.Combine(_settings.DataDirectory, "unified-gateway.json");
 
+    public string BuildSafePowerShellExample(string gatewayModel) =>
+        BuildSafePowerShellExample(Url, gatewayModel);
+
+    internal static string BuildSafePowerShellExample(string gatewayBaseUrl, string gatewayModel)
+    {
+        if (!Uri.TryCreate(gatewayBaseUrl, UriKind.Absolute, out var gatewayUri)
+            || gatewayUri.Scheme != Uri.UriSchemeHttp
+            || !gatewayUri.Host.Equals("127.0.0.1", StringComparison.Ordinal)
+            || !string.IsNullOrEmpty(gatewayUri.UserInfo)
+            || !string.IsNullOrEmpty(gatewayUri.Query)
+            || !string.IsNullOrEmpty(gatewayUri.Fragment))
+            throw new InvalidOperationException("调用示例只允许使用本机回环中转站地址。");
+        if (string.IsNullOrWhiteSpace(gatewayModel)
+            || gatewayModel.Length > 256
+            || gatewayModel.Any(character => char.IsControl(character)))
+            throw new InvalidOperationException("模型名称不适合生成调用示例。");
+
+        var model = gatewayModel.Replace("'", "''", StringComparison.Ordinal);
+        var endpoint = gatewayUri.AbsoluteUri.TrimEnd('/') + "/chat/completions";
+        return string.Join(Environment.NewLine,
+        [
+            "$headers = @{ Authorization = 'Bearer <YOUR_GATEWAY_API_KEY>' }",
+            $"$body = @{{ model = '{model}'; messages = @(@{{ role = 'user'; content = 'Hello' }}) }} | ConvertTo-Json -Depth 6",
+            $"Invoke-RestMethod -Method Post -Uri '{endpoint}' -Headers $headers -ContentType 'application/json' -Body $body"
+        ]);
+    }
+
     /// <summary>
     /// Reads only the already-persisted gateway catalog. It does not start the
     /// gateway, discover accounts, create secrets, or send a model request.

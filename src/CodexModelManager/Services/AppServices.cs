@@ -54,7 +54,7 @@ public sealed class AppServices
             nativeEngineDataRoot);
         var dreamSkin = new DreamSkinService(
             stateRoot: ResolveDreamSkinStateRoot(settings.DataDirectory));
-        var desktop = new CodexDesktopBridgeService();
+        var desktop = new CodexDesktopBridgeService(codexConfig.ModelsCachePath);
         var accountUsageLedger = RuntimeMode.IsDetachedUi
             ? new AccountUsageLedgerService(
                 settings.DataDirectory,

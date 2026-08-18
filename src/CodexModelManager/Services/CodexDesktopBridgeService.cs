@@ -88,18 +88,30 @@ public static class CodexConversationContinuity
 public sealed class CodexDesktopBridgeService
 {
     private const int DreamSkinPort = 9335;
-    private const string CodexPageUrl = "app://-/index.html";
+    private const string CodexPagePath = "/index.html";
+    private readonly string _modelsCachePath;
     private readonly HttpClient _http = new()
     {
         BaseAddress = new Uri($"http://127.0.0.1:{DreamSkinPort}"),
         Timeout = TimeSpan.FromSeconds(3)
     };
 
+    public CodexDesktopBridgeService(string? modelsCachePath = null)
+    {
+        var selectedPath = string.IsNullOrWhiteSpace(modelsCachePath)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".codex",
+                "models_cache.json")
+            : modelsCachePath;
+        _modelsCachePath = Path.GetFullPath(selectedPath);
+    }
+
     public async Task<CodexDesktopState> ReadStateAsync(CancellationToken cancellationToken = default)
     {
         if (RuntimeMode.IsDetachedUi)
             return new CodexDesktopState(false, false, null, "独立模式未读取 Codex 窗口、任务或调试端口。");
-        var windowsState = await CodexWindowsAutomation.ReadStateAsync(cancellationToken);
+        var windowsState = await CodexWindowsAutomation.ReadStateAsync(_modelsCachePath, cancellationToken);
 
         try
         {
@@ -156,10 +168,14 @@ public sealed class CodexDesktopBridgeService
         string? webSocketUrl = null;
         foreach (var target in document.RootElement.EnumerateArray())
         {
-            if (!string.Equals(ReadString(target, "type"), "page", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!string.Equals(ReadString(target, "url"), CodexPageUrl, StringComparison.Ordinal)) continue;
-            if (!string.Equals(ReadString(target, "title"), "Codex", StringComparison.OrdinalIgnoreCase)) continue;
-            webSocketUrl = ReadString(target, "webSocketDebuggerUrl");
+            var candidateWebSocketUrl = ReadString(target, "webSocketDebuggerUrl");
+            if (!IsTrustedCodexPageTarget(
+                    ReadString(target, "type"),
+                    ReadString(target, "url"),
+                    ReadString(target, "title"),
+                    candidateWebSocketUrl))
+                continue;
+            webSocketUrl = candidateWebSocketUrl;
             if (!string.IsNullOrWhiteSpace(webSocketUrl)) break;
         }
         if (!Uri.TryCreate(webSocketUrl, UriKind.Absolute, out var uri)
@@ -168,6 +184,36 @@ public sealed class CodexDesktopBridgeService
             throw new InvalidOperationException("没有找到可信的 Codex 本机页面。");
 
         return await CdpSession.ConnectAsync(uri, cancellationToken);
+    }
+
+    internal static bool IsTrustedCodexPageTarget(
+        string? type,
+        string? pageUrl,
+        string? title,
+        string? webSocketDebuggerUrl)
+    {
+        if (!string.Equals(type, "page", StringComparison.OrdinalIgnoreCase)
+            || !(string.Equals(title, "Codex", StringComparison.OrdinalIgnoreCase)
+                 || string.Equals(title, "ChatGPT", StringComparison.OrdinalIgnoreCase))
+            || !Uri.TryCreate(pageUrl, UriKind.Absolute, out var pageUri)
+            || !pageUri.Scheme.Equals("app", StringComparison.OrdinalIgnoreCase)
+            || !pageUri.AbsolutePath.Equals(CodexPagePath, StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(pageUri.Host)
+            || pageUri.Host.Length > 128
+            || pageUri.Host.Any(character => !(char.IsLetterOrDigit(character)
+                                                || character is '-' or '_' or '.'))
+            || !string.IsNullOrEmpty(pageUri.UserInfo)
+            || pageUri.Port != -1)
+            return false;
+
+        return Uri.TryCreate(webSocketDebuggerUrl, UriKind.Absolute, out var webSocketUri)
+               && webSocketUri.Scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)
+               && webSocketUri.IsLoopback
+               && webSocketUri.Port == DreamSkinPort
+               && string.IsNullOrEmpty(webSocketUri.UserInfo)
+               && webSocketUri.AbsolutePath.StartsWith(
+                   "/devtools/page/",
+                   StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<CodexDesktopState> ReadStateAsync(

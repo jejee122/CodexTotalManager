@@ -27,8 +27,10 @@ public partial class MainWindow
             SaveDesktopPreferencesButton.IsEnabled = false;
             CompleteFirstRunButton.IsEnabled = false;
             CheckProductUpdateButton.IsEnabled = false;
+            CheckThirdPartyUpdatesButton.IsEnabled = false;
             OpenProductReleaseButton.IsEnabled = false;
             ProductDesktopStatusText.Text = "独立测试模式不会修改 Windows 启动项，也不会联网检查更新。";
+            ThirdPartyComponentStatusText.Text = "独立测试模式不会联网读取第三方版本；内置组件仍按候选包清单核对。";
             return;
         }
 
@@ -45,7 +47,7 @@ public partial class MainWindow
         _trayIcon = new Forms.NotifyIcon
         {
             Icon = _trayIconImage,
-            Text = "Codex 总管家",
+            Text = "AI 中转站总管家",
             ContextMenuStrip = menu,
             Visible = true
         };
@@ -100,7 +102,7 @@ public partial class MainWindow
         Hide();
         if (_trayIcon is null || _trayHintShown) return;
         _trayHintShown = true;
-        _trayIcon.BalloonTipTitle = "Codex 总管家仍在运行";
+        _trayIcon.BalloonTipTitle = "AI 中转站总管家仍在运行";
         _trayIcon.BalloonTipText = "双击托盘图标可以重新打开；右键可完全退出。";
         _trayIcon.ShowBalloonTip(2500);
     }
@@ -209,6 +211,31 @@ public partial class MainWindow
     {
         if (_availableReleaseUri is null) return;
         OpenExternalUri(_availableReleaseUri);
+    }
+
+    private async void CheckThirdPartyUpdatesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (RuntimeMode.IsDetachedUi || _busy) return;
+        CheckThirdPartyUpdatesButton.IsEnabled = false;
+        ThirdPartyComponentStatusText.Text = "正在读取三个项目的公开正式 Release；不会下载或安装…";
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+            var result = await _services.ProductMaintenance.CheckThirdPartyComponentsAsync(timeout.Token);
+            ThirdPartyComponentStatusText.Text = result.Summary;
+        }
+        catch (OperationCanceledException)
+        {
+            ThirdPartyComponentStatusText.Text = "组件版本检查超时。没有下载、安装或修改任何组件。";
+        }
+        catch (Exception ex)
+        {
+            ThirdPartyComponentStatusText.Text = $"暂时无法检查组件版本：{FriendlyError(ex)}";
+        }
+        finally
+        {
+            CheckThirdPartyUpdatesButton.IsEnabled = true;
+        }
     }
 
     private void OpenProjectHomeButton_Click(object sender, RoutedEventArgs e) =>

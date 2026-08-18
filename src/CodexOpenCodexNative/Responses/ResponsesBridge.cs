@@ -162,7 +162,8 @@ public sealed class ResponsesBridge
                                 _outputIndex++,
                                 itemId,
                                 adapterEvent.CallId ?? itemId,
-                                adapterEvent.FunctionName ?? string.Empty);
+                                adapterEvent.FunctionName ?? string.Empty,
+                                adapterEvent.ThoughtSignature);
                             _toolItems[adapterEvent.ToolCallIndex] = tool;
                             await writer.WriteAsync(Frame("response.output_item.added", new JsonObject
                             {
@@ -179,6 +180,8 @@ public sealed class ResponsesBridge
                         }
                         if (!string.IsNullOrEmpty(adapterEvent.FunctionName))
                             tool.Name = adapterEvent.FunctionName;
+                        if (!string.IsNullOrWhiteSpace(adapterEvent.ThoughtSignature))
+                            tool.ThoughtSignature = adapterEvent.ThoughtSignature;
                         if (adapterEvent.Arguments is { Length: > 0 })
                         {
                             tool.Arguments.Append(adapterEvent.Arguments);
@@ -495,7 +498,7 @@ public sealed class ResponsesBridge
             ["output_index"] = tool.OutputIndex,
             ["item"] = item
         }), ct);
-        _finishedItems.Add(new FinishedItem(tool.OutputIndex, item));
+        _finishedItems.Add(new FinishedItem(tool.OutputIndex, item, tool.ThoughtSignature));
     }
 
     private async Task CloseAllAsync(ChannelWriter<string> writer, CancellationToken ct)
@@ -538,6 +541,9 @@ public sealed class ResponsesBridge
         foreach (var item in _finishedItems.OrderBy(item => item.OutputIndex))
         {
             var mapped = ResponsesParser.MapInputItem(JsonSerializer.SerializeToElement(item.Item));
+            if (mapped?.ToolCalls is { Count: > 0 }
+                && !string.IsNullOrWhiteSpace(item.ThoughtSignature))
+                mapped.ToolCalls[0].ThoughtSignature = item.ThoughtSignature;
             if (mapped is not null) messages.Add(mapped);
         }
         return messages;
@@ -612,20 +618,22 @@ public sealed class ResponsesBridge
         return $"event: {name}\ndata: {payload.ToJsonString()}\n\n";
     }
 
-    private sealed record FinishedItem(int OutputIndex, JsonObject Item);
+    private sealed record FinishedItem(int OutputIndex, JsonObject Item, string? ThoughtSignature = null);
 
     private sealed class ToolItem(
         int toolCallIndex,
         int outputIndex,
         string itemId,
         string callId,
-        string name)
+        string name,
+        string? thoughtSignature)
     {
         public int ToolCallIndex { get; } = toolCallIndex;
         public int OutputIndex { get; } = outputIndex;
         public string ItemId { get; } = itemId;
         public string CallId { get; } = callId;
         public string Name { get; set; } = name;
+        public string? ThoughtSignature { get; set; } = thoughtSignature;
         public StringBuilder Arguments { get; } = new();
     }
 }

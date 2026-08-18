@@ -40,6 +40,8 @@ public partial class MainWindow : Window
         ProviderPresetBox.ItemsSource = ProviderPresetCatalog.All;
         ProviderPresetBox.DisplayMemberPath = nameof(ProviderPreset.DisplayName);
         ProviderPresetBox.SelectedIndex = 0;
+        HomeProviderPresetsList.ItemsSource = ProviderPresetCatalog.All.Where(preset => !preset.IsCustom).ToArray();
+        InitializeGatewayOverviewText();
         AccountsPage.Initialize(_services);
         SubagentsPage.Initialize(_services);
         AccountsPage.ManageOtherModelsRequested += async (_, _) => await ShowModelsPageAsync();
@@ -52,6 +54,76 @@ public partial class MainWindow : Window
         ServerCardsList.ItemsSource = _serverCards;
         ExtensionsPage.Initialize(_services.Extensions);
         InitializeProductShell();
+    }
+
+    private void InitializeGatewayOverviewText()
+    {
+        var baseUrl = _services.UnifiedGateway.Url.TrimEnd('/');
+        HomeUnifiedGatewayUrlText.Text = baseUrl;
+        HomeResponsesEndpointText.Text = baseUrl + "/responses";
+        HomeChatEndpointText.Text = baseUrl + "/chat/completions";
+        HomeModelsEndpointText.Text = "模型目录：" + baseUrl + "/models";
+    }
+
+    private async Task RefreshGatewayOverviewAsync()
+    {
+        InitializeGatewayOverviewText();
+        try
+        {
+            var status = await _services.UnifiedGateway.ReadAsync();
+            HomeUnifiedGatewayStatusText.Text = status.Running
+                ? $"本机中转站运行中 · {status.Models.Count} 个模型 · API Key {status.KeyHint}"
+                : "本机中转站尚未启动；添加上游后可在“模型与线路”中按需启动。";
+        }
+        catch (Exception ex)
+        {
+            HomeUnifiedGatewayStatusText.Text = "中转站状态暂时不可读：" + FriendlyError(ex);
+        }
+    }
+
+    private void CopyHomeGatewayUrlButton_Click(object sender, RoutedEventArgs e)
+    {
+        Clipboard.SetText(_services.UnifiedGateway.Url);
+        FooterMessage.Text = "统一中转站 Base URL 已复制。";
+    }
+
+    private async void StartHomeGatewayButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+        SetBusy(true, "正在检查上游并启动中转站…");
+        try
+        {
+            var status = await _services.UnifiedGateway.EnsureReadyAsync();
+            if (!status.Running)
+                throw new InvalidOperationException(status.Summary);
+            HomeUnifiedGatewayStatusText.Text =
+                $"本机中转站运行中 · {status.Models.Count} 个模型 · API Key {status.KeyHint}";
+            FooterMessage.Text = "统一中转站已经启动并同步；Codex 仍保持原来的连接状态。";
+        }
+        catch (Exception ex)
+        {
+            HomeUnifiedGatewayStatusText.Text = "中转站没有启动：" + FriendlyError(ex);
+            FooterMessage.Text = HomeUnifiedGatewayStatusText.Text;
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshCodexConnectionUi();
+            if (RuntimeMode.IsDetachedUi) DisableDetachedActionButtons();
+        }
+    }
+
+    private void CopyHomeGatewayKeyButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            Clipboard.SetText(_services.UnifiedGateway.GetClientKey());
+            FooterMessage.Text = "统一中转站 API Key 已复制；界面和日志不会显示明文。";
+        }
+        catch (Exception ex)
+        {
+            FooterMessage.Text = "API Key 没有复制：" + FriendlyError(ex);
+        }
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -185,8 +257,8 @@ public partial class MainWindow : Window
 
     private async Task InitializeManagerOnlyAsync()
     {
-        HomeOverallTitle.Text = "总管家可单独使用，Codex 没有连接";
-        HomeOverallDetail.Text = "只有点击“一键连接 Codex”后才会改 Codex 网关；其他功能按各自按钮独立运行。";
+        HomeOverallTitle.Text = "AI 中转站可以独立使用";
+        HomeOverallDetail.Text = "模型、API、线路、账号池和调用方都可独立管理；Codex 默认不接入。";
         HomeModelText.Text = "Codex 未连接（默认）";
         HomeModelDetail.Text = "不会自动启动 Native Engine，也不会改模型目录";
         HomeAccountText.Text = "号池可管理，暂不切给 Codex";
@@ -199,6 +271,7 @@ public partial class MainWindow : Window
         await RefreshThemeUiAsync();
         try { await AccountsPage.ReloadAsync(); }
         catch { }
+        await RefreshGatewayOverviewAsync();
         RefreshCodexConnectionUi();
     }
 
@@ -321,6 +394,7 @@ public partial class MainWindow : Window
         BackupServiceTitle.Text = $"已有 {_services.Backups.Count} 份安全备份";
 
         UpdateThemeUi(themesTask.Result);
+        await RefreshGatewayOverviewAsync();
 
         var memorySafe = _services.CodexConfig.MemoryProtectionLooksSafe();
         var localConfigWarning = _services.Settings.LoadWarning ?? _services.Secrets.LoadWarning;
@@ -338,10 +412,10 @@ public partial class MainWindow : Window
 
         var allReady = memorySafe && localConfigWarning is null && accountsHealthy && v2rayReady && runtime.Healthy
                        && runtimeTruth.Consistency.State == RuntimeTruthState.Consistent;
-        HomeOverallTitle.Text = allReady ? "Codex 核心功能已经验证可用" : "Codex 当前是部分可用";
+        HomeOverallTitle.Text = allReady ? "AI 中转站运行正常，Codex 接入可用" : "AI 中转站可用，但 Codex 接入需要处理";
         HomeOverallDetail.Text = allReady
-            ? "模型入口、账号池和本机网络已现场检查；服务器状态仍以最近一次只读采样为准。"
-            : "至少一项真实检查没有通过；页面不会用“全部正常”掩盖故障。";
+            ? "统一模型入口、账号池、本机网络和 Codex 可选接入已经检查。"
+            : "至少一项 Codex 接入检查没有通过；中转站其他独立线路仍按各自状态运行。";
 
         var fixedEntryReady = runtimeTruth.Preferred.CodexDefaultMatchesExpected;
         var configuredDefaultModel = runtimeTruth.Preferred.CodexDefaultModel;
@@ -1064,7 +1138,7 @@ public partial class MainWindow : Window
     }
 
     private void ShowHomePage() => ShowPage(
-        HomePage, HomeNavButton, "首页", "一眼看清 Codex 和服务器是否正常。");
+        HomePage, HomeNavButton, "AI 中转站", "统一管理 API、模型、线路和调用方；Codex 只是可选接入。");
 
     private void ShowTokenPage() => ShowPage(
         TokenPage, TokenNavButton, "Token 流光", "按真实本机日志查看每日 Token 活动；套餐余额仍以中转站账号卡片为准。");
@@ -1101,7 +1175,7 @@ public partial class MainWindow : Window
     }
 
     private void ShowAccountsPage() => ShowPage(
-        AccountsPage, AccountsNavButton, "中转站", "在同一任务中切换 Codex Pro / Plus 扣费账号，并管理独立 API 出口。");
+        AccountsPage, AccountsNavButton, "模型与线路", "管理 Codex 授权池、Grok 等上游 API、统一路由和独立调用方钥匙。");
 
     private void ShowSubagentsPage()
     {
@@ -1179,7 +1253,7 @@ public partial class MainWindow : Window
 
     private void ShowServicesPage()
     {
-        ShowPage(ServicesPage, ServicesNavButton, "本机服务与备份", "逐项控制本机服务，并安全恢复或清理备份。");
+        ShowPage(ServicesPage, ServicesNavButton, "Codex 接入", "Codex 是中转站的可选客户端；默认关闭，可一键接入或恢复原网关。");
         RefreshCodexConnectionUi();
         if (!RuntimeMode.IsDetachedUi)
             _ = RefreshLocalManagementAsync();
@@ -1229,14 +1303,14 @@ public partial class MainWindow : Window
 
     private void PrepareDetachedUi()
     {
-        Title = "Codex 总管家 · 独立开发版";
+        Title = "AI 中转站总管家 · 独立开发版";
         ShowHomePage();
         ConnectionDot.Fill = new SolidColorBrush(Color.FromRgb(224, 177, 92));
         ConnectionText.Text = "独立开发模式";
         MemoryStatusTitle.Text = "与真实 Codex 完全断开";
         MemoryStatusDetail.Text = "不读取聊天和账号；只安全显示当前网关，等你主动点击连接";
-        HomeOverallTitle.Text = "总管家界面已独立打开";
-        HomeOverallDetail.Text = "真实 Codex 保持隔离；当前只显示网关，服务器、v2rayN 和本机状态允许只读检测。";
+        HomeOverallTitle.Text = "AI 中转站界面已独立打开";
+        HomeOverallDetail.Text = "中转站功能独立展示；真实 Codex 保持隔离，服务器、v2rayN 和本机状态只读检测。";
         HomeModelText.Text = "未连接（按要求）";
         HomeModelDetail.Text = "没有读取模型、Provider、账号或扣费信息";
         HomeAccountText.Text = "未连接（按要求）";
@@ -1280,15 +1354,15 @@ public partial class MainWindow : Window
 
         var snapshot = RealCodexConfig.ReadGatewaySnapshot();
         var status = snapshot.IsManagedConnected
-            ? "当前状态：已连接总管家"
-            : "当前状态：未连接总管家（默认关闭）";
+            ? "当前状态：Codex 已接入中转站"
+            : "当前状态：Codex 未接入中转站（默认关闭）";
         var currentGateway = $"{snapshot.CurrentGateway}  ·  Provider：{snapshot.SelectedProviderId}";
         var managedGateway = snapshot.IsManagedConnected
             ? $"取消后恢复：{snapshot.RestoreGateway}  ·  Provider：{snapshot.RestoreProviderId}"
             : snapshot.ManagedGateway;
         var buttonText = snapshot.IsManagedConnected
-            ? "一键取消连接并恢复原网关"
-            : "一键连接 Codex 使用总管家";
+            ? "一键取消接入并恢复原网关"
+            : "一键让 Codex 接入中转站";
         SetCodexConnectionUi(
             status,
             currentGateway,
@@ -1333,14 +1407,14 @@ public partial class MainWindow : Window
 
         var disconnecting = before.IsManagedConnected;
         var message = disconnecting
-            ? "确定取消 Codex 使用总管家吗？\n\n" +
+            ? "确定取消 Codex 接入中转站吗？\n\n" +
               $"当前网关：{before.CurrentGateway}\n" +
               $"恢复网关：{before.RestoreGateway}\n\n" +
-              "总管家只删除自己写入的网关和模型目录，并停止自己启动的本机网关。不会关闭或重启 Codex。"
-            : "确定让 Codex 使用总管家吗？\n\n" +
+              "中转站只删除自己写入的 Codex 网关和模型目录，并停止自己启动的 Codex 专用入口。不会关闭或重启 Codex。"
+            : "确定让 Codex 接入 AI 中转站吗？\n\n" +
               $"当前网关：{before.CurrentGateway}\n" +
               $"连接后网关：{before.ManagedGateway}\n\n" +
-              "总管家会保留 Codex 内置 openai 身份，只写入本机网关和模型目录。不会关闭或重启 Codex；正在运行的 Codex 可能要由你手动重新打开后才读取新目录。";
+              "中转站会保留 Codex 内置 openai 身份，只写入本机网关和模型目录。不会关闭或重启 Codex；正在运行的 Codex 可能要由你手动重新打开后才读取新目录。";
         var choice = MessageBox.Show(
             message,
             disconnecting ? "确认取消 Codex 连接" : "确认连接 Codex",
@@ -1349,7 +1423,7 @@ public partial class MainWindow : Window
             MessageBoxResult.No);
         if (choice != MessageBoxResult.Yes) return;
 
-        SetBusy(true, disconnecting ? "正在恢复 Codex 原网关…" : "正在连接 Codex 与总管家…");
+        SetBusy(true, disconnecting ? "正在恢复 Codex 原网关…" : "正在让 Codex 接入中转站…");
         try
         {
             if (disconnecting)

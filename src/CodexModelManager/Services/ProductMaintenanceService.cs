@@ -17,6 +17,24 @@ public sealed class ProductMaintenanceService : IDisposable
     private const long MaximumReleaseResponseBytes = 1024 * 1024;
     private static readonly Uri ReleasesEndpoint = new(
         "https://api.github.com/repos/jejee122/CodexTotalManager/releases?per_page=20");
+    private static readonly ThirdPartyDefinition[] ThirdPartyDefinitions =
+    [
+        new(
+            "OpenCodex C# 迁移基线",
+            "2.7.41",
+            new Uri("https://api.github.com/repos/lidge-jun/opencodex/releases/latest"),
+            "只移植经过复核的行为，不执行 npm 包，也不会整包自动覆盖本地 C# 引擎。"),
+        new(
+            "CLIProxyAPI",
+            CliProxyPoolService.BundledVersion,
+            new Uri("https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"),
+            "正式 Windows 制品只在构建时按 SHA-256 锁定接入，不从软件内自动下载。"),
+        new(
+            "Codex Dream Skin",
+            "1.5.14",
+            new Uri("https://api.github.com/repos/Fei-Away/Codex-Dream-Skin/releases/latest"),
+            "Windows 源码经过三方合并，保留总管家的隔离测试和本地安全加固。")
+    ];
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
 
@@ -89,7 +107,7 @@ public sealed class ProductMaintenanceService : IDisposable
             : "已进入只读保护，请查看 diagnostics";
         return string.Join(Environment.NewLine, new[]
         {
-            "Codex 总管家诊断摘要",
+            "AI 中转站总管家诊断摘要",
             $"软件版本：{CurrentVersion}",
             $"运行模式：{mode}",
             $"系统：{RuntimeInformation.OSDescription.Trim()}",
@@ -115,10 +133,9 @@ public sealed class ProductMaintenanceService : IDisposable
         if (response.Content.Headers.ContentLength is > MaximumReleaseResponseBytes)
             throw new InvalidOperationException("GitHub 更新信息超过安全大小限制，已停止读取。 ");
 
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var releases = await JsonSerializer.DeserializeAsync<List<GitHubRelease>>(
-                           stream,
-                           JsonOptions,
+        var releases = await ReadBoundedJsonAsync<List<GitHubRelease>>(
+                           response.Content,
+                           "GitHub 更新信息超过安全大小限制，已停止读取。 ",
                            cancellationToken)
                        ?? new List<GitHubRelease>();
         var valid = releases
@@ -143,6 +160,51 @@ public sealed class ProductMaintenanceService : IDisposable
             ? $"发现新版本 {latest}。只会打开 GitHub Release，不会静默下载或覆盖当前软件。"
             : $"当前已经是最新或更高的候选版本（GitHub：{latest}）。";
         return new ProductUpdateResult(CurrentVersion, latest, available, releaseUri, status);
+    }
+
+    public async Task<ThirdPartyMaintenanceResult> CheckThirdPartyComponentsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var components = new List<ThirdPartyComponentStatus>();
+        foreach (var definition in ThirdPartyDefinitions)
+        {
+            try
+            {
+                var latest = await ReadLatestThirdPartyReleaseAsync(
+                    definition.ReleaseEndpoint,
+                    cancellationToken);
+                var updateAvailable = CompareVersionText(latest, definition.IntegratedVersion) > 0;
+                var state = definition.Name.StartsWith("OpenCodex", StringComparison.Ordinal)
+                    ? $"上游正式版 {latest}；本地是 {definition.IntegratedVersion} 迁移基线，必须逐项移植和测试"
+                    : updateAvailable
+                        ? $"上游正式版 {latest}；当前 {definition.IntegratedVersion}，可评估升级"
+                        : $"当前 {definition.IntegratedVersion}，与上游正式版 {latest} 一致或更高";
+                components.Add(new ThirdPartyComponentStatus(
+                    definition.Name,
+                    definition.IntegratedVersion,
+                    latest,
+                    updateAvailable,
+                    $"{state}。{definition.IntegrationNote}"));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                components.Add(new ThirdPartyComponentStatus(
+                    definition.Name,
+                    definition.IntegratedVersion,
+                    null,
+                    false,
+                    $"当前 {definition.IntegratedVersion}；暂时没有读到上游正式版本。{definition.IntegrationNote}"));
+            }
+        }
+
+        return new ThirdPartyMaintenanceResult(
+            components,
+            string.Join(Environment.NewLine, components.Select(component =>
+                $"• {component.Name}：{component.StatusText}")));
     }
 
     public void Dispose()
@@ -201,6 +263,66 @@ public sealed class ProductMaintenanceService : IDisposable
             return false;
         uri = candidate;
         return true;
+    }
+
+    private async Task<string> ReadLatestThirdPartyReleaseAsync(
+        Uri endpoint,
+        CancellationToken cancellationToken)
+    {
+        if (endpoint.Scheme != Uri.UriSchemeHttps
+            || !endpoint.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase)
+            || !string.IsNullOrEmpty(endpoint.UserInfo))
+            throw new InvalidOperationException("第三方版本地址不在允许的 GitHub API 范围内。 ");
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        using var response = await _httpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+        var finalUri = response.RequestMessage?.RequestUri;
+        if (finalUri is null
+            || finalUri.Scheme != Uri.UriSchemeHttps
+            || !finalUri.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase)
+            || !string.IsNullOrEmpty(finalUri.UserInfo))
+            throw new InvalidOperationException("第三方版本检查发生了不允许的地址跳转。 ");
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException("GitHub 暂时没有返回第三方正式版本。 ");
+        if (response.Content.Headers.ContentLength is > MaximumReleaseResponseBytes)
+            throw new InvalidOperationException("第三方版本信息超过安全大小限制。 ");
+
+        var release = await ReadBoundedJsonAsync<GitHubRelease>(
+            response.Content,
+            "第三方版本信息超过安全大小限制。 ",
+            cancellationToken);
+        if (release is null || !TryParseSemanticVersion(release.TagName, out _))
+            throw new InvalidOperationException("第三方项目没有返回可验证的正式版本号。 ");
+        return release.TagName.Trim().TrimStart('v', 'V');
+    }
+
+    private static async Task<T?> ReadBoundedJsonAsync<T>(
+        HttpContent content,
+        string tooLargeMessage,
+        CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is > MaximumReleaseResponseBytes)
+            throw new InvalidOperationException(tooLargeMessage);
+
+        await using var source = await content.ReadAsStreamAsync(cancellationToken);
+        using var bounded = new MemoryStream();
+        var buffer = new byte[64 * 1024];
+        long total = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
+            if (read == 0) break;
+            total += read;
+            if (total > MaximumReleaseResponseBytes)
+                throw new InvalidOperationException(tooLargeMessage);
+            await bounded.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+        }
+
+        bounded.Position = 0;
+        return await JsonSerializer.DeserializeAsync<T>(bounded, JsonOptions, cancellationToken);
     }
 
     private static SemanticVersion ParseSemanticVersion(string value)
@@ -300,6 +422,12 @@ public sealed class ProductMaintenanceService : IDisposable
         [JsonPropertyName("draft")]
         public bool Draft { get; set; }
     }
+
+    private sealed record ThirdPartyDefinition(
+        string Name,
+        string IntegratedVersion,
+        Uri ReleaseEndpoint,
+        string IntegrationNote);
 }
 
 public sealed record ProductUpdateResult(
@@ -308,3 +436,14 @@ public sealed record ProductUpdateResult(
     bool UpdateAvailable,
     Uri? ReleaseUri,
     string Message);
+
+public sealed record ThirdPartyComponentStatus(
+    string Name,
+    string IntegratedVersion,
+    string? LatestVersion,
+    bool UpdateAvailable,
+    string StatusText);
+
+public sealed record ThirdPartyMaintenanceResult(
+    IReadOnlyList<ThirdPartyComponentStatus> Components,
+    string Summary);

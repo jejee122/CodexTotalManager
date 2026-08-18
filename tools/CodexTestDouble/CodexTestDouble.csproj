@@ -10,6 +10,6 @@
     <Version>1.0.0-test-only</Version>
     <AssemblyTitle>Codex Test Double</AssemblyTitle>
     <Product>Codex Test Double</Product>
-    <Description>Inert loopback-only Codex simulator for Codex Total Manager testing.</Description>
+    <Description>Inert loopback-only Codex simulator for AI Gateway Manager testing.</Description>
   </PropertyGroup>
 </Project>

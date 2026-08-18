@@ -101,8 +101,25 @@ function New-ManagerShortcut(
     $shortcut.Arguments = $Arguments
     $shortcut.WorkingDirectory = $WorkingDirectory
     $shortcut.IconLocation = $IconLocation
-    $shortcut.Description = 'Codex 总管家'
+    $shortcut.Description = 'AI 中转站总管家'
     $shortcut.Save()
+}
+
+function Remove-ManagerShortcutIfOwned(
+    [string]$Path,
+    [string]$OwnedInstallRoot) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($Path)
+        $targetPath = [string]$shortcut.TargetPath
+        $arguments = [string]$shortcut.Arguments
+        $owned = ($targetPath -and $targetPath.StartsWith($OwnedInstallRoot + '\', [StringComparison]::OrdinalIgnoreCase)) -or
+                 ($arguments -and $arguments.IndexOf($OwnedInstallRoot + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0)
+        if ($owned) { Remove-Item -LiteralPath $Path -Force }
+    } catch {
+        Write-Warning "无法核对旧快捷方式，已保留：$Path"
+    }
 }
 
 function Read-RegistrySnapshot([string]$Path) {
@@ -265,7 +282,7 @@ if ($licenseMaterial -eq 'LICENSE.txt') {
 
 $cliProxyPath = Resolve-PayloadPath ([string]$manifest.dependencies.cliProxyApi.path)
 if ((Get-FileHash -LiteralPath $cliProxyPath -Algorithm SHA256).Hash -ine [string]$manifest.dependencies.cliProxyApi.sha256 -or
-    [string]$manifest.dependencies.cliProxyApi.sha256 -ine 'BD3456675B98CFF406B600D1361F1441879220CAD2DD4083B63409A09210629B') {
+    [string]$manifest.dependencies.cliProxyApi.sha256 -ine '0A8FFC52DFB2A466BAA1B006341B350BDB1F76FC70B6CC80375BB99AFDFF697B') {
     throw 'CLIProxyAPI 没有通过固定 SHA-256 校验。它没有数字签名，不能放宽检查。'
 }
 
@@ -302,10 +319,14 @@ $managedRootFiles = @(
 $managedStateFiles = @($pointerPath, $previousPointerPath, $acceptancePath)
 $programsRoot = [Environment]::GetFolderPath('Programs')
 $desktopRoot = [Environment]::GetFolderPath('DesktopDirectory')
-$startMenuFolder = Join-Path $programsRoot 'Codex 总管家'
+$startMenuFolder = Join-Path $programsRoot 'AI 中转站总管家'
+$legacyStartMenuFolder = Join-Path $programsRoot 'Codex 总管家'
 $managedShortcutPaths = @(
-    (Join-Path $startMenuFolder 'Codex 总管家.lnk'),
-    (Join-Path $startMenuFolder '卸载 Codex 总管家.lnk'),
+    (Join-Path $startMenuFolder 'AI 中转站总管家.lnk'),
+    (Join-Path $startMenuFolder '卸载 AI 中转站总管家.lnk'),
+    (Join-Path $desktopRoot 'AI 中转站总管家.lnk'),
+    (Join-Path $legacyStartMenuFolder 'Codex 总管家.lnk'),
+    (Join-Path $legacyStartMenuFolder '卸载 Codex 总管家.lnk'),
     (Join-Path $desktopRoot 'Codex 总管家.lnk')
 )
 $uninstallRegistryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexTotalManager'
@@ -358,7 +379,7 @@ try {
     $installedManifest = Join-Path $destination 'payload-manifest.json'
     $installedExe = Join-Path $destination 'CodexModelManager.exe'
     $installedInfo = (Get-Item -LiteralPath $installedExe).VersionInfo
-    if ($installedInfo.ProductName -ne 'Codex 总管家') {
+    if ($installedInfo.ProductName -ne 'AI 中转站总管家') {
         throw "程序名称不符合预期：$($installedInfo.ProductName)"
     }
     if (-not ($installedInfo.ProductVersion -eq $version -or
@@ -433,6 +454,13 @@ try {
     New-ManagerShortcut $managedShortcutPaths[1] 'wscript.exe' `
         ('"' + $friendlyUninstaller + '"') $installFull $installedExe
     New-ManagerShortcut $managedShortcutPaths[2] 'wscript.exe' $quotedLauncher $installFull $installedExe
+    foreach ($legacyShortcut in $managedShortcutPaths[3..5]) {
+        Remove-ManagerShortcutIfOwned $legacyShortcut $installFull
+    }
+    if ((Test-Path -LiteralPath $legacyStartMenuFolder -PathType Container) -and
+        (Get-ChildItem -LiteralPath $legacyStartMenuFolder -Force | Measure-Object).Count -eq 0) {
+        Remove-Item -LiteralPath $legacyStartMenuFolder -Force
+    }
 
     if (Test-Path -LiteralPath $uninstallRegistryPath) {
         Remove-Item -LiteralPath $uninstallRegistryPath -Recurse -Force
@@ -445,7 +473,7 @@ try {
         [Math]::Ceiling((Get-ChildItem -LiteralPath $destination -Recurse -File | Measure-Object Length -Sum).Sum / 1KB))
     $versionParts = $version.Split('-', 2)[0].Split('.')
     $registration = [ordered]@{
-        DisplayName = 'Codex 总管家'
+        DisplayName = 'AI 中转站总管家'
         DisplayVersion = $version
         Publisher = 'jejee122'
         DisplayIcon = $installedExe

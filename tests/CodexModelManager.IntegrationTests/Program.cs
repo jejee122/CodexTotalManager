@@ -1215,12 +1215,15 @@ static async Task RunUnitTestsAsync()
             "总管家自己拥有的目录或缓存失效文件没有被清理。");
 
         var continuationStore = new ResponseContinuationStore();
+        var continuationScope = ContinuationScope.Create("pool-a", "model-a", "client-a-digest");
         continuationStore.Save(
             "resp_cmm_first",
+            continuationScope,
             new[] { new OcxMessage { Role = "user", Content = "第一轮问题" } },
             new[] { new OcxMessage { Role = "assistant", Content = "第一轮回答" } });
         Ensure(continuationStore.TryExpand(
                    "resp_cmm_first",
+                   continuationScope,
                    new[] { new OcxMessage { Role = "user", Content = "第二轮问题" } },
                    out var expandedConversation)
                && expandedConversation.Count == 3
@@ -1228,6 +1231,35 @@ static async Task RunUnitTestsAsync()
                && expandedConversation[1].Content?.ToString() == "第一轮回答"
                && expandedConversation[2].Content?.ToString() == "第二轮问题",
             "previous_response_id 没有展开上一轮完整对话，切第三方模型仍会失忆。");
+        Ensure(!continuationStore.TryExpand(
+                   "resp_cmm_first",
+                   ContinuationScope.Create("pool-b", "model-a", "client-a-digest"),
+                   Array.Empty<OcxMessage>(),
+                   out _)
+               && !continuationStore.TryExpand(
+                   "resp_cmm_first",
+                   ContinuationScope.Create("pool-a", "model-b", "client-a-digest"),
+                   Array.Empty<OcxMessage>(),
+                   out _)
+               && !continuationStore.TryExpand(
+                   "resp_cmm_first",
+                   ContinuationScope.Create("pool-a", "model-a", "client-b-digest"),
+                   Array.Empty<OcxMessage>(),
+                   out _),
+            "续聊记录没有同时隔离 Provider、模型和调用方，存在串任务风险。");
+
+        const string incompleteResponse =
+            "{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"半截回答\"}]}]}";
+        continuationStore.SaveFromResponseJson(
+            incompleteResponse,
+            continuationScope,
+            new[] { new OcxMessage { Role = "user", Content = "不应保存" } });
+        Ensure(!continuationStore.TryExpand(
+                   "resp_incomplete",
+                   continuationScope,
+                   Array.Empty<OcxMessage>(),
+                   out _),
+            "未完成回复被错误写入续聊历史。");
 
         const string credentialLikeUserInfo = "user:password@";
         var credentialLikeGateway =
@@ -2492,19 +2524,32 @@ static async Task RunUnitTestsAsync()
         var alphaTheme = Path.Combine(dreamThemes, "alpha-theme");
         var hiddenTheme = Path.Combine(dreamThemes, "hidden-theme");
         var activeTheme = Path.Combine(dreamRoot, "active-theme");
-        Directory.CreateDirectory(dreamEngineScripts);
+        var bundledDreamEngine = Path.Combine(AppContext.BaseDirectory, "Resources", "CodexDreamSkin");
+        var dreamEngineRoot = Path.Combine(dreamRoot, "engine");
+        foreach (var sourceDirectory in Directory.EnumerateDirectories(
+                     bundledDreamEngine,
+                     "*",
+                     SearchOption.AllDirectories))
+        {
+            Directory.CreateDirectory(Path.Combine(
+                dreamEngineRoot,
+                Path.GetRelativePath(bundledDreamEngine, sourceDirectory)));
+        }
+        foreach (var sourceFile in Directory.EnumerateFiles(
+                     bundledDreamEngine,
+                     "*",
+                     SearchOption.AllDirectories))
+        {
+            var destination = Path.Combine(
+                dreamEngineRoot,
+                Path.GetRelativePath(bundledDreamEngine, sourceFile));
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            File.Copy(sourceFile, destination, overwrite: true);
+        }
         Directory.CreateDirectory(alphaTheme);
         Directory.CreateDirectory(hiddenTheme);
         Directory.CreateDirectory(activeTheme);
         await File.WriteAllTextAsync(Path.Combine(dreamRoot, "engine", "VERSION"), "9.9.9\n");
-        foreach (var scriptName in new[]
-                 {
-                     "common-windows.ps1", "theme-windows.ps1", "start-dream-skin.ps1",
-                     "restore-dream-skin.ps1", "apply-community-theme.ps1"
-                 })
-            File.Copy(
-                Path.Combine(AppContext.BaseDirectory, "Resources", "CodexDreamSkin", "scripts", scriptName),
-                Path.Combine(dreamEngineScripts, scriptName));
         const string alphaJson = """
                                  {
                                    "schemaVersion": 1,

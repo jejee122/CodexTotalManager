@@ -1,42 +1,70 @@
-# Codex Total Manager / Codex 总管家
+# AI Gateway Manager / AI 中转站总管家
 
-> 把 Codex 的模型、独立账号出口、皮肤、本机网关、外部 Worker 和服务器状态集中到一个 Windows 桌面面板中管理。
+> 把 OpenAI、Grok、Claude、Gemini 等上游 API、模型线路、账号池、调用方和请求记录集中到一个 Windows 桌面中转站；Codex 接入只是其中一个可选功能。
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows)
 ![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet)
-![Release](https://img.shields.io/badge/release-3.0.0--rc.28-orange)
+![Release](https://img.shields.io/badge/release-3.0.0--rc.29-orange)
 ![Status](https://img.shields.io/badge/status-external_validation_pending-yellow)
 
-Codex 总管家不是另一个聊天客户端，也不会替换 Codex。它是一个运行在本机的控制面：
-默认与 Codex 断开；只有用户点击“一键连接 Codex”并确认后，才把本机网关和模型目录写入 Codex 配置。
-断开时只删除总管家自己拥有的内容。
+AI 中转站总管家不是另一个聊天客户端。它的主功能是本机统一中转：把多个上游模型接入同一个
+`http://127.0.0.1:10110/v1`，供本机 AI 工具、Worker 和其他明确配置的调用方使用。即使完全不连接 Codex，
+中转站、上游 API、独立调用方密钥和请求账本也可以单独使用。
 
-当前版本为 **3.0.0-rc.28 候选版**。隔离构建、安全测试、假上游端到端请求和
+Codex 是可选客户端，默认断开。只有用户点击“一键让 Codex 接入中转站”并确认后，软件才写入自己拥有的
+本机网关和模型目录；再次点击会恢复原网关。整个过程不自动关闭或重启 Codex。
+
+当前版本为 **3.0.0-rc.29 候选版**。隔离构建、安全测试、假上游端到端请求和
 10 万条账本压力矩阵已经通过；真实 Codex、真实 OAuth 账号池和皮肤仍需在专用测试电脑完成最终验收，
 因此现在不能称为生产稳定版。
 
 ## 它解决什么问题
 
-当模型来源、账号出口和本机工具越来越多时，常见问题不是“缺一个转发器”，而是：
+当模型来源、账号出口和本机工具越来越多时，常见问题不只是“缺一个转发器”，而是：
 
-- 模型散落在不同来源，Codex 原生模型菜单里看不到或名字冲突；
+- OpenAI、Grok、Claude、Gemini 等来源的 URL、协议和密钥分散在不同工具里；
+- 多个本机工具各用一套地址和钥匙，无法统一停用、记账或查出实际走了哪条线路；
+- 模型散落在不同来源，接入 Codex 时原生模型菜单里看不到或名字冲突；
 - 切换模型时脚本自动点击界面，失败后却误报成功，甚至要求重启 Codex；
 - 从官方 Pro 模型切到第三方模型后，`previous_response_id` 无法被上游识别，聊天像突然失忆；
 - 多个 OAuth 账号混在同一出口，无法确定下一次请求到底由哪个账号扣费；
 - 皮肤、Worker、服务器状态和本机端口分别由不同脚本维护，出错后很难判断是哪一层；
 - 工具为了“方便”覆盖用户原配置，断开时又无法精确恢复。
 
-总管家把这些能力放进同一个有明确边界的 Windows 应用，并让所有高风险操作失败关闭。
+AI 中转站总管家把这些能力放进同一个有明确边界的 Windows 应用，并让高风险操作失败关闭。
 
 ## 主要功能
 
-### Codex 原生模型目录
+### AI 统一中转站
 
+- 统一 Base URL：`http://127.0.0.1:10110/v1`；
+- 提供 `/responses`、`/chat/completions` 和 `/models`；
+- 第三方 API 一律使用 `来源编号/模型`，不会生成容易撞名的裸模型；
+- 每个调用方可发放独立 API Key（`--gateway-key-create/list/revoke`），可单独记账和吊销；
+- 每次请求写入 `unified-gateway-request-log.jsonl`，记录调用方、模型、实际账号、状态和结果；
+- 中转站只监听 `127.0.0.1`，不会自动暴露到局域网或公网；
+- 接入 DSH、opencode、Trae 等工具的方法见 [docs/HARNESS-INTEGRATION.md](docs/HARNESS-INTEGRATION.md)。
+
+### 内置主流模型来源模板
+
+- 原生提供 OpenAI API、xAI Grok、OpenRouter、DeepSeek、Anthropic Claude、Google Gemini、Mistral、Groq、
+  通义千问、Moonshot/Kimi、Perplexity 和 Together AI 模板；
+- 选择模板只会填写公开 Base URL、协议和建议上下文，不会内置、下载或收集任何 API Key；
+- OpenAI 开发者平台 API Key 与 ChatGPT/Codex 套餐登录互相独立；
+- xAI Grok 直接使用官方 `api.x.ai` Responses API，不读取网页 Cookie，也不复制第三方项目的固定客户端身份；
+- LiteLLM、New API、One API、LocalAI 等自建网关继续通过“自定义 / 自建统一网关”接入；
+- Anthropic 使用原生 `x-api-key`，Google 使用原生 `x-goog-api-key`，其余 OpenAI 兼容来源使用 Bearer；
+- 模板和协议边界见 [docs/PROVIDER-PRESETS.md](docs/PROVIDER-PRESETS.md)。
+
+### 可选功能：一键接入 Codex
+
+- 默认不接入 Codex，首页和“Codex 接入”页都有同一个一键开关；
+- 连接前显示当前 Codex 网关和连接后的本机网关，断开时显示将恢复的原网关；
 - 使用 Codex 官方支持的 `model_catalog_json` 生成启动模型目录；
-- 保留 Codex 内置 `openai` Provider 身份，只通过 `openai_base_url` 接入本机 Native Engine；
+- 保留 Codex 内置 `openai` Provider 身份，只通过用户级 `openai_base_url` 接入本机 Native Engine；
 - OpenAI 官方模型保留原名称，第三方模型统一显示为 `provider/model`，避免同名串线；
-- 不再自动点击 Codex 的模型菜单，也不会自动关闭或重启 Codex；
-- 当前任务需要切换时，由用户在 Codex 自己的模型菜单中选择，结果更可验证。
+- 不自动点击 Codex 的模型菜单，也不会自动关闭或重启 Codex；
+- 当前任务需要切换时，由用户在 Codex 自己的模型菜单中选择。
 
 ### Responses 对话连续性
 
@@ -44,16 +72,6 @@ Codex 总管家不是另一个聊天客户端，也不会替换 Codex。它是�
 - 对无法识别 Codex Response ID 的 Chat、Anthropic、Google 等路由，在本机内存中展开上一轮完整消息；
 - 续接状态有 2 小时 TTL、128 条上限、单条 1 MB 和总计 16 MB 上限；
 - 不保存 Authorization Header、API Key 或账号凭据；Native Engine 退出后自动清空。
-
-### 内置主流模型来源模板
-
-- 原生提供 xAI Grok、OpenRouter、DeepSeek、Anthropic Claude、Google Gemini、Mistral、Groq、
-  通义千问、Moonshot/Kimi、Perplexity 和 Together AI 模板；
-- 选择模板只会填写公开 Base URL、协议和建议上下文，不会内置、下载或收集任何 API Key；
-- xAI Grok 直接使用官方 `api.x.ai` Responses API，不读取网页 Cookie，也不复制第三方项目的固定客户端身份；
-- LiteLLM、New API、One API、LocalAI 等自建网关继续通过“自定义 / 自建统一网关”接入；
-- Anthropic 使用原生 `x-api-key`，Google 使用原生 `x-goog-api-key`，其余 OpenAI 兼容来源使用 Bearer；
-- 模板和协议边界见 [docs/PROVIDER-PRESETS.md](docs/PROVIDER-PRESETS.md)。
 
 ### 账号池和独立出口
 
@@ -66,18 +84,13 @@ Codex 总管家不是另一个聊天客户端，也不会替换 Codex。它是�
 > 说明：候选版不伪造不存在的原生 Codex 账号。Native Engine 当前只把官方主账号作为原生透传入口；
 > 额外账号应通过独立 CLIProxyAPI 出口接入，真实扣费仍要用下一条请求日志确认。
 
-### 统一网关：codex-auto 轮换、独立钥匙与请求账本
+### Codex 授权池：codex-auto 轮换
 
 - `codex-auto/<模型>` 把多个 Codex 账号池的同一模型聚合成一个稳定模型名：哪个账号有额度用哪个，
   429（尊重 Retry-After）、401/403、5xx 自动冷却当前账号并切到下一个；全部冷却时 503 并提示恢复时间；
 - 轮换候选每次请求前都重新执行与精确路由相同的服务端来源与凭据校验；响应头 `X-CMM-Served-By` 标出实际扣费账号；
 - 带 `previous_response_id` 的 Responses 对话有会话粘性：同一对话尽量锁定同一账号，避免换号续聊失忆；
 - 精确路由（`cli/号池/模型` 等）行为不变，适合把某个任务钉死在指定账号；
-- 第三方 API 一律使用 `来源编号/模型`，例如 `deepseek-xxxxxxxx/deepseek-chat`；不会生成可能与官方模型或其他来源撞名的裸模型；
-- 每个 harness 可发放独立 API Key（`--gateway-key-create/list/revoke`），用量按钥匙分开记账、可单独吊销；
-  历史主钥匙继续有效；
-- 每次请求写入 `unified-gateway-request-log.jsonl`（时间、调用方、模型、实际账号、状态、结果），记账失败不影响代理；
-- 接入方法见 [docs/HARNESS-INTEGRATION.md](docs/HARNESS-INTEGRATION.md)。
 
 ### 皮肤、Worker 与状态面板
 
@@ -113,22 +126,20 @@ Codex 总管家不是另一个聊天客户端，也不会替换 Codex。它是�
 
 ```mermaid
 flowchart LR
-    U["用户点击一键连接"] --> C["安全检查 config.toml"]
-    C -->|"发现用户自有同名配置"| STOP["停止，不覆盖"]
-    C -->|"可安全连接"| N["启动 127.0.0.1:10100 Native Engine"]
-    N --> R["/readyz 检查 Provider 与模型"]
-    R --> M["生成 Codex 原生模型目录"]
-    M --> W["写入 openai_base_url + model_catalog_json"]
-    W --> X["Codex 仍保持 openai 身份"]
-    X --> P{"用户在 Codex 选择模型"}
-    P --> O["OpenAI 官方透传"]
-    P --> A["独立账号池 / 第三方 API"]
-    P --> G["Anthropic / Google / Chat 适配"]
-    A --> L["用量、错误与扣费证据"]
-    G --> L
-    O --> L
-    D["用户点击断开"] --> E["只删除总管家标记和自有目录"]
-    E --> F["恢复 Codex 官方网关"]
+    S["OpenAI / Grok / Claude / Gemini / 账号池"] --> G["AI 统一中转站 127.0.0.1:10110/v1"]
+    G --> H["普通本机 AI 工具 / Harness"]
+    G --> W["外部 Worker / 子代理"]
+    G --> L["按调用方、模型、账号记录日志"]
+
+    C{"用户是否让 Codex 接入？"}
+    C -->|"否，默认"| K["Codex 原网关保持不变"]
+    C -->|"是，点一键接入"| V["检查并保存原 Codex 网关"]
+    V --> N["Native Engine 127.0.0.1:10100"]
+    N --> M["写入自有网关块和模型目录"]
+    M --> X["Codex 原生模型菜单选择线路"]
+    X --> G
+    D["再次点击取消接入"] --> E["只删除中转站自有配置"]
+    E --> K
 ```
 
 ## 安全设计
@@ -166,8 +177,8 @@ v2rayN 不是 Native Engine 的启动前置条件。没有启用代理的 Provid
 2. 核对 Release 页面公布的 SHA-256；
 3. 解压后使用包内 `install-local-release.ps1` 校验并安装；不要绕过清单直接运行 EXE；
 4. 先添加模型来源或独立账号出口；
-5. 确认主页的 Native Engine 和 `/readyz` 正常；
-6. 需要 Codex 使用时，再点击“一键连接 Codex”；
+5. 确认主页的统一中转站 URL、模型目录和 API Key 状态正常；
+6. 需要 Codex 使用时，再点击“一键让 Codex 接入中转站”；
 7. 如果正在运行的 Codex 没刷新模型列表，由用户手动重新打开一次；
 8. 在 Codex 原生模型菜单中选择目标模型。
 
@@ -189,15 +200,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-local-release.
 ```powershell
 dotnet build CodexTotalManager.sln --no-restore -c Debug
 dotnet test tests\CodexModelManager.SecurityTests\CodexModelManager.SecurityTests.csproj --no-build -c Debug
-.\build.ps1 -Publish -Version 3.0.0-rc.28 `
-  -CliProxyApiArtifactPath 'C:\path\to\verified\cli-proxy-api.exe'
+.\build.ps1 -Publish -Version 3.0.0-rc.29 `
+  -CliProxyApiArtifactPath 'C:\path\to\verified\cli-proxy-api.exe' `
+  -NodeArtifactPath 'C:\path\to\node.exe' `
+  -NodeLicensePath 'C:\path\to\Node.js\LICENSE'
 ```
 
 生成永久隔离、不能连接真实 Codex 的测试包：
 
 ```powershell
-.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.28 `
-  -CliProxyApiArtifactPath 'C:\path\to\verified\cli-proxy-api.exe'
+.\build.ps1 -Publish -DetachedOnly -Version 3.0.0-rc.29 `
+  -CliProxyApiArtifactPath 'C:\path\to\verified\cli-proxy-api.exe' `
+  -NodeArtifactPath 'C:\path\to\node.exe' `
+  -NodeLicensePath 'C:\path\to\Node.js\LICENSE'
 ```
 
 `-Publish` 会自动运行安全测试和集成自检；不需要另加 `-Test`。脚本会把
@@ -206,13 +221,13 @@ dotnet test tests\CodexModelManager.SecurityTests\CodexModelManager.SecurityTest
 
 ## 测试边界
 
-当前 rc.28 源码已验证：
+当前 rc.29 源码已验证：
 
 - Release 全解决方案编译：0 错误、0 警告；
 - 当前安全测试集全部通过（准确数量以 `dotnet test` 当次输出为准，避免文档数字再次过期），其中包含本机准入、官方会话验证、流式工具调用、第三方模型接入、正式发布证据门槛、跨进程配置防覆盖、软件版本比较与脱敏诊断，以及通用插件的禁用默认值、路径边界、整包指纹、确认期间换包拦截、参数传递、环境变量隔离和崩溃隔离；
 - 隔离单元/集成矩阵；
 - 10 万条账本冷启动和追加压力测试；
-- 候选包清单和安装回路“只验包、不安装”逻辑测试；当前工作区尚未生成新的 rc.28 安装包；
+- 候选包清单和安装回路“只验包、不安装”逻辑测试；本地候选仍不等于已发布的 GitHub Release；
 - 本机假 Responses/Chat 上游的两轮连续对话；
 - 本机假 Anthropic/Google 上游、工具调用和第三方统一网关端到端转发；
 - `/healthz` 存活与 `/readyz` 就绪分离；
@@ -249,7 +264,7 @@ dotnet test tests\CodexModelManager.SecurityTests\CodexModelManager.SecurityTest
 
 ## 与其他工具的区别
 
-| 能力 | 普通 API 转发器 | OpenCodex 类原生模型接入 | Codex 总管家 |
+| 能力 | 普通 API 转发器 | OpenCodex 类原生模型接入 | AI 中转站总管家 |
 | --- | ---: | ---: | ---: |
 | API/模型路由 | ✅ | ✅ | ✅ |
 | Codex 原生模型目录 | 通常没有 | ✅ | ✅ |
@@ -260,8 +275,8 @@ dotnet test tests\CodexModelManager.SecurityTests\CodexModelManager.SecurityTest
 | Worker 预算与审计 | ❌ | ❌ | ✅ |
 | 本机服务与服务器状态面板 | ❌ | ❌ | ✅ |
 
-总管家吸收了原生模型接入项目中“让 Codex 自己认识模型”的思路，但目标不是做一个单纯转发器，
-而是把接入、账号边界、可恢复配置和运维状态放进同一控制面。
+AI 中转站总管家以统一 API、上游线路、调用方钥匙和请求账本为主，同时吸收了原生模型接入项目中
+“让 Codex 自己认识模型”的思路。Codex 接入是可选模块，不是整个软件的前置条件。
 
 ## 常见问题
 
@@ -290,7 +305,7 @@ Provider 请求只发送给用户明确配置的上游。
 欢迎提交脱敏后的 Bug 复现、界面建议、Provider 适配和文档改进。
 公开 Issue 中请勿粘贴 Token、Cookie、账号文件、服务器地址或完整日志。
 
-如果这个项目解决了你的 Codex 多模型或多账号管理问题，欢迎点一个 Star，
+如果这个项目解决了你的多模型中转、调用方管理或 Codex 接入问题，欢迎点一个 Star，
 并在 Issue 中告诉我们你最需要优先验收的模型来源。
 
 ## 许可证与第三方组件

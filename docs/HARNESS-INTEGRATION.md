@@ -1,6 +1,6 @@
 # 外部 Harness 接入统一网关指南
 
-给 DSH（DeepSeek Harness）、opencode、Trae、zcode 等本机 AI 工具接入 Codex 总管家"统一 API"的一页说明。
+给 DSH（DeepSeek Harness）、opencode、Trae、zcode 等本机 AI 工具接入 AI 中转站总管家统一 API 的一页说明。Codex 不是使用这套统一 API 的前置条件。
 面向读者：任何要把自己工具的模型来源指到总管家的 harness 或人。
 
 ## 前置条件

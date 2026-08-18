@@ -161,7 +161,7 @@ function Read-Release {
     $exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
     if ($exeHash -ine [string]$pointer.sha256) { throw 'Release executable hash mismatch.' }
     $exeInfo = (Get-Item -LiteralPath $exe).VersionInfo
-    if ($exeInfo.ProductName -ne 'Codex 总管家') {
+if ($exeInfo.ProductName -ne 'AI 中转站总管家') {
         throw "Release executable product name $($exeInfo.ProductName) does not match."
     }
     $actualVersion = [string]$exeInfo.ProductVersion
@@ -242,7 +242,7 @@ function Wait-GatewayHealth(
 try {
     $ownsMutex = $mutex.WaitOne(0)
     if (-not $ownsMutex) {
-        Write-Output 'Codex Total Manager control panel is already running; duplicate launch skipped.'
+Write-Output 'AI Gateway Manager control panel is already running; duplicate launch skipped.'
         exit 0
     }
 
@@ -292,7 +292,7 @@ try {
     } catch {
         Write-Output "GATEWAY_DISABLED_INVALID_CONFIG version=$($release.Pointer.productVersion) reason=$($_.Exception.Message)"
         Show-Result 'Control panel closed. The gateway was not restored because its saved port or configuration is stale. Open the control panel again and use Start / Sync Gateway after checking the new port.' `
-            'Codex Total Manager' 'Information'
+            'AI Gateway Manager' 'Information'
         exit 0
     }
     if ($null -eq $gatewayConfig) {
@@ -307,7 +307,7 @@ try {
     if ($expectedRouteCount -eq 0) {
         Write-Output "GATEWAY_DISABLED_NO_ROUTES version=$($release.Pointer.productVersion)"
         Show-Result 'Control panel closed. The gateway remains disabled because no trusted routes are configured.' `
-            'Codex Total Manager' 'Information'
+            'AI Gateway Manager' 'Information'
         exit 0
     }
 
@@ -320,14 +320,14 @@ try {
         ([string]$gatewayConfig.configurationFingerprint)
     Write-Output "GATEWAY_RESTORED version=$($release.Pointer.productVersion) routes=$expectedRouteCount port=$gatewayPort pid=$($gateway.Id) fingerprint=$($gatewayConfig.configurationFingerprint)"
     Show-Result "Gateway restored: version $($release.Pointer.productVersion), routes $expectedRouteCount." `
-        'Codex Total Manager' 'Information'
+        'AI Gateway Manager' 'Information'
 } catch {
-    $message = "Codex Total Manager launch failed: $($_.Exception.Message)"
+    $message = "AI Gateway Manager launch failed: $($_.Exception.Message)"
     Write-Output $message
     if ($null -ne $gateway) {
         try { if (-not $gateway.HasExited) { $gateway.Kill($true) } } catch { }
     }
-    Show-Result $message 'Codex Total Manager' 'Warning'
+    Show-Result $message 'AI Gateway Manager' 'Warning'
     exit 1
 } finally {
     if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch { } }

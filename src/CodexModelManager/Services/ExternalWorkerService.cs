@@ -83,7 +83,7 @@ public sealed class UnifiedGatewayExternalWorkerBackend : IExternalWorkerBackend
                 new
                 {
                     role = "system",
-                    content = "你是 Codex 总管家的纯文本子工人。你没有文件系统、命令、网络或其他工具权限；"
+        content = "你是 AI 中转站总管家的纯文本子工人。你没有文件系统、命令、网络或其他工具权限；"
                               + "不得声称已经修改、运行或验证任何外部对象。只返回分析、草稿、检查清单或建议。\n\n"
                               + $"角色：{request.RoleId}\n角色说明：{request.RoleInstructions}"
                 },

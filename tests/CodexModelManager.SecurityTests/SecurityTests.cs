@@ -22,7 +22,7 @@ public sealed class ReleaseAcceptanceGateTests
     [Fact]
     public void ProductMaintenance_UsesSemanticVersionsAndDiagnosticSummaryStaysPathFree()
     {
-        Assert.True(ProductMaintenanceService.CompareVersionText("3.0.0-rc.29", "3.0.0-rc.28") > 0);
+        Assert.True(ProductMaintenanceService.CompareVersionText("3.0.0-rc.30", "3.0.0-rc.29") > 0);
         Assert.True(ProductMaintenanceService.CompareVersionText("3.0.0", "3.0.0-rc.99") > 0);
         Assert.True(ProductMaintenanceService.CompareVersionText("4.0.0", "3.99.99") > 0);
 
@@ -42,6 +42,92 @@ public sealed class ReleaseAcceptanceGateTests
         {
             if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task ProductMaintenance_ThirdPartyChecksUseOnlyPinnedGitHubEndpoints()
+    {
+        var requested = new List<string>();
+        using var client = new HttpClient(new ProductHttpHandler(request =>
+        {
+            requested.Add(request.RequestUri!.AbsoluteUri);
+            var tag = request.RequestUri.AbsolutePath.Contains("opencodex", StringComparison.OrdinalIgnoreCase)
+                ? "v2.25.0"
+                : request.RequestUri.AbsolutePath.Contains("CLIProxyAPI", StringComparison.OrdinalIgnoreCase)
+                    ? "v7.2.135"
+                    : "v1.5.14";
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent($"{{\"tag_name\":\"{tag}\"}}", Encoding.UTF8, "application/json")
+            };
+        }));
+        using var product = new ProductMaintenanceService(Path.GetTempPath(), client);
+
+        var result = await product.CheckThirdPartyComponentsAsync();
+
+        Assert.Equal(3, result.Components.Count);
+        Assert.Equal(
+            [
+                "https://api.github.com/repos/lidge-jun/opencodex/releases/latest",
+                "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest",
+                "https://api.github.com/repos/Fei-Away/Codex-Dream-Skin/releases/latest"
+            ],
+            requested);
+        Assert.Equal("2.25.0", result.Components[0].LatestVersion);
+        Assert.Equal("7.2.135", result.Components[1].LatestVersion);
+        Assert.Equal("1.5.14", result.Components[2].LatestVersion);
+    }
+
+    [Fact]
+    public async Task ProductMaintenance_ThirdPartyChecksFailClosedOnRedirectOrOversizedBody()
+    {
+        using var redirectedClient = new HttpClient(new ProductHttpHandler(request =>
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = new HttpRequestMessage(HttpMethod.Get, "https://example.invalid/releases/latest"),
+                Content = new StringContent("{\"tag_name\":\"v99.0.0\"}", Encoding.UTF8, "application/json")
+            }));
+        using var redirected = new ProductMaintenanceService(Path.GetTempPath(), redirectedClient);
+        var redirectedResult = await redirected.CheckThirdPartyComponentsAsync();
+        Assert.All(redirectedResult.Components, component => Assert.Null(component.LatestVersion));
+
+        var oversizedJson = "{\"tag_name\":\"v99.0.0\",\"padding\":\"" + new string('x', 1024 * 1024) + "\"}";
+        using var oversizedClient = new HttpClient(new ProductHttpHandler(request =>
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent(oversizedJson, Encoding.UTF8, "application/json")
+            }));
+        using var oversized = new ProductMaintenanceService(Path.GetTempPath(), oversizedClient);
+        var oversizedResult = await oversized.CheckThirdPartyComponentsAsync();
+        Assert.All(oversizedResult.Components, component => Assert.Null(component.LatestVersion));
+    }
+
+    [Fact]
+    public void GatewayInvocationExampleUsesLoopbackAndNeverCopiesARealSecret()
+    {
+        var example = UnifiedGatewayService.BuildSafePowerShellExample(
+            "http://127.0.0.1:10110/v1",
+            "grok-main/grok-4");
+        Assert.Contains("http://127.0.0.1:10110/v1/chat/completions", example, StringComparison.Ordinal);
+        Assert.Contains("grok-main/grok-4", example, StringComparison.Ordinal);
+        Assert.Contains("<YOUR_GATEWAY_API_KEY>", example, StringComparison.Ordinal);
+        Assert.DoesNotContain("cmm-gw-", example, StringComparison.OrdinalIgnoreCase);
+        Assert.Throws<InvalidOperationException>(() =>
+            UnifiedGatewayService.BuildSafePowerShellExample(
+                "https://example.invalid/v1",
+                "grok-main/grok-4"));
+    }
+
+    [Fact]
+    public void DetachedUiDisablesThirdPartyNetworkChecks()
+    {
+        var repo = FindRepositoryRoot();
+        var source = File.ReadAllText(
+            Path.Combine(repo, @"src\CodexModelManager\MainWindow.ProductShell.cs"), Encoding.UTF8);
+        Assert.Contains("CheckThirdPartyUpdatesButton.IsEnabled = false", source, StringComparison.Ordinal);
+        Assert.Contains("if (RuntimeMode.IsDetachedUi || _busy) return", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -336,6 +422,14 @@ public sealed class ReleaseAcceptanceGateTests
         }
         throw new DirectoryNotFoundException("CodexTotalManager repository root was not found.");
     }
+
+    private sealed class ProductHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> factory)
+        : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) => Task.FromResult(factory(request));
+    }
 }
 
 public sealed class ProviderPresetSecurityTests
@@ -362,6 +456,12 @@ public sealed class ProviderPresetSecurityTests
         Assert.Equal("https://api.x.ai/v1", xai.BaseUrl);
         Assert.Equal("openai-responses", xai.Adapter);
         Assert.Contains("不读取 Grok 网页 Cookie", xai.Summary, StringComparison.Ordinal);
+
+        var openAi = Assert.Single(presets, item => item.Id == "openai-api");
+        Assert.Equal("https://api.openai.com/v1", openAi.BaseUrl);
+        Assert.Equal("openai-responses", openAi.Adapter);
+        Assert.Equal("OpenAI Responses", openAi.ProtocolText);
+        Assert.Contains("与 ChatGPT/Codex 套餐登录相互独立", openAi.Summary, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1972,7 +2072,12 @@ public class NativeProxyStreamingCompatibilityTests
                     Role = "assistant",
                     ToolCalls =
                     [
-                        new OcxToolCall { Id = "tool_a", Function = new OcxToolCallFunction { Name = "alpha", Arguments = "{}" } },
+                        new OcxToolCall
+                        {
+                            Id = "tool_a",
+                            ThoughtSignature = "signature-alpha",
+                            Function = new OcxToolCallFunction { Name = "alpha", Arguments = "{}" }
+                        },
                         new OcxToolCall { Id = "tool_b", Function = new OcxToolCallFunction { Name = "beta", Arguments = "{}" } }
                     ]
                 },
@@ -2042,7 +2147,12 @@ public class NativeProxyStreamingCompatibilityTests
                     Role = "assistant",
                     ToolCalls =
                     [
-                        new OcxToolCall { Id = "tool_a", Function = new OcxToolCallFunction { Name = "alpha", Arguments = "{}" } },
+                        new OcxToolCall
+                        {
+                            Id = "tool_a",
+                            ThoughtSignature = "signature-alpha",
+                            Function = new OcxToolCallFunction { Name = "alpha", Arguments = "{}" }
+                        },
                         new OcxToolCall { Id = "tool_b", Function = new OcxToolCallFunction { Name = "beta", Arguments = "{}" } }
                     ]
                 },
@@ -2054,6 +2164,9 @@ public class NativeProxyStreamingCompatibilityTests
         using var document = JsonDocument.Parse(GoogleAdapter.BuildRequestJson(request));
         var contents = document.RootElement.GetProperty("contents");
         Assert.Equal(2, contents.GetArrayLength());
+        Assert.Equal(
+            "signature-alpha",
+            contents[0].GetProperty("parts")[0].GetProperty("thoughtSignature").GetString());
         var resultTurn = contents[1];
         Assert.Equal("user", resultTurn.GetProperty("role").GetString());
         var parts = resultTurn.GetProperty("parts");
@@ -2398,7 +2511,7 @@ public class NativeProxyStreamingCompatibilityTests
     [Fact]
     public async Task GoogleNonStreamingFunctionCall_AndLengthStop_AreNormalized()
     {
-        const string upstream = "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"weather\",\"args\":{\"city\":\"Beijing\"}}}]},\"finishReason\":\"STOP\"}],"
+        const string upstream = "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"weather\",\"args\":{\"city\":\"Beijing\"}},\"thoughtSignature\":\"signature-nonstream\"}]},\"finishReason\":\"STOP\"}],"
                                 + "\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2,\"totalTokenCount\":6}}";
         using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
         {
@@ -2417,12 +2530,28 @@ public class NativeProxyStreamingCompatibilityTests
         var call = Assert.Single(result.Message?.ToolCalls ?? []);
         Assert.Equal("weather", call.Function?.Name);
         Assert.Equal("{\"city\":\"Beijing\"}", call.Function?.Arguments);
+        Assert.Equal("signature-nonstream", call.ThoughtSignature);
+
+        var replay = new OcxParsedRequest
+        {
+            Messages =
+            [
+                result.Message!,
+                new OcxMessage { Role = "tool", ToolCallId = call.Id, Content = "{\"temperature\":20}" }
+            ]
+        };
+        using var replayJson = JsonDocument.Parse(GoogleAdapter.BuildRequestJson(replay));
+        Assert.Equal(
+            "signature-nonstream",
+            replayJson.RootElement.GetProperty("contents")[0]
+                .GetProperty("parts")[0]
+                .GetProperty("thoughtSignature").GetString());
     }
 
     [Fact]
     public async Task GoogleStreamingFunctionCall_IsNotLost_AndUsagePrecedesToolFinish()
     {
-        const string upstream = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"weather\",\"args\":{\"city\":\"Beijing\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2}}\n\n";
+        const string upstream = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"weather\",\"args\":{\"city\":\"Beijing\"}},\"thoughtSignature\":\"signature-stream\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2}}\n\n";
         using var client = new HttpClient(new StaticHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = new StringContent(upstream, Encoding.UTF8, "text/event-stream")
@@ -2438,6 +2567,7 @@ public class NativeProxyStreamingCompatibilityTests
         var call = Assert.Single(events, item => item.Type == "function_call");
         Assert.Equal("weather", call.FunctionName);
         Assert.Equal("{\"city\":\"Beijing\"}", call.Arguments);
+        Assert.Equal("signature-stream", call.ThoughtSignature);
         Assert.Contains(events, item => item.Type == "function_call_done");
         Assert.Contains(events, item => item.Type == "usage" && item.Usage?.TotalTokens == 6);
         Assert.Equal("tool_calls", Assert.Single(events, item => item.Type == "finish").FinishReason);
@@ -2447,6 +2577,8 @@ public class NativeProxyStreamingCompatibilityTests
         await foreach (var frame in bridge.StreamAsync(ToAsync(events), CancellationToken.None))
             frames.Append(frame);
         Assert.Contains("\"end_turn\":false", frames.ToString(), StringComparison.Ordinal);
+        var continuedCall = Assert.Single(Assert.Single(bridge.GetContinuationMessages()).ToolCalls!);
+        Assert.Equal("signature-stream", continuedCall.ThoughtSignature);
     }
 
     [Fact]

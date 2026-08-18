@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "product": "CodexTotalManager",
-  "productVersion": "3.0.0-rc.28",
+  "productVersion": "3.0.0-rc.29",
   "candidateManifestSha256": "REPLACE_WITH_64_CHARACTER_SHA256_OF_payload-manifest.json",
   "dedicatedTestComputer": true,
   "testComputerRunId": "REPLACE_WITH_A_UUID_CREATED_FOR_THIS_TEST_RUN",

@@ -7,7 +7,7 @@ quote = Chr(34)
 
 launcher = fso.BuildPath(fso.GetParentFolderName(WScript.ScriptFullName), "Open-New-Manager-ControlPanel.ps1")
 If Not fso.FileExists(launcher) Then
-    shell.Popup "Launcher not found: " & launcher, 5, "Codex Total Manager", 16
+    shell.Popup "Launcher not found: " & launcher, 5, "AI Gateway Manager", 16
     WScript.Quit 2
 End If
 
